@@ -9,14 +9,24 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const NAME = 'relay-queue';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'events.jsonl');
+// Where the UI page is read from, first match wins. `public/index.html` is the source of
+// truth; the DATA_DIR copy is a shim for the container, which currently bind-mounts only
+// server.js, package.json and data/ — drop it once compose mounts `./public:/app/public:ro`.
+const UI_FILES = [
+  process.env.UI_FILE,
+  path.join(__dirname, 'public', 'index.html'),
+  path.join(DATA_DIR, 'ui', 'index.html'),
+].filter(Boolean);
 const MAX_BODY = 1024 * 1024; // 1 MiB
+const MAX_TEXT = 8000; // per-message cap for instruction/text; results are only bounded by MAX_BODY
 const STARTED_AT = Date.now();
 const STATUSES = ['pending', 'claimed', 'done'];
+const DEFAULT_ROLE = 'user'; // records written before roles existed are the human's messages
 
 // ---------------------------------------------------------------- event log
 /** @type {Map<string, object>} id -> task (insertion order == creation order) */
@@ -25,6 +35,8 @@ let logFd = null;
 
 function applyEvent(ev) {
   if (ev.t === 'create') {
+    // Records logged before `role` existed replay as the human's messages.
+    if (ev.task.role !== 'agent') ev.task.role = DEFAULT_ROLE;
     tasks.set(ev.task.id, ev.task);
   } else if (ev.t === 'patch') {
     const task = tasks.get(ev.id);
@@ -149,14 +161,100 @@ const counts = () => {
   return c;
 };
 
+// ---------------------------------------------------------------- thread view
+/*
+ * The thread is a read-only projection of the same task records — there is no
+ * second store and no second write path:
+ *   - every task yields one entry carrying its own role ("user" by default);
+ *   - a task that has a result *also* yields a derived role:"agent" entry
+ *     (id `<taskId>:r`, `replyTo` set), so an agent replies to the human simply
+ *     by POSTing a result. No extra endpoint, no change to claim/result rules.
+ * `ts` is the immutable display/ordering key. `rev` is the last-changed key that
+ * `since=` filters on, so a status change (pending -> claimed -> done) also
+ * reaches an incrementally polling client.
+ */
+const msOf = (v) => { const n = Date.parse(v || ''); return Number.isNaN(n) ? 0 : n; };
+const asText = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : JSON.stringify(v));
+
+function threadEntries() {
+  const out = [];
+  for (const t of tasks.values()) {
+    const createdMs = msOf(t.ts);
+    const revMs = Math.max(createdMs, msOf(t.claimedAt), msOf(t.resultTs));
+    out.push({
+      id: t.id,
+      role: t.role === 'agent' ? 'agent' : 'user',
+      text: asText(t.instruction),
+      ts: t.ts,
+      status: t.status,
+      rev: new Date(revMs).toISOString(),
+    });
+    if (t.result !== null && t.result !== undefined) {
+      const at = t.resultTs || t.ts;
+      out.push({
+        id: `${t.id}:r`,
+        role: 'agent',
+        text: asText(t.result),
+        ts: at,
+        status: 'done',
+        rev: new Date(Math.max(msOf(at), createdMs)).toISOString(),
+        replyTo: t.id,
+      });
+    }
+  }
+  // Stable sort: a reply is pushed after its parent, so equal timestamps keep order.
+  return out.sort((a, b) => msOf(a.ts) - msOf(b.ts));
+}
+
+// ---------------------------------------------------------------- static UI
+let indexCache = null; // { file, mtimeMs, buf } — re-read only when the file changes on disk
+
+function findUiFile() {
+  for (const f of UI_FILES) {
+    try { return { file: f, mtimeMs: fs.statSync(f).mtimeMs }; } catch { /* try the next one */ }
+  }
+  return null;
+}
+
+function sendIndex(res) {
+  const found = findUiFile();
+  if (!found) {
+    return fail(res, 503, 'UI page not found on disk', { searched: UI_FILES });
+  }
+  try {
+    if (!indexCache || indexCache.file !== found.file || indexCache.mtimeMs !== found.mtimeMs) {
+      indexCache = { ...found, buf: fs.readFileSync(found.file) };
+    }
+  } catch {
+    return fail(res, 503, `UI page is unreadable: ${found.file}`);
+  }
+  res.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': indexCache.buf.length,
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    // The page is fully self-contained; this forbids any external request from it.
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; " +
+      "script-src 'unsafe-inline'; img-src data:; connect-src 'self'; " +
+      "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  });
+  res.end(indexCache.buf);
+}
+
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
-  const instruction = body.instruction;
+  // `text` is the UI's field name and an alias for `instruction`; both are accepted.
+  const instruction = typeof body.text === 'string' ? body.text : body.instruction;
   if (typeof instruction !== 'string' || !instruction.trim()) {
-    return fail(res, 400, 'instruction is required and must be a non-empty string');
+    return fail(res, 400, 'instruction (alias: text) is required and must be a non-empty string');
+  }
+  if (instruction.length > MAX_TEXT) {
+    return fail(res, 400, `message too long: ${instruction.length} chars, max ${MAX_TEXT}`);
   }
   const task = {
     id: newId(),
+    role: DEFAULT_ROLE, // server-set, never taken from the client
     instruction,
     from: typeof body.from === 'string' && body.from ? body.from : null,
     ts: nowIso(),
@@ -220,6 +318,12 @@ async function route(req, res) {
     return false;
   };
 
+  // / — the mobile web UI
+  if (seg.length === 0) {
+    if (!need('GET')) return;
+    return sendIndex(res);
+  }
+
   // /health
   if (seg.length === 1 && seg[0] === 'health') {
     if (!need('GET')) return;
@@ -248,6 +352,27 @@ async function route(req, res) {
     const done = [...tasks.values()].filter((t) => t.status === 'done');
     const list = applyFilters(done, q);
     return send(res, 200, { count: list.length, tasks: list });
+  }
+
+  // /thread — chronological human + agent view; `since` filters on `rev`, `limit` takes the LAST N
+  if (seg.length === 1 && seg[0] === 'thread') {
+    if (!need('GET')) return;
+    let list = threadEntries();
+
+    const since = q.get('since');
+    if (since !== null) {
+      const sinceMs = parseSince(since);
+      if (sinceMs === null) throw httpErr(400, `invalid since "${since}" (want ISO 8601 or epoch ms)`);
+      list = list.filter((e) => Date.parse(e.rev) > sinceMs); // strictly after
+    }
+
+    const limit = q.get('limit');
+    if (limit !== null) {
+      const n = Number(limit);
+      if (!Number.isInteger(n) || n < 0) throw httpErr(400, `invalid limit "${limit}"`);
+      list = n === 0 ? [] : list.slice(-n); // most recent N — a thread is read from the end
+    }
+    return send(res, 200, { count: list.length, now: nowIso(), entries: list });
   }
 
   // /tasks/:id/(claim|result|relayed)
@@ -288,6 +413,8 @@ server.listen(PORT, HOST, () => {
   const c = counts();
   console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`log: ${LOG_FILE} (${replayed.events} events replayed, ${replayed.skipped} skipped)`);
+  const ui = findUiFile();
+  console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);
   console.log(`tasks: ${tasks.size} total — ${c.pending} pending, ${c.claimed} claimed, ${c.done} done, ${c.unrelayed} unrelayed`);
 });
 

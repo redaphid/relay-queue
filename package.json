@@ -1,8 +1,8 @@
 {
   "name": "relay-queue",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Minimal durable local-only HTTP task queue for passing tasks and results between agents. Zero runtime dependencies.",
+  "description": "Minimal durable local-only HTTP task queue with a mobile web UI, for passing messages between a human and their agents. Zero runtime dependencies.",
   "license": "MIT",
   "main": "server.js",
   "engines": {

@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>relay</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Ccircle%20cx='16'%20cy='16'%20r='13'%20fill='%232f6fed'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg:#f4f6f8; --fg:#14161a; --muted:#667085; --line:#dfe3e8; --panel:#ffffff;
+    --user-bg:#2f6fed; --user-fg:#ffffff;
+    --agent-bg:#ffffff; --agent-fg:#14161a;
+    --err-fg:#8a2018; --err-bg:#fdeceb; --off:#c2410c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0e1116; --fg:#e6e8ec; --muted:#98a2b3; --line:#242a35; --panel:#141922;
+      --user-bg:#2f6fed; --user-fg:#ffffff;
+      --agent-bg:#1a202b; --agent-fg:#e6e8ec;
+      --err-fg:#ffb4ab; --err-bg:#3a1714; --off:#fdba74;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+    display: flex; flex-direction: column;
+    height: 100vh; height: 100dvh;
+    overflow: hidden;
+  }
+  header {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px calc(10px);
+    padding-top: calc(10px + env(safe-area-inset-top));
+    background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header b { font-size: 16px; font-weight: 650; letter-spacing: .01em; }
+  #conn { margin-left: auto; font-size: 13px; color: var(--off); display: none; }
+  #conn.show { display: inline; }
+
+  #thread {
+    flex: 1 1 auto; min-height: 0;
+    overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+    padding: 14px 12px 6px;
+  }
+  #empty { color: var(--muted); text-align: center; margin: 32px 12px; font-size: 15px; }
+
+  .msg { max-width: 86%; margin: 0 0 12px; padding: 10px 13px; border-radius: 17px; }
+  .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+  .msg .meta { margin-top: 5px; font-size: 12px; opacity: .72; }
+  .msg.user { margin-left: auto; background: var(--user-bg); color: var(--user-fg); border-bottom-right-radius: 6px; }
+  .msg.user .meta { text-align: right; }
+  .msg.agent { margin-right: auto; background: var(--agent-bg); color: var(--agent-fg); border: 1px solid var(--line); border-bottom-left-radius: 6px; }
+
+  #err {
+    display: none; flex: 0 0 auto;
+    margin: 0; padding: 9px 14px; font-size: 14px;
+    color: var(--err-fg); background: var(--err-bg); border-top: 1px solid var(--line);
+  }
+  #err.show { display: block; }
+
+  #composer {
+    flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end;
+    padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  #input {
+    flex: 1 1 auto; min-width: 0;
+    font-family: inherit; font-size: 16px; line-height: 1.4;
+    resize: none; overflow-y: auto;
+    min-height: 48px; max-height: 40vh; padding: 12px;
+    color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 15px;
+  }
+  #send {
+    flex: 0 0 auto; font-family: inherit; font-size: 16px; font-weight: 650;
+    min-height: 48px; min-width: 80px; padding: 0 18px;
+    color: #fff; background: var(--user-bg);
+    border: 0; border-radius: 15px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #send:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+  <header><b>relay</b><span id="conn">offline &mdash; retrying</span></header>
+
+  <main id="thread">
+    <div id="list"></div>
+    <p id="empty">No messages yet. Type below to send one.</p>
+  </main>
+
+  <p id="err"></p>
+
+  <div id="composer">
+    <textarea id="input" rows="1" placeholder="Message&hellip;" maxlength="8000"
+      autocapitalize="sentences" autocomplete="off" spellcheck="true" enterkeyhint="enter"></textarea>
+    <button id="send" type="button">Send</button>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  var POLL_MS = 3000;        // normal poll interval
+  var MAX_BACKOFF = 20000;   // slowest retry when the server is unreachable
+  var MAX_CHARS = 8000;      // must match the server-side cap
+  var FULL_EVERY = 20;       // every Nth poll re-reads the whole thread as a repair pass
+  var WINDOW = 500;          // entries fetched by a full read
+
+  var thread = document.getElementById('thread');
+  var list = document.getElementById('list');
+  var empty = document.getElementById('empty');
+  var input = document.getElementById('input');
+  var sendBtn = document.getElementById('send');
+  var errBar = document.getElementById('err');
+  var conn = document.getElementById('conn');
+
+  var entries = new Map();   // id -> entry
+  var sigs = new Map();      // id -> change signature
+  var cursorMs = 0;          // newest rev seen; drives incremental polling
+  var fails = 0, polls = 0, timer = null, errTimer = null;
+  var everRendered = false, sending = false;
+
+  var STATUS = { pending: 'pending', claimed: 'claimed', done: 'answered' };
+
+  function ms(s) { var n = Date.parse(s || ''); return isNaN(n) ? 0 : n; }
+  function sigOf(e) { return [e.role, e.status, e.ts, e.text].join('|'); }
+
+  function rel(iso) {
+    var t = ms(iso);
+    if (!t) return '';
+    var d = Date.now() - t;
+    if (d < 45000) return 'now';
+    var m = Math.round(d / 60000); if (m < 60) return m + 'm';
+    var h = Math.round(m / 60); if (h < 24) return h + 'h';
+    var dd = Math.round(h / 24); if (dd < 7) return dd + 'd';
+    return new Date(t).toLocaleDateString();
+  }
+  function absolute(iso) { var t = ms(iso); return t ? new Date(t).toLocaleString() : ''; }
+
+  function nearBottom() { return thread.scrollHeight - thread.scrollTop - thread.clientHeight < 120; }
+  function scrollBottom() { thread.scrollTop = thread.scrollHeight; }
+
+  function nodeFor(e) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg ' + (e.role === 'agent' ? 'agent' : 'user');
+
+    var body = document.createElement('div');
+    body.className = 'body';
+    body.textContent = e.text == null ? '' : String(e.text);   // textContent only: never innerHTML
+
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    var t = document.createElement('span');
+    t.className = 'time';
+    t.setAttribute('data-ts', e.ts || '');
+    t.title = absolute(e.ts);
+    t.textContent = rel(e.ts);
+    meta.appendChild(t);
+    if (e.role !== 'agent') {
+      var st = document.createElement('span');
+      st.textContent = ' · ' + (STATUS[e.status] || e.status || '');
+      meta.appendChild(st);
+    }
+
+    wrap.appendChild(body);
+    wrap.appendChild(meta);
+    return wrap;
+  }
+
+  function render() {
+    var all = Array.from(entries.values());
+    all.sort(function (a, b) {
+      return (ms(a.ts) - ms(b.ts)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    });
+    var stick = !everRendered || nearBottom();
+
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < all.length; i++) frag.appendChild(nodeFor(all[i]));
+    list.textContent = '';
+    list.appendChild(frag);
+
+    empty.style.display = all.length ? 'none' : 'block';
+    if (stick) scrollBottom();
+    if (all.length) everRendered = true;
+  }
+
+  function refreshTimes() {
+    var els = list.querySelectorAll('.time');
+    for (var i = 0; i < els.length; i++) els[i].textContent = rel(els[i].getAttribute('data-ts'));
+  }
+
+  function merge(arr) {
+    var changed = false;
+    for (var i = 0; i < arr.length; i++) {
+      var e = arr[i];
+      if (!e || typeof e.id !== 'string') continue;
+      var s = sigOf(e);
+      if (sigs.get(e.id) !== s) { sigs.set(e.id, s); entries.set(e.id, e); changed = true; }
+      var r = ms(e.rev || e.ts);
+      if (r > cursorMs) cursorMs = r;
+    }
+    return changed;
+  }
+
+  function setConn(ok) { conn.className = ok ? '' : 'show'; }
+
+  function showErr(msg) {
+    errBar.textContent = msg;
+    errBar.className = 'show';
+    clearTimeout(errTimer);
+    errTimer = setTimeout(clearErr, 9000);
+  }
+  function clearErr() { clearTimeout(errTimer); errBar.className = ''; errBar.textContent = ''; }
+
+  // All requests are root-relative so the page works unchanged behind a reverse proxy.
+  function poll(fullRead) {
+    var url = (!fullRead && cursorMs) ? '/thread?since=' + cursorMs : '/thread?limit=' + WINDOW;
+    return fetch(url, { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        var arr = (j && Array.isArray(j.entries)) ? j.entries : [];
+        if (merge(arr) || !everRendered) render();
+        fails = 0; setConn(true);
+        return true;
+      })
+      .catch(function () { fails++; setConn(false); return false; });
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    var delay = fails ? Math.min(POLL_MS * Math.pow(2, Math.min(fails, 4)), MAX_BACKOFF) : POLL_MS;
+    timer = setTimeout(tick, delay);
+  }
+  function tick() {
+    if (document.hidden) { schedule(); return; }
+    polls++;
+    poll(polls % FULL_EVERY === 0).then(schedule);
+  }
+
+  function autosize() {
+    input.style.height = 'auto';
+    var cap = Math.round(window.innerHeight * 0.4);
+    input.style.height = Math.min(input.scrollHeight + 2, cap) + 'px';
+  }
+
+  function doSend() {
+    if (sending) return;
+    var text = input.value;
+    if (!text.trim()) { input.focus(); return; }
+    if (text.length > MAX_CHARS) {
+      showErr('Too long — ' + text.length + ' of ' + MAX_CHARS + ' characters.');
+      return;
+    }
+    sending = true; sendBtn.disabled = true; clearErr();
+    fetch('/tasks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: text, from: 'web' })
+    }).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok) throw new Error((j && j.error) || ('send failed (HTTP ' + r.status + ')'));
+        return j;
+      });
+    }).then(function () {
+      input.value = '';            // cleared only after the POST succeeded
+      autosize();
+      return poll(false);
+    }).then(function () {
+      scrollBottom();
+    }).catch(function (err) {
+      // Draft is left untouched so nothing typed is ever lost.
+      showErr('Not sent — ' + ((err && err.message) || 'network error') + '. Your text is still here.');
+    }).then(function () {
+      sending = false; sendBtn.disabled = false;
+    });
+  }
+
+  sendBtn.addEventListener('click', doSend);
+  input.addEventListener('input', autosize);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSend(); }
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { clearTimeout(timer); fails = 0; tick(); }
+  });
+  window.addEventListener('resize', function () { if (nearBottom()) scrollBottom(); });
+
+  setInterval(refreshTimes, 30000);
+  render();
+  autosize();
+  poll(true).then(schedule);
+})();
+</script>
+</body>
+</html>
