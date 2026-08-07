@@ -1,12 +1,9 @@
 'use strict';
 /*
- * relay-queue — minimal durable local-only HTTP task queue.
- * Zero runtime dependencies. Node built-ins only. Run: node server.js
- *
- * Durability: every mutation is appended to data/events.jsonl (write + fsync)
- * BEFORE the HTTP response is sent, then replayed into memory on boot.
+ * relay-queue — minimal durable local-only HTTP task queue. Run: node server.js
+ * Zero runtime dependencies. Every mutation is appended to data/events.jsonl
+ * (write + fsync) BEFORE the response is sent, then replayed into memory on boot.
  */
-
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -19,11 +16,9 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'events.jsonl');
 const MAX_BODY = 1024 * 1024; // 1 MiB
 const STARTED_AT = Date.now();
-
 const STATUSES = ['pending', 'claimed', 'done'];
 
 // ---------------------------------------------------------------- event log
-
 /** @type {Map<string, object>} id -> task (insertion order == creation order) */
 const tasks = new Map();
 let logFd = null;
@@ -64,7 +59,6 @@ function replay() {
 }
 
 // ---------------------------------------------------------------- helpers
-
 const nowIso = () => new Date().toISOString();
 
 function newId() {
@@ -86,6 +80,7 @@ function send(res, code, obj) {
 }
 
 const fail = (res, code, error, extra) => send(res, code, { error, ...extra });
+const httpErr = (code, message) => Object.assign(new Error(message), { code });
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -93,27 +88,21 @@ function readBody(req) {
     let size = 0;
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) {
-        reject(Object.assign(new Error('body too large'), { code: 413 }));
-        req.destroy();
-        return;
-      }
+      if (size > MAX_BODY) { reject(httpErr(413, 'body too large')); req.destroy(); return; }
       chunks.push(c);
     });
+    req.on('error', () => reject(httpErr(400, 'request stream error')));
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8').trim();
-      if (!raw) return resolve({});
+      if (!raw) return resolve({}); // empty body is a valid "no fields" request
       try {
-        const parsed = JSON.parse(raw);
-        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          return reject(Object.assign(new Error('body must be a JSON object'), { code: 400 }));
-        }
-        resolve(parsed);
+        const body = JSON.parse(raw);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
+        resolve(body);
       } catch {
-        reject(Object.assign(new Error('malformed JSON body'), { code: 400 }));
+        reject(httpErr(400, 'malformed JSON body'));
       }
     });
-    req.on('error', () => reject(Object.assign(new Error('request stream error'), { code: 400 })));
   });
 }
 
@@ -128,9 +117,7 @@ function parseSince(raw) {
 function applyFilters(list, q) {
   const status = q.get('status');
   if (status !== null) {
-    if (!STATUSES.includes(status)) {
-      throw Object.assign(new Error(`invalid status "${status}"`), { code: 400 });
-    }
+    if (!STATUSES.includes(status)) throw httpErr(400, `invalid status "${status}"`);
     list = list.filter((t) => t.status === status);
   }
 
@@ -140,18 +127,14 @@ function applyFilters(list, q) {
   const since = q.get('since');
   if (since !== null) {
     const ms = parseSince(since);
-    if (ms === null) {
-      throw Object.assign(new Error(`invalid since "${since}" (want ISO 8601 or epoch ms)`), { code: 400 });
-    }
+    if (ms === null) throw httpErr(400, `invalid since "${since}" (want ISO 8601 or epoch ms)`);
     list = list.filter((t) => Date.parse(t.ts) > ms); // strictly after
   }
 
   const limit = q.get('limit');
   if (limit !== null) {
     const n = Number(limit);
-    if (!Number.isInteger(n) || n < 0) {
-      throw Object.assign(new Error(`invalid limit "${limit}"`), { code: 400 });
-    }
+    if (!Number.isInteger(n) || n < 0) throw httpErr(400, `invalid limit "${limit}"`);
     list = list.slice(0, n);
   }
   return list;
@@ -167,7 +150,6 @@ const counts = () => {
 };
 
 // ---------------------------------------------------------------- handlers
-
 function createTask(res, body) {
   const instruction = body.instruction;
   if (typeof instruction !== 'string' || !instruction.trim()) {
@@ -227,7 +209,6 @@ function relayTask(res, id) {
 }
 
 // ---------------------------------------------------------------- router
-
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const seg = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -301,10 +282,8 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------------------------------------------------------------- boot
-
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const replayed = replay();
-
 server.listen(PORT, HOST, () => {
   const c = counts();
   console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
@@ -312,12 +291,8 @@ server.listen(PORT, HOST, () => {
   console.log(`tasks: ${tasks.size} total — ${c.pending} pending, ${c.claimed} claimed, ${c.done} done, ${c.unrelayed} unrelayed`);
 });
 
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    server.close(() => {
-      if (logFd !== null) try { fs.closeSync(logFd); } catch { /* ignore */ }
-      process.exit(0);
-    });
-    setTimeout(() => process.exit(0), 2000).unref();
-  });
-}
+// Every write is already fsynced, so shutdown just needs to stop accepting.
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => {
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref(); // don't hang on keep-alive sockets
+});
