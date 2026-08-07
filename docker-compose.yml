@@ -1,0 +1,27 @@
+services:
+  relay-queue:
+    image: node:22-alpine
+    container_name: relay-queue
+    restart: unless-stopped
+    working_dir: /app
+    command: ["node", "server.js"]
+    environment:
+      # Inside the container we must bind all interfaces so the published port
+      # can reach us. The service stays local-only because the host side of the
+      # mapping below is pinned to 127.0.0.1.
+      HOST: "0.0.0.0"
+      PORT: "3901"
+    ports:
+      - "127.0.0.1:3901:3901"
+    volumes:
+      # Source is mounted read-only; only data/ is writable.
+      - D:/projects/relay-queue/server.js:/app/server.js:ro
+      - D:/projects/relay-queue/package.json:/app/package.json:ro
+      # Durable store, shared with the bare-node fallback.
+      - D:/projects/relay-queue/data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3901/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

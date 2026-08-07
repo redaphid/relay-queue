@@ -1,0 +1,20 @@
+# Queue contents are local runtime state, never committed.
+data/
+*.jsonl
+
+# Node (there are no dependencies, but keep this honest)
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Local overrides
+.env
+.env.*
+docker-compose.override.yml

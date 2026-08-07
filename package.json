@@ -1,0 +1,17 @@
+{
+  "name": "relay-queue",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal durable local-only HTTP task queue for passing tasks and results between agents. Zero runtime dependencies.",
+  "license": "MIT",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "up": "docker compose up -d",
+    "down": "docker compose down",
+    "logs": "docker compose logs -f"
+  }
+}
