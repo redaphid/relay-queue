@@ -144,10 +144,12 @@ function makeEnv(opts) {
   };
   const audio = makeAudio(store);
 
+  const rootStyle = { props: {}, setProperty(k, v) { this.props[k] = v; } };
   const doc = {
     activeElement: null,
     hidden: false,
     handlers: {},
+    documentElement: { style: rootStyle },
     getElementById: (id) => els[id] || null,
     querySelector: (sel) => (sel === '#meter i' ? meter : null),
     createElement: makeEl,
@@ -298,8 +300,10 @@ function makeEnv(opts) {
     });
   }
 
+  const cssVar = (k) => rootStyle.props[k];
+
   return {
-    sandbox, els, meter, posted, doc, store,
+    sandbox, els, meter, posted, doc, store, cssVar,
     feed, sayOneThing, sayAgain, agentReply, endPlayback, convReply,
     track, sent, stt, tts, reads,
   };
@@ -948,6 +952,59 @@ async function main() {
     check('and a later utterance posts to the new one',
       env.sent().length === 2 && env.sent()[1].body.conversationId === 'c2',
       JSON.stringify(env.sent().map((p) => p.body.conversationId)));
+  }
+
+  console.log('\ncolour — decoration that carries information');
+  {
+    const env = liveEnv();
+    await settle();
+    const mainHue = env.cssVar('--hue');
+    check('the page takes a hue from the conversation', mainHue !== undefined, String(mainHue));
+    check('a second hue is derived for the gradient', env.cssVar('--hue2') !== undefined);
+    check('the hue is a legal degree', Number(mainHue) >= 0 && Number(mainHue) < 360, String(mainHue));
+
+    env.els.convlist.children[1].dispatch('click'); // switch conversations
+    await settle();
+    check('switching conversation changes the colour', env.cssVar('--hue') !== mainHue,
+      `${mainHue} -> ${env.cssVar('--hue')}`);
+
+    const again = liveEnv();
+    await settle();
+    check('the same conversation always gets the same colour', again.cssVar('--hue') === mainHue,
+      `${again.cssVar('--hue')} vs ${mainHue}`);
+    check('each row in the menu is striped with its own colour',
+      again.els.convlist.children[0].style.borderLeftColor
+      !== again.els.convlist.children[1].style.borderLeftColor,
+      String(again.els.convlist.children[0].style.borderLeftColor));
+  }
+
+  console.log('\ncolour — message state is readable without relying on hue');
+  {
+    const env = liveEnv();
+    await settle();
+    const at = (n) => `2026-01-01T00:00:0${n}.000Z`;
+    env.store.es.onmessage({
+      data: JSON.stringify({
+        conversationId: 'main',
+        entries: [
+          { id: 'm1', role: 'user', text: 'one', ts: at(0), rev: at(0), status: 'pending', conversationId: 'main' },
+          { id: 'm2', role: 'user', text: 'two', ts: at(1), rev: at(1), status: 'claimed', conversationId: 'main' },
+          { id: 'm3', role: 'user', text: 'three', ts: at(2), rev: at(2), status: 'done', conversationId: 'main' },
+        ],
+      }),
+    });
+    await settle();
+    const bubbles = env.els.list.children;
+    check('every message rendered', bubbles.length === 3, `${bubbles.length}`);
+    check('pending carries its own class', /st-pending/.test(bubbles[0].className), bubbles[0].className);
+    check('claimed carries its own class', /st-claimed/.test(bubbles[1].className), bubbles[1].className);
+    check('answered carries its own class', /st-done/.test(bubbles[2].className), bubbles[2].className);
+    const chips = ['○ pending', '◐ claimed', '✓ answered'];
+    for (let i = 0; i < 3; i++) {
+      check(`state ${i + 1} is marked with a glyph as well as a colour`,
+        textOf(bubbles[i]).indexOf(chips[i]) > -1, textOf(bubbles[i]));
+    }
+    check('the three glyphs are all different', new Set(chips.map((c) => c[0])).size === 3);
   }
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');

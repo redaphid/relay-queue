@@ -30,11 +30,19 @@ services:
       # identity. Published on all interfaces this was readable and postable by
       # anyone on the LAN or Tailscale — and a post here makes agents act.
       #
-      # IPv4 only, deliberately: the tunnel's origin rule must be spelled
-      # 127.0.0.1:3901, NOT localhost:3901. cloudflared runs network_mode: host
-      # and resolves localhost to ::1 first, while Docker Desktop accepts a [::1]
-      # publish and then refuses connections on it — that combination took the
-      # page down once. Verify the ingress rule before ever touching this line.
+      # DO NOT narrow this to 127.0.0.1 — tried twice on 2026-08-08, both times it
+      # took the page down. cloudflared runs network_mode: host, and on Docker
+      # Desktop "host" is the WSL2 VM, not Windows. A 127.0.0.1 publish binds the
+      # *Windows* loopback, which that VM cannot reach: `dial tcp 127.0.0.1:3901:
+      # connect: connection refused`. Publishing on all interfaces is what makes
+      # the origin reachable from the tunnel at all. (The first attempt also hit a
+      # second trap: the ingress rule said "localhost", which resolves ::1 first,
+      # and Docker Desktop accepts a [::1] publish then refuses connections on it.)
+      #
+      # So the LAN exposure cannot be closed at this layer. The page has no login
+      # of its own, so anyone on the LAN or Tailscale can read it and post — and a
+      # post here makes agents act. Fix it in the app instead:
+      # .github-drafts/authenticate-the-queue.md
       - "3901:3901"
     volumes:
       # The whole working tree, read-only. Mounting the *directory* rather than

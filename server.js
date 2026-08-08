@@ -719,6 +719,276 @@ async function ttsRoute(req, res) {
   res.end(wav);
 }
 
+// ---------------------------------------------------------------- status
+/*
+ * GET /status — "is anything actually listening, or am I typing into a void?"
+ *
+ * That is the question this answers, and it is a question about TRUST, not
+ * statistics. Counts alone are reassurance theatre: a queue with nothing in it
+ * looks identical whether the whole agent side is healthy and caught up or has
+ * been dead for a day. So the headline combines *liveness* with *backlog*, and
+ * "idle, caught up" is never rendered the same way as "nothing is responding".
+ *
+ * Everything is derived from the task records already in memory and memoised on
+ * the mutation counter — this endpoint is polled, and it must never read the
+ * event log. Heartbeats live in memory only and are deliberately NOT written to
+ * the log: they are ephemeral liveness, not queue state, and one durable line
+ * per poll would bury the actual history.
+ */
+const HEARTBEATS = new Map(); // agent -> { at, note }
+const MAX_AGENTS = 20;
+const WATCHING_MS = 60 * 1000; // a check-in this recent means someone is there
+const SILENT_MS = 10 * 60 * 1000; // ...and this stale means nobody is
+const WORRY_MS = 4 * 60 * 1000; // pending work + this much silence is a problem
+const RECENT_N = 25; // activity rows returned
+const SAMPLE_N = 25; // most recent messages used for the timing sample
+
+function heartbeatRoute(res, body) {
+  const agent = typeof body.agent === 'string' && body.agent.trim() ? body.agent.trim().slice(0, 100) : 'agent';
+  const note = typeof body.note === 'string' ? body.note.slice(0, 200) : null;
+  const at = nowIso();
+  HEARTBEATS.set(agent, { at, note });
+  // Keep the newest few; a typo in an agent name should not grow forever.
+  if (HEARTBEATS.size > MAX_AGENTS) {
+    const oldest = [...HEARTBEATS.entries()].sort((a, b) => msOf(a[1].at) - msOf(b[1].at))[0];
+    if (oldest) HEARTBEATS.delete(oldest[0]);
+  }
+  send(res, 200, { ok: true, agent, lastSeen: at });
+}
+
+const secSince = (iso) => (iso ? Math.max(0, Math.round((Date.now() - msOf(iso)) / 1000)) : null);
+
+function quantiles(values) {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  return { median: s[Math.floor((s.length - 1) / 2)], worst: s[s.length - 1], samples: s.length };
+}
+
+/** Everything that only changes when the queue does. Memoised on `mutations`. */
+let derivedCache = { at: -1, value: null };
+
+function derivedStatus() {
+  if (derivedCache.at === mutations) return derivedCache.value;
+
+  const activity = [];
+  const claimSecs = [];
+  const answerSecs = [];
+  let oldestWaiting = null;
+  let lastMessageAt = null;
+  let lastClaimAt = null;
+  let lastResultAt = null;
+
+  for (const t of tasks.values()) {
+    const conversationId = convIdOf(t);
+    const snippet = (v) => asText(v).replace(/\s+/g, ' ').trim().slice(0, 120);
+
+    activity.push({ at: t.ts, kind: 'message', conversationId, who: t.from || null, text: snippet(t.instruction) });
+    if (!lastMessageAt || msOf(t.ts) > msOf(lastMessageAt)) lastMessageAt = t.ts;
+
+    if (t.claimedAt) {
+      activity.push({ at: t.claimedAt, kind: 'claimed', conversationId, who: t.claimedBy || null, text: snippet(t.instruction) });
+      if (!lastClaimAt || msOf(t.claimedAt) > msOf(lastClaimAt)) lastClaimAt = t.claimedAt;
+      claimSecs.push({ at: msOf(t.claimedAt), sec: Math.max(0, Math.round((msOf(t.claimedAt) - msOf(t.ts)) / 1000)) });
+    }
+    if (t.resultTs) {
+      activity.push({ at: t.resultTs, kind: 'answered', conversationId, who: t.claimedBy || null, text: snippet(t.result) });
+      if (!lastResultAt || msOf(t.resultTs) > msOf(lastResultAt)) lastResultAt = t.resultTs;
+      answerSecs.push({ at: msOf(t.resultTs), sec: Math.max(0, Math.round((msOf(t.resultTs) - msOf(t.ts)) / 1000)) });
+    }
+    if (t.status !== 'done') {
+      if (!oldestWaiting || msOf(t.ts) < msOf(oldestWaiting.ts)) oldestWaiting = t;
+    }
+  }
+
+  activity.sort((a, b) => msOf(b.at) - msOf(a.at));
+  const recentOf = (arr) => arr.sort((a, b) => b.at - a.at).slice(0, SAMPLE_N).map((x) => x.sec);
+
+  const value = {
+    recent: activity.slice(0, RECENT_N),
+    timeToClaim: quantiles(recentOf(claimSecs)),
+    timeToAnswer: quantiles(recentOf(answerSecs)),
+    oldestWaiting: oldestWaiting ? {
+      id: oldestWaiting.id,
+      conversationId: convIdOf(oldestWaiting),
+      status: oldestWaiting.status,
+      ts: oldestWaiting.ts,
+      text: asText(oldestWaiting.instruction).replace(/\s+/g, ' ').trim().slice(0, 120),
+    } : null,
+    lastMessageAt,
+    lastClaimAt,
+    lastResultAt,
+  };
+  derivedCache = { at: mutations, value };
+  return value;
+}
+
+/*
+ * Is anyone watching? A heartbeat is the direct answer. Without one we fall back
+ * to inference — an agent that claimed or answered something recently is
+ * evidently alive — so the page still says something useful even if nobody ever
+ * calls /heartbeat.
+ */
+function watchState(derived) {
+  const agents = [...HEARTBEATS.entries()]
+    .map(([name, h]) => ({ name, lastSeen: h.at, agoSec: secSince(h.at), note: h.note }))
+    .sort((a, b) => a.agoSec - b.agoSec);
+
+  if (agents.length) {
+    const best = agents[0];
+    const ms = best.agoSec * 1000;
+    return {
+      agents,
+      source: 'heartbeat',
+      state: ms <= WATCHING_MS ? 'watching' : ms <= SILENT_MS ? 'stale' : 'silent',
+      agent: best.name,
+      agoSec: best.agoSec,
+    };
+  }
+
+  // Nobody has ever checked in. Did an agent *do* anything recently?
+  const acted = [derived.lastClaimAt, derived.lastResultAt]
+    .filter(Boolean)
+    .sort((a, b) => msOf(b) - msOf(a))[0] || null;
+  return {
+    agents: [],
+    source: acted ? 'inferred' : 'none',
+    state: acted && Date.now() - msOf(acted) <= SILENT_MS ? 'stale' : 'unknown',
+    agent: null,
+    agoSec: secSince(acted),
+  };
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const humanAgo = (sec) => {
+  if (sec === null || sec === undefined) return 'never';
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.round(sec / 60)} min ago`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h ago`;
+  return `${Math.round(sec / 86400)}d ago`;
+};
+
+/*
+ * The one line at the top of the page. Levels are deliberately coarse:
+ *   ok    — someone is watching. Nothing to do.
+ *   idle  — nothing is waiting. Quiet is not broken, and must not look it.
+ *   warn  — work is waiting and the watcher is going stale.
+ *   alarm — work is waiting and nothing is answering.
+ * An empty queue can never reach `alarm`: with nothing to do, an agent that is
+ * not checking in is not yet a problem, and crying wolf at 3am is how a status
+ * page teaches you to ignore it.
+ */
+function headline(c, watch, derived) {
+  const waiting = c.pending + c.claimed;
+  const oldestSec = derived.oldestWaiting ? secSince(derived.oldestWaiting.ts) : null;
+  const seen = watch.state === 'watching' || watch.state === 'stale' || watch.source === 'inferred';
+
+  if (!waiting) {
+    if (watch.state === 'watching') return { level: 'ok', text: 'All caught up, and an agent is watching.' };
+    return {
+      level: 'idle',
+      text: seen ? 'All caught up. Nothing is waiting.' : 'Nothing is waiting.',
+    };
+  }
+
+  const what = c.pending
+    ? `${plural(c.pending, 'message', 'messages')} waiting`
+    : `${plural(c.claimed, 'message', 'messages')} being worked on`;
+
+  if (watch.state === 'watching') return { level: 'ok', text: `${what}, and an agent is watching.` };
+  if (watch.state === 'stale' && watch.agoSec * 1000 < WORRY_MS) {
+    return { level: 'ok', text: `${what}. Last checked in ${humanAgo(watch.agoSec)}.` };
+  }
+  if (oldestSec !== null && oldestSec * 1000 < WORRY_MS && !c.pending) {
+    return { level: 'ok', text: `${what}.` };
+  }
+  if (watch.source === 'none') {
+    return {
+      level: oldestSec !== null && oldestSec * 1000 > WORRY_MS ? 'alarm' : 'warn',
+      text: `${what}, and no agent has ever checked in.`,
+    };
+  }
+  return {
+    level: watch.state === 'silent' || watch.state === 'unknown' ? 'alarm' : 'warn',
+    text: `${what}, and nothing has checked in for ${humanAgo(watch.agoSec)}.`,
+  };
+}
+
+/*
+ * TCP reachability of the two voice engines, cached — the page may poll this,
+ * and opening a socket to each engine on every request would be rude to them
+ * and slow for us.
+ */
+const engineCache = new Map();
+const ENGINE_CACHE_MS = 15000;
+const ENGINE_TIMEOUT_MS = 1500;
+
+function probeEngine(name, host, port) {
+  const hit = engineCache.get(name);
+  if (hit && Date.now() - hit.at < ENGINE_CACHE_MS) return Promise.resolve(hit.value);
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const sock = net.createConnection({ host, port });
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      engineCache.set(name, { at: Date.now(), value });
+      resolve(value);
+    };
+    sock.setTimeout(ENGINE_TIMEOUT_MS, () => finish({ ok: false, host, port, error: 'timed out' }));
+    sock.on('connect', () => finish({ ok: true, host, port, ms: Date.now() - startedAt }));
+    sock.on('error', (err) => finish({ ok: false, host, port, error: err.code || err.message }));
+  });
+}
+
+async function statusRoute(req, res, q) {
+  const c = counts();
+  const derived = derivedStatus();
+  const watch = watchState(derived);
+  const body = {
+    now: nowIso(),
+    headline: headline(c, watch, derived),
+    watch,
+    counts: c,
+    server: {
+      name: NAME,
+      version: VERSION,
+      startedAt: new Date(STARTED_AT).toISOString(),
+      uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
+      streams: streams.size,
+      conversations: conversations.size,
+      tasks: tasks.size,
+    },
+    activity: {
+      lastMessageAt: derived.lastMessageAt,
+      lastMessageAgoSec: secSince(derived.lastMessageAt),
+      lastClaimAt: derived.lastClaimAt,
+      lastClaimAgoSec: secSince(derived.lastClaimAt),
+      lastResultAt: derived.lastResultAt,
+      lastResultAgoSec: secSince(derived.lastResultAt),
+    },
+    responsiveness: {
+      timeToClaimSec: derived.timeToClaim,
+      timeToAnswerSec: derived.timeToAnswer,
+      oldestWaiting: derived.oldestWaiting
+        ? { ...derived.oldestWaiting, waitingSec: secSince(derived.oldestWaiting.ts) }
+        : null,
+    },
+    recent: derived.recent,
+  };
+  // Probing costs a socket to each engine, so it is opt-out for callers that
+  // only want the cheap half.
+  if (q.get('engines') !== '0' && q.get('engines') !== 'false') {
+    const [stt, tts] = await Promise.all([
+      probeEngine('stt', STT_HOST, STT_PORT),
+      probeEngine('tts', TTS_HOST, TTS_PORT),
+    ]);
+    body.engines = { stt, tts };
+  }
+  send(res, 200, body);
+}
+
 // ---------------------------------------------------------------- client log
 /*
  * POST /client-log — write one line to stdout, visible in `docker logs relay-queue`.
@@ -958,6 +1228,18 @@ async function route(req, res) {
     }
     if (m === 'POST') return updateConversation(res, seg[1], await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /status — is anything actually listening?
+  if (seg.length === 1 && seg[0] === 'status') {
+    if (!need('GET')) return;
+    return statusRoute(req, res, q);
+  }
+
+  // /heartbeat — an agent saying "I am here". In memory only, never logged.
+  if (seg.length === 1 && seg[0] === 'heartbeat') {
+    if (!need('POST')) return;
+    return heartbeatRoute(res, await readBody(req));
   }
 
   // /client-log — one diagnostic line from the browser into the container log

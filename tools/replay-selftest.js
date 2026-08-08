@@ -50,14 +50,30 @@ function check(name, cond, detail) {
   console.log(`  FAIL ${name}${detail ? ' — ' + detail : ''}`);
 }
 
-const get = async (p) => (await fetch(BASE + p)).json();
-async function post(p, body) {
-  const res = await fetch(BASE + p, {
+const getAt = async (base, p) => (await fetch(base + p)).json();
+async function postAt(base, p, body) {
+  const res = await fetch(base + p, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body === undefined ? {} : body),
   });
   return { status: res.status, body: await res.json() };
+}
+const get = (p) => getAt(BASE, p);
+const post = (p, body) => postAt(BASE, p, body);
+
+/*
+ * Stop a child and wait for it to actually be gone. A process killed by a signal
+ * reports exitCode === null (signalCode carries the signal), so a naive
+ * `exitCode === null` guard re-kills an already-dead child and then awaits an
+ * 'exit' event that fired long ago — which hangs silently and, once the event
+ * loop drains, ends the run with no output and a success code.
+ */
+function stop(proc) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  const gone = new Promise((r) => proc.once('exit', r));
+  proc.kill('SIGTERM');
+  return gone;
 }
 
 async function waitForBoot(proc) {
@@ -175,8 +191,7 @@ async function main() {
       (await get('/conversations?archived=only')).conversations.some((c) => c.id === conv.body.id));
 
     console.log('\nit survives a restart with the new records in the log');
-    proc.kill('SIGTERM');
-    await new Promise((r) => proc.on('exit', r));
+    await stop(proc);
     const proc2 = spawn(process.execPath, [SERVER], {
       env: { ...process.env, DATA_DIR: dir, PORT: String(PORT), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -193,19 +208,109 @@ async function main() {
       check('the old messages are still there',
         (await get('/tasks')).tasks.some((t) => t.id === 'old-1'));
     } finally {
-      proc2.kill('SIGTERM');
-      await new Promise((r) => proc2.on('exit', r));
+      await stop(proc2);
     }
   } finally {
-    if (proc.exitCode === null) {
-      proc.kill('SIGTERM');
-      await new Promise((r) => proc.on('exit', r));
-    }
+    await stop(proc);
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows may hold it briefly */ }
   }
 
+  await statusChecks();
+
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
+}
+
+/*
+ * GET /status answers "is anything actually listening?", which is a question
+ * about trust. The failure that matters is not a wrong number — it is a quiet,
+ * healthy, caught-up queue rendering as an alarm, which teaches the user to
+ * ignore the page. These run against a fresh empty server so the queue state is
+ * exactly known.
+ */
+async function statusChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-status-'));
+  const port = PORT + 1;
+  const base = `http://127.0.0.1:${port}`;
+  const proc = spawn(process.execPath, [SERVER], {
+    env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout.on('data', () => {});
+  try {
+    for (let i = 0; i < 100; i++) {
+      try { if ((await fetch(`${base}/health`)).ok) break; } catch { /* not up */ }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    console.log('\nstatus — an empty queue is calm, not broken');
+    let s = await getAt(base, '/status?engines=0');
+    check('nothing waiting reads as idle', s.headline.level === 'idle',
+      `${s.headline.level}: ${s.headline.text}`);
+    check('*** a quiet queue is NEVER an alarm ***', s.headline.level !== 'alarm' && s.headline.level !== 'warn',
+      s.headline.text);
+    check('and it says so in plain words', /nothing is waiting/i.test(s.headline.text), s.headline.text);
+    check('it admits nobody has checked in', s.watch.source === 'none', JSON.stringify(s.watch));
+    check('there is nothing to measure yet', s.responsiveness.timeToAnswerSec === null);
+    check('and nothing waiting', s.responsiveness.oldestWaiting === null);
+
+    console.log('\nstatus — waiting work with nobody listening is an alarm');
+    await postAt(base, '/tasks', { text: 'is anyone there?' });
+    s = await getAt(base, '/status?engines=0');
+    check('a waiting message with no agent is raised', s.headline.level === 'warn' || s.headline.level === 'alarm',
+      `${s.headline.level}: ${s.headline.text}`);
+    check('it names the problem', /no agent has ever checked in/i.test(s.headline.text), s.headline.text);
+    check('the oldest waiting message is reported', !!s.responsiveness.oldestWaiting
+      && s.responsiveness.oldestWaiting.text === 'is anyone there?');
+    check('with how long it has been waiting',
+      typeof s.responsiveness.oldestWaiting.waitingSec === 'number');
+
+    console.log('\nstatus — a heartbeat changes the answer');
+    const hb = await postAt(base, '/heartbeat', { agent: 'coordinator', note: 'polling' });
+    check('a heartbeat is accepted', hb.status === 200 && hb.body.ok === true);
+    s = await getAt(base, '/status?engines=0');
+    check('the same queue now reads as fine', s.headline.level === 'ok',
+      `${s.headline.level}: ${s.headline.text}`);
+    check('it says an agent is watching', /an agent is watching/i.test(s.headline.text), s.headline.text);
+    check('the agent is named', s.watch.agents[0] && s.watch.agents[0].name === 'coordinator');
+    check('with its note', s.watch.agents[0].note === 'polling');
+    check('and the source is the heartbeat, not a guess', s.watch.source === 'heartbeat');
+
+    console.log('\nstatus — the rest of the picture');
+    const made = await postAt(base, '/tasks', { text: 'answer me' });
+    await postAt(base, `/tasks/${made.body.id}/claim`, { by: 'coordinator' });
+    await postAt(base, `/tasks/${made.body.id}/result`, { result: 'done' });
+    s = await getAt(base, '/status?engines=0');
+    check('timings appear once something is answered', !!s.responsiveness.timeToAnswerSec
+      && s.responsiveness.timeToAnswerSec.samples === 1, JSON.stringify(s.responsiveness.timeToAnswerSec));
+    check('recent activity lists what happened',
+      s.recent.some((r) => r.kind === 'answered') && s.recent.some((r) => r.kind === 'claimed')
+      && s.recent.some((r) => r.kind === 'message'), JSON.stringify(s.recent.map((r) => r.kind)));
+    check('activity is newest first', msOrder(s.recent), JSON.stringify(s.recent.map((r) => r.at)));
+    check('who did it is recorded', s.recent.some((r) => r.who === 'coordinator'));
+    check('engines are probed when asked',
+      !!(await getAt(base, '/status')).engines, 'no engines block');
+    check('...and skipped when not', (await getAt(base, '/status?engines=0')).engines === undefined);
+
+    console.log('\nstatus — heartbeats are liveness, not history');
+    const before = fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8');
+    await postAt(base, '/heartbeat', { agent: 'coordinator' });
+    await postAt(base, '/heartbeat', { agent: 'coordinator' });
+    await getAt(base, '/status?engines=0');
+    check('*** heartbeats are never written to the durable log ***',
+      fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8') === before,
+      'the event log grew — one line per poll would bury the real history');
+  } finally {
+    await stop(proc);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
+  }
+}
+
+function msOrder(rows) {
+  for (let i = 1; i < rows.length; i++) {
+    if (Date.parse(rows[i - 1].at) < Date.parse(rows[i].at)) return false;
+  }
+  return true;
 }
 
 main().catch((err) => { console.error('FAIL —', err); process.exit(1); });
