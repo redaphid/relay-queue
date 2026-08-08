@@ -194,6 +194,11 @@ interleave and each process only sees its own in-memory state.
 | `TTS_VOICE`     | —              | Forces a voice by name; unset uses the engine's default. |
 | `WATCH_SOURCE`  | `1`            | Exit when `server.js` changes so the supervisor restarts it. `0` disables. |
 | `WATCH_POLL_MS` | `2000`         | mtime poll interval for that watcher.                |
+| `PUSH`          | `1`            | Web push notifications. `0` disables the feature entirely. |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | — | Override the auto-generated pair. Normally unset: the server mints one on first boot and keeps it in `data/push-keys.json` (mode `600`). **Deleting that file invalidates every existing subscription**, because the browser pinned the public key when it subscribed. |
+| `VAPID_SUBJECT` | `mailto:relay@hypnodroid.com` | The contact address the push service is given. |
+| `PUSH_PER_HOUR` | `20`           | Hard ceiling on notifications sent per hour.         |
+| `PUSH_DEBOUNCE_MS` | —           | Override the per-category batching delay (normally 15s; 3s for `broken`). |
 
 ---
 
@@ -520,6 +525,100 @@ With **nothing waiting**, none of this applies and the page can never show worse
 **Heartbeats are held in memory and are never written to `events.jsonl`.** They are ephemeral
 liveness, not queue state, and one durable line per poll would bury the actual history. They are
 therefore forgotten on restart, which is honest — the restart is visible in `uptimeSec`.
+
+---
+
+## Getting his attention when the page is closed
+
+Everything above only reaches someone already looking at the tab, which is precisely when they do
+not need alerting. Web push is the path that works with the browser closed:
+
+```
+this server --(outbound HTTPS)--> Mozilla autopush / Google FCM --> the phone
+```
+
+The phone holds a long-lived connection to **its own browser vendor's** push service. That service
+is named by the subscription's `endpoint`, which is a `mozilla.com` or `google.com` URL — never
+`relay.hypnodroid.com`. So a notification arrives with the tab closed, with this machine's page
+unreachable, and with an expired Cloudflare Access session. Access only gates *opening* the page
+after tapping the notification. Everything the notification displays travels inside the encrypted
+payload, so the worker never fetches and an expired Access session can never silence it.
+
+No npm package: `push.js` implements RFC 8030/8291/8292 on node builtins. `tools/push-selftest.js`
+checks the encryption against the published RFC 8291 test vector, which is the only way to know it
+is right without a phone in the loop.
+
+### The three categories
+
+Three, because more than three or four is unlearnable by feel — the point is to know what happened
+without looking.
+
+| Category    | Means                            | Vibration              | Default TTL |
+| ----------- | -------------------------------- | ---------------------- | ----------- |
+| `needs-you` | something is waiting on an answer | two taps, then a long one | 6h |
+| `done`      | something finished                | two light taps         | 6h |
+| `broken`    | something failed                  | three long pulses      | 1h |
+
+Chosen automatically: a result or an agent `POST /messages` is `done`; a task posted by an agent is
+`needs-you`; the deadman reaching `alarm` is `broken`. **A task the page itself posted never
+notifies** — it is labelled `web`/`voice`/`voice-conversation`, and buzzing the phone that just sent
+the message is pure noise.
+
+Override it per call with `notify` on `POST /tasks`, `POST /tasks/:id/result` or `POST /messages`:
+
+```bash
+curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/json' \
+  -d '{"text":"the deploy failed","from":"vega","notify":"broken"}'
+
+# ...and the one every agent should reach for more often:
+curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/json' \
+  -d '{"text":"still working, 3 of 8 done","from":"vega","notify":"none"}'
+```
+
+**Anything with a `channel` is never notified, under any category, hint or config.** Agent-to-agent
+traffic is internal by construction and the notifier drops it before anything else happens.
+
+### Not spamming him
+
+- **Batched.** Notifications of a kind are held ~15s (3s for `broken`) and coalesced into one buzz
+  — "3 replies ready" rather than three separate ones.
+- **Self-cancelling.** An answer landing cancels the `needs-you` still waiting to go out, so the
+  post-a-task-then-answer-it pattern costs one buzz instead of two.
+- **Collapsed in transit.** Each category is sent with a push `Topic`, so a phone that has been
+  offline receives the *latest* of each kind rather than a week of backlog.
+- **Capped.** `PUSH_PER_HOUR` (default 20) is a hard ceiling.
+
+### Quiet hours
+
+Set a window and a timezone in Status → Alerts. The window is a plain membership test on
+minutes-past-midnight in a named IANA zone, evaluated **at send time**:
+
+- It cannot roll into tomorrow. `relay-watchdog`'s `--nudge-until` computed a datetime cutoff and
+  then did `if (cutoff <= now) cutoff += 1 day`, so the moment quiet time passed the window silently
+  became *tomorrow's* and stayed armed all night. There is no date here to roll forward.
+- It is anchored to a zone he sets, shown in the UI beside the current clock in that zone, because
+  he changes timezone and a window running on the wrong clock protects nobody. The panel offers one
+  tap to adopt the phone's own zone when they differ.
+- A zone the runtime cannot resolve falls back to UTC **and says so** (`zoneKnown: false`), rather
+  than quietly running on the wrong clock the way the watchdog container did.
+- Suppressed notifications are **dropped, not deferred** — holding them would deliver the whole
+  night at 07:00, and the thread is still there whenever he opens it. `broken` can be let through
+  with `brokenOverridesQuiet`, off by default.
+
+### When push is not available
+
+It degrades and never gets worse than it was:
+
+1. **Push** — the tab can be closed. Needs a granted permission, requested only on a deliberate tap.
+2. **Vibration while the page is open** — if push is unavailable, blocked, or not set up in this
+   browser. Same three patterns.
+3. **The hamburger dot and spoken replies** — what already existed, untouched.
+
+Subscriptions are **per browser, not per person**: Firefox and Chrome subscribe separately to
+different push services, so permission must be granted in each. The panel states "on for this
+browser" or "not set up in this browser" outright, because the alternative is granting it in one,
+opening the other, and concluding the feature is broken. Endpoints that answer `404`/`410` are
+deleted rather than retried forever.
 
 ---
 
@@ -1000,6 +1099,12 @@ JSON
 | GET    | `/status`             | **new** — is anything listening: headline, liveness, timings, recent activity |
 | POST   | `/heartbeat`          | **new** — an agent reporting that it is alive (memory only, never logged) |
 | POST   | `/client-log`         | one diagnostic line from the browser into the container log      |
+| GET    | `/sw.js`              | **new** — the service worker; the only file besides the page      |
+| GET    | `/push/config`        | **new** — VAPID key, quiet-hours state, armed devices; `deviceId` says whether *this* browser is armed |
+| POST   | `/push/config`        | **new** — set `timezone`, `quietFrom`, `quietTo`, `categories`, `brokenOverridesQuiet` |
+| POST   | `/push/subscribe`     | **new** — store a browser's push subscription (`400` if the keys will not encrypt) |
+| POST   | `/push/unsubscribe`   | **new** — forget one, by `deviceId` or `endpoint`                 |
+| POST   | `/push/test`          | **new** — send a test alert now, reporting per-device HTTP status |
 
 `POST /client-log` stores nothing and touches no queue state; it only writes a rate-limited,
 control-character-stripped line to stdout. It exists because the UI's real home is a phone, where

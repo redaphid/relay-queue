@@ -79,6 +79,24 @@ const CONVS = {
 let sse = [];
 const posted = [];
 const clientLogs = [];
+const pushPosts = [];
+// What /push/config answers: a browser that is NOT yet armed, and quiet hours
+// set in Iceland — so the page has to state a timezone that is not this
+// machine's, which is the case that matters while he is away.
+const PUSHCFG = {
+  enabled: true,
+  vapidPublicKey: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8',
+  subscribedHere: false,
+  devices: [],
+  categories: { 'needs-you': true, done: true, broken: false },
+  brokenOverridesQuiet: false,
+  quiet: {
+    timezone: 'Atlantic/Reykjavik', requestedTimezone: 'Atlantic/Reykjavik', zoneKnown: true,
+    zoneNow: '21:14', configured: true, active: false, from: '23:00', to: '07:30', changesInMin: 106,
+  },
+  budgetLeft: 20,
+  stats: { queued: 0, flushed: 0, suppressedQuiet: 0, suppressedBudget: 0, delivered: 0 },
+};
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
   const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
@@ -96,6 +114,19 @@ const server = http.createServer((req, res) => {
   }
   if (u.pathname === '/conversations') return json(CONVS);
   if (u.pathname === '/status') return json({ headline: { text: 'ok' }, counts: {} });
+  if (u.pathname === '/sw.js') {
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'service-worker-allowed': '/' });
+    return res.end(fs.readFileSync(path.join(__dirname, '..', 'public', 'sw.js')));
+  }
+  if (u.pathname === '/push/config') {
+    if (req.method === 'POST') {
+      let b = '';
+      req.on('data', (d) => { b += d; });
+      req.on('end', () => { try { pushPosts.push(JSON.parse(b)); } catch (e) { /* ignore */ } json(PUSHCFG); });
+      return;
+    }
+    return json(PUSHCFG);
+  }
   if (u.pathname === '/events') {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     res.write('retry: 3000\n\n');
@@ -158,6 +189,32 @@ function REACHABLE(sel) {
   const base = `http://127.0.0.1:${PORT}/`;
   const browser = await firefox.launch({ headless: true });
   const ctx = await browser.newContext({ viewport: VIEWPORT, userAgent: UA });
+  /*
+   * Record rather than perform. Headless Firefox will not really vibrate and
+   * cannot really reach a push service, but the two things worth asserting are
+   * behavioural, not physical: that a distinct pattern is requested, and that
+   * permission is NEVER requested without a tap. A permission prompt fired on
+   * load gets dismissed reflexively, and a dismissed permission is a dead
+   * feature that cannot be revived from inside the page.
+   */
+  await ctx.addInitScript(() => {
+    window.__vibes = [];
+    window.__permAsked = 0;
+    try {
+      Object.defineProperty(navigator, 'vibrate', {
+        configurable: true,
+        value: function (p) { window.__vibes.push(p); return true; },
+      });
+    } catch (e) { /* leave the real one in place */ }
+    try {
+      if (window.Notification) {
+        window.Notification.requestPermission = function () {
+          window.__permAsked++;
+          return Promise.resolve('default');
+        };
+      }
+    } catch (e) { /* ignore */ }
+  });
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
@@ -367,6 +424,118 @@ function REACHABLE(sel) {
 
   const resident = await page.evaluate(() => document.querySelectorAll('#list .msg').length);
   check(`the thread stays bounded with ${N} messages available`, resident <= 300, `${resident} resident`);
+
+  /*
+   * The degradation path: push is not armed here, so an agent reply arriving
+   * while the page is open must fall back to a buzz. This is the only signal
+   * that exists today besides the hamburger dot.
+   */
+  const buzzed = await page.evaluate(() => window.__vibes.slice());
+  check('an agent reply buzzes the phone when push is not armed', buzzed.length >= 1, JSON.stringify(buzzed));
+  check('...with the two-light-taps "finished" pattern',
+    buzzed.length >= 1 && JSON.stringify(buzzed[buzzed.length - 1]) === JSON.stringify([0, 50, 90, 50]),
+    JSON.stringify(buzzed[buzzed.length - 1]));
+
+  console.log('\nalerts can be set up with a thumb');
+  {
+    check('no permission was requested on load',
+      (await page.evaluate(() => window.__permAsked)) === 0,
+      String(await page.evaluate(() => window.__permAsked)));
+
+    await page.click('#menu');
+    await page.waitForTimeout(400);
+    await page.click('#statusopen');
+    await page.waitForTimeout(700);
+    await page.evaluate(() => {
+      const n = document.getElementById('notifybody');
+      if (n) n.scrollIntoView({ block: 'start' });
+    });
+    await page.waitForTimeout(400);
+
+    check('the alerts panel exists inside Status',
+      (await page.evaluate(() => !!document.querySelector('#notifybody .scard'))) === true);
+    check('it is NOT inside the block Status repaints every 5s',
+      (await page.evaluate(() => !document.querySelector('#statusbody #notifybody'))) === true);
+
+    for (const [name, sel] of [
+      ['the arm button', '#notifybody .nbtn.primary'],
+      ['the quiet-hours start time', '#nquietfrom'],
+      ['the quiet-hours end time', '#nquietto'],
+      ['the "broken" category box', '#ncat-broken'],
+    ]) {
+      const r = await page.evaluate(REACHABLE, sel);
+      check(`${name} is on screen and not covered`, r.ok, r.why);
+    }
+
+    const tall = await page.evaluate(() => {
+      const b = document.querySelector('#notifybody .nbtn.primary');
+      return b ? Math.round(b.getBoundingClientRect().height) : 0;
+    });
+    check('the arm button is a thumb-sized target', tall >= 44, `${tall}px`);
+
+    const state = await page.evaluate(() => {
+      const n = document.querySelector('#notifybody .nstate');
+      return n ? n.textContent : '';
+    });
+    check('it says plainly that this browser is not set up', state.indexOf('Not set up in this browser') >= 0, state);
+
+    /*
+     * He changes timezone this week. The panel must name the zone the quiet
+     * window is measured in, and the clock in it — a window that silently runs
+     * on the wrong zone is the watchdog bug wearing a different hat.
+     */
+    const tz = await page.evaluate(() => {
+      const n = document.querySelector('#notifybody .ntz');
+      return n ? n.textContent : '';
+    });
+    check('the timezone in force is named', tz.indexOf('Atlantic/Reykjavik') >= 0, tz);
+    check('...with the local time beside it', tz.indexOf('21:14') >= 0, tz);
+    check('...and when the window next changes', tz.indexOf('Quiet starts in') >= 0, tz);
+
+    const boxes = await page.evaluate(() => ({
+      done: document.getElementById('ncat-done').checked,
+      broken: document.getElementById('ncat-broken').checked,
+      from: document.getElementById('nquietfrom').value,
+      to: document.getElementById('nquietto').value,
+    }));
+    check('the categories reflect the server', boxes.done === true && boxes.broken === false, JSON.stringify(boxes));
+    check('the saved quiet hours are filled in', boxes.from === '23:00' && boxes.to === '07:30', JSON.stringify(boxes));
+
+    // Tapping a pattern's label plays it, so the three can be learnt on the ground.
+    await page.evaluate(() => { window.__vibes.length = 0; });
+    await page.click('label[for="ncat-broken"]');
+    await page.waitForTimeout(300);
+    const pat = await page.evaluate(() => window.__vibes.slice());
+    check('tapping a category plays its pattern', pat.length === 1, JSON.stringify(pat));
+    check('...and "broken" is three long pulses',
+      pat.length === 1 && JSON.stringify(pat[0]) === JSON.stringify([0, 300, 100, 300, 100, 300]),
+      JSON.stringify(pat[0]));
+
+    pushPosts.length = 0;
+    await page.click('#ncat-broken');
+    await page.waitForTimeout(500);
+    check('toggling a category saves it', pushPosts.length === 1 && pushPosts[0].categories, JSON.stringify(pushPosts));
+
+    check('still no permission prompt from any of that',
+      (await page.evaluate(() => window.__permAsked)) === 0);
+
+    // ...and only now, on a deliberate tap, is permission asked for.
+    await page.click('#notifybody .nbtn.primary');
+    await page.waitForTimeout(600);
+    check('tapping the arm button DOES ask for permission',
+      (await page.evaluate(() => window.__permAsked)) === 1,
+      String(await page.evaluate(() => window.__permAsked)));
+    const note = await page.evaluate(() => {
+      const n = document.querySelector('#notifybody .snote');
+      return n ? n.textContent : '';
+    });
+    check('a dismissed prompt explains what to do next', note.indexOf('Tap again') >= 0, note);
+
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(300);
+    check('Escape closes Status again',
+      (await page.evaluate(() => document.getElementById('statusview').hidden)) === true);
+  }
 
   console.log('\na tab that dies is reported by the next one');
   clientLogs.length = 0;

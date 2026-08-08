@@ -24,6 +24,7 @@
  * Nothing here touches the real data directory. Zero dependencies.
  */
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -219,9 +220,357 @@ async function main() {
 
   await statusChecks();
   await protocolChecks();
+  await pushChecks();
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
+}
+
+/** A structurally valid browser subscription, without a browser. */
+function fakeSubscription(n) {
+  const ecdh = crypto.createECDH('prime256v1');
+  ecdh.generateKeys();
+  return {
+    endpoint: `https://push.invalid/wpush/v2/token-${n}`,
+    keys: {
+      p256dh: ecdh.getPublicKey().toString('base64url'),
+      auth: crypto.randomBytes(16).toString('base64url'),
+    },
+  };
+}
+
+/*
+ * Web push, end to end over HTTP.
+ *
+ * The two checks that matter most live here rather than in push-selftest,
+ * because they are properties of the running server rather than of a function:
+ * a `channel` message must queue NOTHING, and quiet hours must actually
+ * suppress. The debounce is turned down to 120ms so a flush can be observed
+ * inside a test, and the counters on /push/config are the observation point —
+ * so no push service and no network are involved.
+ */
+async function pushChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-push-'));
+  const port = PORT + 4;
+  const base = `http://127.0.0.1:${port}`;
+  let proc = spawn(process.execPath, [SERVER], {
+    env: {
+      ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1',
+      WATCH_SOURCE: '0', PUSH_DEBOUNCE_MS: '120',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout.on('data', () => {});
+  proc.stderr.on('data', () => {});
+  const g = (p) => getAt(base, p);
+  const p_ = (path_, body) => postAt(base, path_, body);
+  const stats = async () => (await g('/push/config')).stats;
+  const settle = () => sleep(400); // comfortably past the 120ms debounce
+  const hhmm = (m) => {
+    const x = ((m % 1440) + 1440) % 1440;
+    return String(Math.floor(x / 60)).padStart(2, '0') + ':' + String(x % 60).padStart(2, '0');
+  };
+  const utcNowMin = () => {
+    const d = new Date();
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+  };
+
+  try {
+    await waitForBoot(proc, base);
+
+    console.log('\npush — the server offers a key and starts disarmed');
+    {
+      const cfg = await g('/push/config');
+      check('push is enabled', cfg.enabled === true);
+      check('a VAPID public key is published', typeof cfg.vapidPublicKey === 'string' && cfg.vapidPublicKey.length > 80);
+      check('the key is an uncompressed P-256 point',
+        Buffer.from(cfg.vapidPublicKey, 'base64url').length === 65 && Buffer.from(cfg.vapidPublicKey, 'base64url')[0] === 4);
+      check('no device is armed yet', cfg.devices.length === 0);
+      check('this browser is not armed', cfg.subscribedHere === false);
+      check('all three categories are on by default',
+        cfg.categories['needs-you'] && cfg.categories.done && cfg.categories.broken);
+      check('quiet hours start unset', cfg.quiet.configured === false);
+      check('the timezone in force is stated', typeof cfg.quiet.timezone === 'string' && cfg.quiet.timezone.length > 0);
+      check('the clock in that zone is stated beside it', /^\d\d:\d\d$/.test(cfg.quiet.zoneNow), cfg.quiet.zoneNow);
+      check('the key is stable across reads', (await g('/push/config')).vapidPublicKey === cfg.vapidPublicKey);
+    }
+
+    console.log('\npush — a channel message never reaches his phone');
+    {
+      /*
+       * Rule zero, over the wire. 19 of one night's messages were agent-to-agent
+       * coordination; if this regresses, every one of them buzzes him.
+       */
+      const before = await stats();
+      const r = await p_('/messages', { text: 'coordinating with vega', from: 'zora', channel: 'agents' });
+      check('the channel message was accepted', r.status === 201, String(r.status));
+      check('...and it is internal', r.body.visibility === 'internal');
+      await settle();
+      const after = await stats();
+      check('nothing was queued for him', after.queued === before.queued, `${before.queued} -> ${after.queued}`);
+      check('nothing was flushed', after.flushed === before.flushed);
+
+      const seen = await p_('/messages', { text: 'the thing you asked about is done', from: 'zora' });
+      check('the same message without a channel is accepted', seen.status === 201);
+      check('...and it is not internal', seen.body.visibility === 'conversation');
+      await settle();
+      const after2 = await stats();
+      check('...and it DOES queue a notification', after2.queued === before.queued + 1, String(after2.queued));
+      check('...and it flushes', after2.flushed === before.flushed + 1);
+    }
+
+    console.log('\npush — he is never buzzed by the phone he typed on');
+    {
+      const before = await stats();
+      for (const from of ['web', 'voice', 'voice-conversation']) {
+        await p_('/tasks', { text: `typed from ${from}`, from });
+      }
+      await settle();
+      check('three messages he sent himself queued nothing', (await stats()).queued === before.queued);
+
+      const handed = await p_('/tasks', { text: 'which branch should I merge?', from: 'vega' });
+      check('a task handed to him by an agent is accepted', handed.status === 201);
+      await settle();
+      check('...and that one does queue', (await stats()).queued === before.queued + 1);
+    }
+
+    console.log('\npush — an answer cancels the "needs you" still waiting to go out');
+    {
+      /*
+       * The documented way for an agent to speak unprompted is to post a task
+       * and immediately answer it. Without the cancel that is two buzzes for
+       * one update, which is exactly the noise he asked to be spared.
+       */
+      const before = await stats();
+      const t = await p_('/tasks', { text: 'unprompted update', from: 'vega' });
+      const answered = await p_(`/tasks/${t.body.id}/result`, { result: 'here it is' });
+      check('the result posted', answered.status === 200, String(answered.status));
+      await settle();
+      const after = await stats();
+      check('two things wanted to notify', after.queued === before.queued + 2);
+      check('but only one buzz went out', after.flushed === before.flushed + 1, `${before.flushed} -> ${after.flushed}`);
+    }
+
+    console.log('\npush — an explicit notify hint is honoured');
+    {
+      const before = await stats();
+      await p_('/messages', { text: 'routine progress', from: 'zora', notify: 'none' });
+      await settle();
+      check('notify:"none" queues nothing', (await stats()).queued === before.queued);
+      await p_('/messages', { text: 'the disk is full', from: 'zora', notify: 'broken' });
+      await settle();
+      check('notify:"broken" does queue', (await stats()).queued === before.queued + 1);
+    }
+
+    console.log('\npush — a silenced category queues nothing');
+    {
+      const off = await p_('/push/config', { categories: { done: false } });
+      check('a category can be turned off', off.status === 200 && off.body.categories.done === false);
+      const before = await stats();
+      await p_('/messages', { text: 'another finished thing', from: 'zora' });
+      await settle();
+      check('a "done" message is then ignored', (await stats()).queued === before.queued);
+      const on = await p_('/push/config', { categories: { done: true } });
+      check('and it can be turned back on', on.status === 200 && on.body.categories.done === true);
+      await p_('/messages', { text: 'and another', from: 'zora' });
+      await settle();
+      check('...after which it queues again', (await stats()).queued === before.queued + 1);
+    }
+
+    console.log('\npush — quiet hours actually suppress, which is the whole point');
+    {
+      /*
+       * The watchdog's quiet window silently became TOMORROW's the moment it
+       * passed, so it never suppressed anything and was found still armed at
+       * 05:00. This proves the running server drops a notification inside the
+       * window and sends it outside — anchored to a named zone, pinned to UTC
+       * here so the result does not depend on where this machine is.
+       */
+      const nowMin = utcNowMin();
+      const wrap = await p_('/push/config', {
+        timezone: 'UTC', quietFrom: hhmm(nowMin - 60), quietTo: hhmm(nowMin + 60),
+      });
+      check('the quiet window was accepted', wrap.status === 200, JSON.stringify(wrap.body).slice(0, 140));
+      check('...and reports itself active right now', wrap.body.quiet.active === true, JSON.stringify(wrap.body.quiet));
+      check('...naming the zone in force', wrap.body.quiet.timezone === 'UTC');
+      check('...and saying when it lifts', typeof wrap.body.quiet.changesInMin === 'number');
+
+      const before = await stats();
+      await p_('/messages', { text: 'this should be held back', from: 'zora' });
+      await settle();
+      const during = await stats();
+      check('the message was queued', during.queued === before.queued + 1);
+      check('but it was NOT flushed', during.flushed === before.flushed, `${before.flushed} -> ${during.flushed}`);
+      check('and it is counted as suppressed by quiet hours', during.suppressedQuiet === before.suppressedQuiet + 1);
+
+      const past = await p_('/push/config', { quietFrom: hhmm(nowMin - 61), quietTo: hhmm(nowMin - 60) });
+      check('a window that ended a minute ago is NOT active', past.body.quiet.active === false, JSON.stringify(past.body.quiet));
+      await p_('/messages', { text: 'this one should get through', from: 'zora' });
+      await settle();
+      check('...so the next message flushes', (await stats()).flushed === during.flushed + 1);
+
+      const cleared = await p_('/push/config', { quietFrom: null, quietTo: null });
+      check('quiet hours can be cleared entirely', cleared.body.quiet.configured === false);
+    }
+
+    console.log('\npush — "broken" can be let through the night, but only on request');
+    {
+      const nowMin = utcNowMin();
+      await p_('/push/config', { timezone: 'UTC', quietFrom: hhmm(nowMin - 60), quietTo: hhmm(nowMin + 60) });
+      const before = await stats();
+      await p_('/messages', { text: 'it is on fire', from: 'zora', notify: 'broken' });
+      await settle();
+      check('by default even "broken" is silenced at night', (await stats()).flushed === before.flushed);
+
+      const opt = await p_('/push/config', { brokenOverridesQuiet: true });
+      check('the override is off by default and can be set', opt.body.brokenOverridesQuiet === true);
+      const mid = await stats();
+      await p_('/messages', { text: 'still on fire', from: 'zora', notify: 'broken' });
+      await settle();
+      check('...after which "broken" gets through', (await stats()).flushed === mid.flushed + 1);
+      await p_('/messages', { text: 'a routine thing', from: 'zora' });
+      await settle();
+      check('...but "done" still does not', (await stats()).flushed === mid.flushed + 1);
+      await p_('/push/config', { quietFrom: null, quietTo: null, brokenOverridesQuiet: false });
+    }
+
+    console.log('\npush — the config refuses what it cannot honour');
+    {
+      check('an unknown timezone is refused', (await p_('/push/config', { timezone: 'Mars/Olympus_Mons' })).status === 400);
+      check('a malformed quiet time is refused', (await p_('/push/config', { quietFrom: '7:30' })).status === 400);
+      check('hour 24 is refused', (await p_('/push/config', { quietTo: '24:00' })).status === 400);
+      check('an empty change is refused', (await p_('/push/config', {})).status === 400);
+      const good = await p_('/push/config', { timezone: 'Atlantic/Reykjavik' });
+      check('a real timezone is accepted', good.status === 200 && good.body.quiet.timezone === 'Atlantic/Reykjavik');
+      check('...and reported as known', good.body.quiet.zoneKnown === true);
+      check('...with the local clock beside it', /^\d\d:\d\d$/.test(good.body.quiet.zoneNow));
+    }
+
+    console.log('\npush — subscriptions are per browser, replaced and not duplicated');
+    {
+      const fx = fakeSubscription('firefox');
+      const one = await p_('/push/subscribe', {
+        ...fx, deviceId: 'devicefirefox1',
+        ua: 'Mozilla/5.0 (Android 16; Mobile; rv:153.0) Gecko/153.0 Firefox/153.0',
+      });
+      check('a subscription is accepted', one.status === 201, JSON.stringify(one.body).slice(0, 140));
+      check('...and named by browser', one.body.label === 'Firefox 153', one.body.label);
+
+      const cfg = await g('/push/config?deviceId=devicefirefox1');
+      check('one device is armed', cfg.devices.length === 1);
+      check('...and this browser knows it is armed', cfg.subscribedHere === true);
+      check('a different browser is told it is NOT armed',
+        (await g('/push/config?deviceId=devicechrome1')).subscribedHere === false);
+      /*
+       * The endpoint is a capability URL — anyone holding it can buzz his phone
+       * — so it is never handed back out, not even to his own page.
+       */
+      check('the endpoint is never returned', JSON.stringify(cfg.devices).indexOf('push.invalid') === -1,
+        JSON.stringify(cfg.devices));
+      check('nor are the crypto keys', JSON.stringify(cfg.devices).indexOf(fx.keys.auth) === -1);
+
+      const again = await p_('/push/subscribe', {
+        ...fakeSubscription('firefox2'), deviceId: 'devicefirefox1', ua: 'Firefox/153.0',
+      });
+      check('re-subscribing the same browser is accepted', again.status === 201);
+      check('...and replaces rather than duplicates', (await g('/push/config')).devices.length === 1);
+
+      const chrome = await p_('/push/subscribe', {
+        ...fakeSubscription('chrome'), deviceId: 'devicechrome1',
+        ua: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
+      });
+      check('a second browser subscribes alongside the first', chrome.status === 201);
+      const both = await g('/push/config?deviceId=devicechrome1');
+      check('...so two devices are armed', both.devices.length === 2, String(both.devices.length));
+      check('...and Chrome is named', both.devices.some((d) => d.label === 'Chrome 150'));
+      check('...and Chrome knows it is armed', both.subscribedHere === true);
+
+      const off = await p_('/push/unsubscribe', { deviceId: 'devicechrome1' });
+      check('unsubscribing removes exactly one', off.status === 200 && off.body.removed === 1, JSON.stringify(off.body));
+      check('...leaving the other armed', (await g('/push/config')).devices.length === 1);
+      check('unsubscribing again removes nothing', (await p_('/push/unsubscribe', { deviceId: 'devicechrome1' })).body.removed === 0);
+    }
+
+    console.log('\npush — a subscription that cannot work is refused at the door');
+    {
+      const s = fakeSubscription('bad');
+      check('a plain http endpoint is refused',
+        (await p_('/push/subscribe', { ...s, endpoint: 'http://push.invalid/x' })).status === 400);
+      check('a missing endpoint is refused', (await p_('/push/subscribe', { keys: s.keys })).status === 400);
+      check('missing keys are refused', (await p_('/push/subscribe', { endpoint: s.endpoint })).status === 400);
+      /*
+       * Keys that will not encrypt are rejected here, where the page can say so,
+       * rather than silently at 3am when the notification does not arrive.
+       */
+      const short = await p_('/push/subscribe', { endpoint: s.endpoint, keys: { p256dh: 'AAAA', auth: s.keys.auth } });
+      check('a truncated p256dh is refused', short.status === 400, JSON.stringify(short.body).slice(0, 140));
+      check('...with a reason he could act on', String(short.body.error).indexOf('unusable') >= 0, String(short.body.error));
+      check('a truncated auth secret is refused',
+        (await p_('/push/subscribe', { endpoint: s.endpoint, keys: { p256dh: s.keys.p256dh, auth: 'AA' } })).status === 400);
+    }
+
+    console.log('\npush — the test button reports per browser, not just "ok"');
+    {
+      const r = await p_('/push/test', { category: 'done' });
+      check('the test endpoint answers', r.status === 200, String(r.status));
+      check('...listing every device it tried', Array.isArray(r.body.results) && r.body.results.length === 1,
+        JSON.stringify(r.body.results));
+      check('...with a label he can recognise', typeof r.body.results[0].label === 'string');
+      check('...and it honestly reports non-delivery', r.body.delivered === 0);
+      check('...and says whether quiet hours were on', typeof r.body.sentDuringQuietHours === 'boolean');
+    }
+
+    console.log('\npush — the service worker and the CSP that permits it');
+    {
+      /*
+       * The stand-in server in mobile-selftest does not apply the real CSP, so
+       * without this a service worker could pass every browser test and still be
+       * blocked in production by the old `worker-src blob:`.
+       */
+      const sw = await fetch(`${base}/sw.js`);
+      check('/sw.js is served', sw.status === 200, String(sw.status));
+      check('...as javascript', String(sw.headers.get('content-type')).indexOf('javascript') >= 0,
+        String(sw.headers.get('content-type')));
+      check('...with root scope allowed', sw.headers.get('service-worker-allowed') === '/');
+      check('...and never cached, because the checkout is the deployment',
+        String(sw.headers.get('cache-control')).indexOf('no-store') >= 0);
+      const body = await sw.text();
+      check('...and it handles push events', body.indexOf("addEventListener('push'") >= 0);
+      check('...and caches nothing at all', body.indexOf('caches.open') === -1);
+
+      const page = await fetch(`${base}/`);
+      const csp = String(page.headers.get('content-security-policy'));
+      check('the CSP allows a same-origin worker', csp.indexOf("worker-src 'self'") >= 0, csp);
+      check('...while still allowing the audio worklet blob', csp.indexOf('blob:') >= 0);
+      check('...and default-src is still none', csp.indexOf("default-src 'none'") >= 0);
+    }
+
+    console.log('\npush — what he armed survives a restart');
+    {
+      const keyBefore = (await g('/push/config')).vapidPublicKey;
+      await stop(proc);
+      proc = spawn(process.execPath, [SERVER], {
+        env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      proc.stdout.on('data', () => {});
+      proc.stderr.on('data', () => {});
+      await waitForBoot(proc, base);
+      const cfg = await g('/push/config?deviceId=devicefirefox1');
+      check('the armed device replayed from the log', cfg.devices.length === 1, String(cfg.devices.length));
+      check('...and is still recognised as this browser', cfg.subscribedHere === true);
+      check('the timezone replayed too', cfg.quiet.timezone === 'Atlantic/Reykjavik', cfg.quiet.timezone);
+      /*
+       * If the keys did not persist, every existing subscription would be dead
+       * on the next restart — and this server restarts on every source change.
+       */
+      check('the VAPID key is byte-identical after a restart', cfg.vapidPublicKey === keyBefore);
+      check('...and the counters reset with the process', cfg.stats.queued === 0);
+    }
+  } finally {
+    await stop(proc);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
+  }
 }
 
 /*

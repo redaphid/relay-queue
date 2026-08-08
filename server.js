@@ -8,6 +8,7 @@ const http = require('node:http');
 const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const NAME = 'relay-queue';
 const VERSION = '1.5.0';
@@ -101,6 +102,61 @@ const INTERNAL_PREFIX = '#';
 const isInternal = (t) => t.visibility === 'internal';
 const channelOf = (t) => (typeof t.channel === 'string' && t.channel ? t.channel : DEFAULT_CHANNEL);
 
+// --- web push --------------------------------------------------------------
+/*
+ * The only path that reaches him when the tab is closed.
+ *
+ * Everything before this could shout only at a page he was already looking at,
+ * which is exactly when he does not need shouting at. Delivery goes
+ *   this server -> Mozilla autopush / Google FCM -> his phone
+ * so it never traverses relay.hypnodroid.com, and Cloudflare Access is not in
+ * the path. See push.js for the specs and for why the crypto is hand-rolled.
+ *
+ * Three categories, deliberately: more than three or four is unlearnable by
+ * feel, and the whole point is that he can tell what happened without looking.
+ */
+const wp = require('./push.js');
+
+const PUSH_ON = process.env.PUSH !== '0';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:relay@hypnodroid.com';
+const KEYS_FILE = path.join(DATA_DIR, 'push-keys.json');
+const MAX_SUBS = 20;
+const MAX_PUSH_BODY = 140; // chars of preview; the rest is on the page
+const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 20);
+
+const CATEGORIES = ['needs-you', 'done', 'broken'];
+const NOTIFY_VALUES = new Set([...CATEGORIES, 'none']);
+/*
+ * How long to sit on a notification before sending. This is the anti-spam
+ * mechanism and it does three jobs at once: it collapses a burst into one buzz,
+ * it lets a "needs-you" be cancelled by its own answer arriving (the documented
+ * post-a-task-then-answer-it pattern would otherwise buzz him twice for one
+ * unprompted update), and it costs no latency he would notice on a phone.
+ */
+const PUSH_DEBOUNCE_MS = { 'needs-you': 15000, done: 15000, broken: 3000 };
+// One knob for all three, for tests and for an operator who wants it snappier.
+const PUSH_DEBOUNCE_OVERRIDE = Number(process.env.PUSH_DEBOUNCE_MS || 0) || null;
+const PUSH_TTL_SEC = { 'needs-you': 6 * 3600, done: 6 * 3600, broken: 3600 };
+const PUSH_URGENCY = { 'needs-you': 'high', done: 'normal', broken: 'high' };
+// The page labels its own posts, so this is how "he typed it" is told apart
+// from "an agent handed him something". Never buzz the phone that sent it.
+const PAGE_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
+
+/** @type {Map<string, object>} id -> { id, endpoint, p256dh, auth, ua, label, createdAt } */
+const subscriptions = new Map();
+let pushConfig = {
+  // UTC by default, and shown as such: an unset zone must *look* unset rather
+  // than pass for a local time that happens to be wrong. The UI offers one tap
+  // to adopt the phone's own zone, which is what makes this survive a flight.
+  timezone: 'UTC',
+  quietFrom: null,
+  quietTo: null,
+  categories: { 'needs-you': true, done: true, broken: true },
+  brokenOverridesQuiet: false,
+  updatedAt: null,
+};
+let vapidKeys = null;
+
 // ---------------------------------------------------------------- event log
 /** @type {Map<string, object>} id -> task (insertion order == creation order) */
 const tasks = new Map();
@@ -151,7 +207,17 @@ function applyEvent(ev) {
   } else if (ev.t === 'convpatch') {
     const conv = conversations.get(ev.id);
     if (conv) Object.assign(conv, ev.patch);
+  } else if (ev.t === 'sub') {
+    // One row per browser. Firefox and Chrome are separate subscriptions with
+    // separate push services, so this is a set and never a single value.
+    subscriptions.set(ev.sub.id, ev.sub);
+  } else if (ev.t === 'unsub') {
+    subscriptions.delete(ev.id);
+  } else if (ev.t === 'pushcfg') {
+    pushConfig = { ...pushConfig, ...ev.cfg };
   }
+  // An unknown `t` is ignored, as it always has been: a log written by a newer
+  // build replays on an older one without tripping it.
 }
 
 function appendEvent(ev) {
@@ -163,6 +229,7 @@ function appendEvent(ev) {
   applyEvent(ev);
   // Push to live pages, post-durability.
   if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
+  else if (ev.t === 'sub' || ev.t === 'unsub' || ev.t === 'pushcfg') { /* not thread state; nothing to stream */ }
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
   // An agent acting is what clears the deadman banner, and it must clear at once
   // rather than up to a tick later — recovery has to feel immediate to be trusted.
@@ -627,8 +694,11 @@ function sendIndex(res) {
     // `blob:` in script-src/worker-src is for the inline AudioWorklet used by voice
     // dictation — the worklet source is built into a Blob so the page stays one file.
     // It grants nothing new: the page already runs with 'unsafe-inline'.
+    // `worker-src 'self'` was added for /sw.js: a service worker must be a real
+    // same-origin file, a blob: worker cannot control the page, and without this
+    // registration fails silently in a way that looks like the browser's fault.
     'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; " +
-      "script-src 'unsafe-inline' blob:; worker-src blob:; img-src data:; " +
+      "script-src 'unsafe-inline' blob:; worker-src 'self' blob:; img-src data:; " +
       "media-src blob: data:; connect-src 'self'; " +
       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   });
@@ -1290,10 +1360,17 @@ function watchSnapshot() {
 }
 
 function pushWatch() {
-  if (streams.size === 0) return;
   const snap = watchSnapshot();
   const changed = snap.level !== lastWatchLevel;
   lastWatchLevel = snap.level;
+  /*
+   * Decided before the no-streams early return, on purpose. A push notification
+   * is the only thing that reaches him when no page is open, which is the exact
+   * case the old comment above called an "honest limit" — so it must not sit
+   * behind a check for whether a page is open.
+   */
+  if (changed) notifyWatchLevel(snap);
+  if (streams.size === 0) return;
   /*
    * Healthy and unchanged: say nothing. A quiet system should produce a quiet
    * stream. While it is bad we re-push every tick so the wording stays true —
@@ -1635,6 +1712,419 @@ function clientLogRoute(res, body) {
   send(res, 200, { ok: true });
 }
 
+// ---------------------------------------------------------------- web push
+/*
+ * Keys. Generated once and kept in data/ (gitignored, 0600) rather than asked
+ * for in the environment, so that merging this branch is the whole install —
+ * there is no key ceremony to perform on a phone at an airport. Losing the file
+ * invalidates every existing subscription, because the browser pinned this
+ * public key when it subscribed, so a failure to persist is shouted about.
+ */
+function loadVapidKeys() {
+  const fromEnv = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+  if (wp.looksLikeVapidKeys(fromEnv)) return fromEnv;
+  try {
+    const disk = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+    if (wp.looksLikeVapidKeys(disk)) return disk;
+  } catch { /* absent or corrupt: mint a new pair below */ }
+  const fresh = wp.generateVapidKeys();
+  try {
+    fs.writeFileSync(KEYS_FILE, JSON.stringify(fresh, null, 2) + '\n', { mode: 0o600 });
+  } catch (e) {
+    console.log(`[push] WARNING could not save VAPID keys to ${KEYS_FILE}: ${e.message}`);
+    console.log('[push] every restart will mint new keys and silently break existing subscriptions');
+  }
+  return fresh;
+}
+
+/*
+ * One row per browser, keyed by a device id the page keeps in localStorage.
+ * Re-subscribing from the same browser therefore *replaces* its own row instead
+ * of accumulating duplicates; a browser that never sends one falls back to a
+ * hash of its endpoint, which is stable for as long as the subscription is.
+ */
+function subIdFor(body, endpoint) {
+  const dev = typeof body.deviceId === 'string' ? body.deviceId.trim() : '';
+  if (/^[A-Za-z0-9_-]{8,64}$/.test(dev)) return `d-${dev}`;
+  return `e-${crypto.createHash('sha256').update(endpoint).digest('base64url').slice(0, 22)}`;
+}
+
+/** A short, honest name for a browser, for the "which devices are armed" list. */
+function browserLabel(ua) {
+  const s = String(ua || '');
+  const fx = /Firefox\/(\d+)/.exec(s);
+  if (fx) return `Firefox ${fx[1]}`;
+  const ch = /Chrome\/(\d+)/.exec(s);
+  if (ch) return `Chrome ${ch[1]}`;
+  return 'this browser';
+}
+
+function subscribeRoute(res, body) {
+  if (!PUSH_ON) return fail(res, 503, 'push is disabled on this server');
+  const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+  const keys = body.keys && typeof body.keys === 'object' ? body.keys : {};
+  const p256dh = typeof keys.p256dh === 'string' ? keys.p256dh : '';
+  const auth = typeof keys.auth === 'string' ? keys.auth : '';
+  if (!/^https:\/\/[^\s]+$/.test(endpoint) || endpoint.length > 1000) {
+    return fail(res, 400, 'endpoint is required and must be an https URL');
+  }
+  if (!p256dh || !auth) return fail(res, 400, 'keys.p256dh and keys.auth are required');
+  // Prove the keys encrypt before storing them, so a broken subscription fails
+  // here — where the page can say so — rather than silently at 3am.
+  try {
+    wp.encrypt(Buffer.from('probe'), p256dh, auth, {});
+  } catch (e) {
+    return fail(res, 400, `subscription keys are unusable: ${e.message}`);
+  }
+
+  const id = subIdFor(body, endpoint);
+  // Drop any other row holding this same endpoint, or the browser would get two.
+  for (const [otherId, s] of subscriptions) {
+    if (otherId !== id && s.endpoint === endpoint) appendEvent({ t: 'unsub', id: otherId });
+  }
+  if (!subscriptions.has(id) && subscriptions.size >= MAX_SUBS) {
+    return fail(res, 429, `too many devices subscribed (max ${MAX_SUBS})`);
+  }
+  const sub = {
+    id,
+    endpoint,
+    p256dh,
+    auth,
+    label: browserLabel(body.ua),
+    createdAt: nowIso(),
+  };
+  appendEvent({ t: 'sub', sub });
+  console.log(`[push] subscribed ${id} (${sub.label}) — ${subscriptions.size} device(s) armed`);
+  send(res, 201, { ok: true, id, label: sub.label, devices: subscriptions.size });
+}
+
+function unsubscribeRoute(res, body) {
+  const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+  let id = typeof body.id === 'string' ? body.id : '';
+  if (!id && typeof body.deviceId === 'string' && body.deviceId.trim()) id = `d-${body.deviceId.trim()}`;
+  let removed = 0;
+  for (const [subId, s] of [...subscriptions]) {
+    if (subId === id || (endpoint && s.endpoint === endpoint)) {
+      appendEvent({ t: 'unsub', id: subId });
+      removed++;
+    }
+  }
+  send(res, 200, { ok: true, removed, devices: subscriptions.size });
+}
+
+/** Everything the UI needs to state plainly what is and is not armed. */
+function pushSnapshot(deviceId) {
+  const quiet = wp.quietState(pushConfig);
+  const mine = typeof deviceId === 'string' && deviceId ? `d-${deviceId}` : null;
+  return {
+    enabled: PUSH_ON,
+    vapidPublicKey: vapidKeys ? vapidKeys.publicKey : null,
+    // Per-browser, because a subscription made in Firefox is invisible to
+    // Chrome. Without this the page cannot tell him "not set up *here*", and he
+    // grants permission once, opens the other browser, and thinks it is broken.
+    subscribedHere: mine ? subscriptions.has(mine) : false,
+    devices: [...subscriptions.values()].map((s) => ({
+      id: s.id,
+      label: s.label,
+      createdAt: s.createdAt,
+      // The endpoint is a capability URL — anyone holding it can buzz his
+      // phone — so it is never handed back out, not even to his own page.
+      failures: s.failures || 0,
+      lastOkAt: s.lastOkAt || null,
+    })),
+    categories: { ...pushConfig.categories },
+    brokenOverridesQuiet: !!pushConfig.brokenOverridesQuiet,
+    quiet,
+    budgetLeft: pushBudget,
+    stats: { ...pushStats },
+  };
+}
+
+function pushConfigRoute(res, body) {
+  const cfg = {};
+  if (body.timezone !== undefined) {
+    const tz = String(body.timezone || '').trim();
+    if (!wp.zoneIsKnown(tz)) return fail(res, 400, `unknown timezone "${tz}"`);
+    cfg.timezone = tz;
+  }
+  for (const [field, key] of [['quietFrom', 'quietFrom'], ['quietTo', 'quietTo']]) {
+    if (body[field] === undefined) continue;
+    if (body[field] === null || body[field] === '') { cfg[key] = null; continue; }
+    if (wp.parseHhMm(body[field]) === null) return fail(res, 400, `${field} must be "HH:MM" in 24-hour time`);
+    cfg[key] = String(body[field]).trim();
+  }
+  if (body.categories && typeof body.categories === 'object') {
+    const next = { ...pushConfig.categories };
+    for (const c of CATEGORIES) if (typeof body.categories[c] === 'boolean') next[c] = body.categories[c];
+    cfg.categories = next;
+  }
+  if (typeof body.brokenOverridesQuiet === 'boolean') cfg.brokenOverridesQuiet = body.brokenOverridesQuiet;
+  if (Object.keys(cfg).length === 0) return fail(res, 400, 'nothing to change');
+  cfg.updatedAt = nowIso();
+  appendEvent({ t: 'pushcfg', cfg });
+  send(res, 200, pushSnapshot(typeof body.deviceId === 'string' ? body.deviceId : null));
+}
+
+/*
+ * Categorisation. Pure and exported, because this is the rule that must never
+ * regress: agent-to-agent traffic on `channel` carries visibility:'internal'
+ * and must not reach his phone under any category, any hint, or any config.
+ */
+function classify(kind, task, hint) {
+  if (!task || isInternal(task)) return null; // rule zero, before anything else
+  if (hint === 'none') return null;
+  if (hint && NOTIFY_VALUES.has(hint)) return hint;
+  if (kind === 'result' || kind === 'message') return 'done';
+  if (kind === 'task') {
+    // He typed it himself. Never buzz the phone that just sent the message.
+    if (PAGE_ORIGINS.has(task.from)) return null;
+    return 'needs-you';
+  }
+  return null;
+}
+
+function readNotifyHint(body) {
+  const v = body && typeof body.notify === 'string' ? body.notify.trim() : '';
+  return NOTIFY_VALUES.has(v) ? v : null;
+}
+
+// ---- the outbound queue
+let pushBudget = PUSH_PER_HOUR;
+setInterval(() => { pushBudget = PUSH_PER_HOUR; }, 3600000).unref();
+/** @type {Map<string, object>} category -> { count, body, url, taskIds:Set, timer } */
+const pushPending = new Map();
+/*
+ * Counters, exposed on /push/config. Two jobs: they let the selftest prove over
+ * HTTP that a `channel` message queues nothing and that quiet hours really do
+ * suppress, and they answer "has this thing ever actually fired?" — which is
+ * otherwise unanswerable from a phone.
+ */
+const pushStats = { queued: 0, flushed: 0, suppressedQuiet: 0, suppressedBudget: 0, delivered: 0 };
+let notifyDepth = 0; // guards the appendEvent -> pushWatch -> notify re-entry
+
+const PUSH_TITLE = {
+  'needs-you': (n) => (n > 1 ? `${n} things need you` : 'Needs you'),
+  done: (n) => (n > 1 ? `${n} replies ready` : 'Reply ready'),
+  broken: () => 'Something is broken',
+};
+
+function preview(v) {
+  const s = asText(v === null || v === undefined ? '' : v).replace(/\s+/g, ' ').trim();
+  return s.length > MAX_PUSH_BODY ? `${s.slice(0, MAX_PUSH_BODY - 1)}…` : s;
+}
+
+/** Queue one notification, coalescing into whatever is already waiting. */
+function queueNotify(category, text, conversationId, taskId) {
+  if (!PUSH_ON || !CATEGORIES.includes(category)) return;
+  if (pushConfig.categories[category] === false) return;
+  let slot = pushPending.get(category);
+  if (!slot) {
+    slot = { count: 0, body: '', url: '/', taskIds: new Set(), timer: null };
+    pushPending.set(category, slot);
+  }
+  slot.count++;
+  pushStats.queued++;
+  slot.body = preview(text);
+  if (conversationId) slot.url = `/#/c/${encodeURIComponent(conversationId)}`;
+  if (taskId) slot.taskIds.add(taskId);
+  if (!slot.timer) {
+    const wait = PUSH_DEBOUNCE_OVERRIDE || PUSH_DEBOUNCE_MS[category] || 15000;
+    slot.timer = setTimeout(() => flushNotify(category), wait);
+    if (slot.timer.unref) slot.timer.unref();
+  }
+}
+
+/*
+ * An answer landing cancels the "needs you" that was still waiting to go out.
+ * This is what makes the agents' post-a-task-then-answer-it pattern cost one
+ * buzz instead of two, and it is why the debounce exists at all.
+ */
+function cancelPendingFor(taskId) {
+  const slot = pushPending.get('needs-you');
+  if (!slot || !slot.taskIds.has(taskId)) return;
+  slot.taskIds.delete(taskId);
+  slot.count = Math.max(0, slot.count - 1);
+  if (slot.count === 0) {
+    if (slot.timer) clearTimeout(slot.timer);
+    pushPending.delete('needs-you');
+  }
+}
+
+function flushNotify(category) {
+  const slot = pushPending.get(category);
+  pushPending.delete(category);
+  if (!slot || slot.count === 0) return;
+  if (slot.timer) clearTimeout(slot.timer);
+
+  /*
+   * Quiet hours are decided here, at send time, not when the event was queued —
+   * so a message that arrives at 22:29 and flushes at 22:30 is correctly
+   * silenced. Suppressed notifications are DROPPED, never deferred: holding
+   * them would deliver the whole night in one avalanche at 07:00, and the
+   * thread is still there for him whenever he opens it.
+   */
+  const quiet = wp.quietState(pushConfig);
+  if (quiet.active && !(category === 'broken' && pushConfig.brokenOverridesQuiet)) {
+    pushStats.suppressedQuiet++;
+    console.log(`[push] suppressed ${category} x${slot.count} — quiet hours ${quiet.from}-${quiet.to} ${quiet.timezone} (now ${quiet.zoneNow})`);
+    return;
+  }
+  if (pushBudget <= 0) {
+    pushStats.suppressedBudget++;
+    console.log(`[push] suppressed ${category} x${slot.count} — hourly budget of ${PUSH_PER_HOUR} spent`);
+    return;
+  }
+  pushBudget--;
+  pushStats.flushed++;
+
+  const payload = JSON.stringify({
+    c: category,
+    t: PUSH_TITLE[category](slot.count),
+    b: slot.body,
+    u: slot.url,
+    n: slot.count,
+  });
+  sendToAll(payload, category).catch((e) => console.log(`[push] send failed: ${e && e.message}`));
+}
+
+/*
+ * Fan out to every subscribed browser. Delivered if any one succeeds — he
+ * carries one phone but may have armed both Firefox and Chrome on it.
+ */
+async function sendToAll(payload, category) {
+  if (!vapidKeys || subscriptions.size === 0) return 0;
+  const opts = {
+    keys: vapidKeys,
+    subject: VAPID_SUBJECT,
+    ttl: PUSH_TTL_SEC[category] || 3600,
+    urgency: PUSH_URGENCY[category] || 'normal',
+    // Same topic replaces an undelivered message of the same kind rather than
+    // queueing both. On a plane with the phone offline this is what stops a
+    // week of backlog landing at once — he gets the latest of each kind.
+    topic: category,
+  };
+  let ok = 0;
+  const results = [];
+  for (const sub of [...subscriptions.values()]) {
+    const r = await wp.sendOne(sub, payload, opts);
+    results.push({ id: sub.id, label: sub.label, status: r.status, gone: !!r.gone, error: r.error || null });
+    if (r.gone) {
+      // 404/410 is permanent: permission revoked, browser data cleared, or the
+      // subscription rotated. Retrying it forever is how this store rots.
+      console.log(`[push] dropping dead subscription ${sub.id} (${sub.label}) — HTTP ${r.status}`);
+      notifyDepth++;
+      try { appendEvent({ t: 'unsub', id: sub.id }); } finally { notifyDepth--; }
+      continue;
+    }
+    if (r.status >= 200 && r.status < 300) {
+      ok++;
+      pushStats.delivered++;
+      sub.failures = 0;
+      sub.lastOkAt = nowIso();
+      continue;
+    }
+    sub.failures = (sub.failures || 0) + 1;
+    console.log(`[push] ${sub.id} (${sub.label}) HTTP ${r.status}${r.error ? ` ${r.error}` : ''} — failure ${sub.failures}`);
+    if (sub.failures >= 5) {
+      // Not "gone", but consistently refused — most often a VAPID key that no
+      // longer matches the one the browser pinned. It will never recover.
+      console.log(`[push] dropping ${sub.id} after ${sub.failures} consecutive failures`);
+      notifyDepth++;
+      try { appendEvent({ t: 'unsub', id: sub.id }); } finally { notifyDepth--; }
+    }
+  }
+  if (ok) console.log(`[push] sent ${category} to ${ok} device(s)`);
+  return { ok, results };
+}
+
+/*
+ * POST /push/test — let him prove it works with his thumb, before he needs it.
+ *
+ * A deliberate action, so it skips the debounce and is not silenced by quiet
+ * hours; it says which it did. It reports per-device HTTP status rather than a
+ * bare ok, because the entire value of this endpoint is telling him *which*
+ * browser is actually armed — the failure he will otherwise hit is granting
+ * permission in Firefox, opening Chrome, and concluding the feature is broken.
+ */
+async function pushTestRoute(res, body) {
+  if (!PUSH_ON) return fail(res, 503, 'push is disabled on this server');
+  if (subscriptions.size === 0) {
+    return fail(res, 409, 'no browser is subscribed yet — tap "Alert me on this phone" first');
+  }
+  const category = CATEGORIES.includes(body && body.category) ? body.category : 'done';
+  const quiet = wp.quietState(pushConfig);
+  const payload = JSON.stringify({
+    c: category,
+    t: PUSH_TITLE[category](1),
+    b: quiet.active
+      ? `Test — it works. (Quiet hours are on right now; a real ${category} alert would have been held back.)`
+      : 'Test — it works. This is what a real alert will feel like.',
+    u: '/',
+    n: 1,
+  });
+  const out = await sendToAll(payload, category);
+  send(res, 200, {
+    ok: out.ok > 0,
+    delivered: out.ok,
+    sentDuringQuietHours: quiet.active,
+    quiet,
+    results: out.results,
+  });
+}
+
+/** The one entry point the task lifecycle calls. */
+function notify(kind, task, hint) {
+  if (!PUSH_ON || notifyDepth > 0) return;
+  if (kind === 'result' && task) cancelPendingFor(task.id);
+  const category = classify(kind, task, hint);
+  if (!category) return;
+  const text = kind === 'result' ? task.result : task.instruction;
+  queueNotify(category, text, task.conversationId, task.id);
+}
+
+/** The deadman banner, but for a phone with no page open. */
+function notifyWatchLevel(snap) {
+  if (!PUSH_ON || notifyDepth > 0) return;
+  // A restart is not a breakage. watchSnapshot() already refuses to alarm out
+  // of a fresh boot; this server restarts itself on every source change, so
+  // without that the deploy loop alone would buzz him.
+  if (snap.starting) return;
+  if (snap.level !== 'alarm') return; // `warn` is not worth a buzz; `alarm` is
+  queueNotify('broken', snap.text || 'The queue has stopped being answered.', DEFAULT_CONV, null);
+}
+
+/*
+ * GET /sw.js — the service worker.
+ *
+ * The page is otherwise deliberately one self-contained file. This is the one
+ * unavoidable second file: a service worker must be a real same-origin script
+ * (a blob: worker cannot receive push events), so it cannot be inlined.
+ */
+let swCache = null;
+const SW_FILE = path.join(__dirname, 'public', 'sw.js');
+
+function sendServiceWorker(res) {
+  let stat;
+  try { stat = fs.statSync(SW_FILE); } catch { return fail(res, 503, 'service worker not found on disk'); }
+  try {
+    if (!swCache || swCache.mtimeMs !== stat.mtimeMs) {
+      swCache = { mtimeMs: stat.mtimeMs, buf: fs.readFileSync(SW_FILE) };
+    }
+  } catch {
+    return fail(res, 503, 'service worker is unreadable');
+  }
+  res.writeHead(200, {
+    'content-type': 'text/javascript; charset=utf-8',
+    'content-length': swCache.buf.length,
+    // The checkout is the deployment here, so a cached worker is how you ship a
+    // page nobody can update. Never store it.
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'service-worker-allowed': '/',
+  });
+  res.end(swCache.buf);
+}
+
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
   // `text` is the UI's field name and an alias for `instruction`; both are accepted.
@@ -1669,6 +2159,7 @@ function createTask(res, body) {
     relayedAt: null,
   };
   appendEvent({ t: 'create', task });
+  notify('task', task, readNotifyHint(body));
   send(res, 201, task);
 }
 
@@ -1765,6 +2256,9 @@ function createMessage(res, body) {
   }
 
   appendEvent({ t: 'create', task });
+  // classify() drops anything internal, so a `channel` message can never buzz
+  // his phone — that is the single most important rule in this whole feature.
+  notify('message', task, readNotifyHint(body));
   send(res, 201, task);
 }
 
@@ -1852,6 +2346,7 @@ function resultTask(res, id, body) {
   }
   // A result may be posted straight to a pending task; no claim required.
   appendEvent({ t: 'patch', id, patch: { status: 'done', result: body.result, resultTs: nowIso() } });
+  notify('result', task, readNotifyHint(body));
   send(res, 200, task);
 }
 
@@ -2053,6 +2548,34 @@ async function route(req, res) {
     return clientLogRoute(res, await readBody(req));
   }
 
+  // /sw.js — the service worker, the one file the page cannot inline
+  if (seg.length === 1 && seg[0] === 'sw.js') {
+    if (!need('GET')) return;
+    return sendServiceWorker(res);
+  }
+
+  // /push/* — web push subscriptions and the quiet-hours config
+  if (seg.length === 2 && seg[0] === 'push') {
+    const what = seg[1];
+    if (what === 'config') {
+      if (m === 'GET') return send(res, 200, pushSnapshot(q.get('deviceId')));
+      if (m === 'POST') return pushConfigRoute(res, await readBody(req));
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
+    if (what === 'subscribe') {
+      if (!need('POST')) return;
+      return subscribeRoute(res, await readBody(req));
+    }
+    if (what === 'unsubscribe') {
+      if (!need('POST')) return;
+      return unsubscribeRoute(res, await readBody(req));
+    }
+    if (what === 'test') {
+      if (!need('POST')) return;
+      return pushTestRoute(res, await readBody(req));
+    }
+  }
+
   // /events — Server-Sent Events push of every change
   if (seg.length === 1 && seg[0] === 'events') {
     if (!need('GET')) return;
@@ -2173,7 +2696,7 @@ const server = http.createServer((req, res) => {
  * `require('./server.js')` gives you the functions and nothing else — no port
  * bound, no data directory touched, no timers running.
  */
-module.exports = { repairTranscript, metaphone, headline, stuckClaims };
+module.exports = { repairTranscript, metaphone, headline, stuckClaims, classify, browserLabel };
 
 if (require.main !== module) return;
 
@@ -2181,6 +2704,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 ensureDefaultConv(); // before replay, so a rename of it replays onto something
 const replayed = replay();
 ensureDefaultConv(); // ...and after, in case the log somehow removed it
+if (PUSH_ON) vapidKeys = loadVapidKeys(); // after mkdir: the key file lives in DATA_DIR
 server.listen(PORT, HOST, () => {
   const c = counts();
   console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
@@ -2188,6 +2712,13 @@ server.listen(PORT, HOST, () => {
   const ui = findUiFile();
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);
   console.log(`tasks: ${tasks.size} total — ${c.pending} pending, ${c.claimed} claimed, ${c.done} done, ${c.unrelayed} unrelayed`);
+  if (!PUSH_ON) {
+    console.log('push: disabled (PUSH=0)');
+  } else {
+    const quiet = wp.quietState(pushConfig);
+    console.log(`push: ${subscriptions.size} device(s) armed; quiet hours ${quiet.configured ? `${quiet.from}-${quiet.to}` : 'off'} in ${quiet.timezone} (now ${quiet.zoneNow}${quiet.active ? ', ACTIVE' : ''})`);
+    if (!quiet.zoneKnown) console.log(`push: WARNING timezone "${quiet.requestedTimezone}" is unknown to this runtime — falling back to UTC`);
+  }
 });
 
 // The deadman's clock. Stale work is the absence of events, so only a timer can

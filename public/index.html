@@ -252,6 +252,31 @@
   .sline .t { overflow-wrap: anywhere; }
   .snote { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
   .sempty { font-size: 15px; color: var(--muted); }
+  /* ---- alerts: web push, quiet hours, and what is actually armed ---- */
+  .nbtn {
+    display: block; width: 100%; min-height: 48px; margin-top: 8px; padding: 0 14px;
+    font: inherit; font-size: 15px; color: var(--fg); text-align: left;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+    -webkit-appearance: none; appearance: none; cursor: pointer;
+  }
+  .nbtn.primary { color: #fff; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .nbtn[disabled] { opacity: .5; cursor: default; }
+  /* The one line that answers "is this browser armed?" — stated, never implied. */
+  .nstate { display: flex; gap: 8px; align-items: baseline; font-size: 15px; padding: 2px 0 6px; }
+  .nstate .dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--off); }
+  .nstate.on .dot { background: #1a7f4b; }
+  .nstate.warn .dot { background: var(--rec); }
+  @media (prefers-color-scheme: dark) { .nstate.on .dot { background: #4ade80; } }
+  .nrow { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 15px; }
+  .nrow label { flex: 1 1 auto; min-width: 0; }
+  .nrow input[type="time"], .nrow select {
+    font: inherit; font-size: 15px; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 44px;
+    -webkit-appearance: none; appearance: none; max-width: 58%;
+  }
+  .nrow input[type="checkbox"] { flex: 0 0 auto; width: 22px; height: 22px; accent-color: var(--accent); }
+  .ntz { font-size: 13px; color: var(--muted); margin: 6px 0 0; overflow-wrap: anywhere; }
+  .ntz b { color: var(--fg); font-weight: 600; }
   #conn { margin-left: auto; font-size: 13px; color: var(--off); display: none; }
   #conn.show { display: inline; }
   /* Speaker toggle: mutes spoken replies independently of the microphone. */
@@ -535,6 +560,12 @@
       <button id="statusclose" type="button" aria-label="Close">&times;</button>
     </div>
     <div id="statusbody"></div>
+    <!--
+      Built once by initNotify(), and deliberately a SIBLING of #statusbody:
+      renderStatus() wipes #statusbody every 5s while this view is open, which
+      would destroy any control placed inside it mid-tap.
+    -->
+    <div id="notifybody"></div>
   </section>
 
 <script>
@@ -1861,6 +1892,10 @@
     statusBody.textContent = '';
     statusBody.appendChild(el('div', 'sempty', 'Checking…'));
     loadStatus();
+    // Re-read the alert state on open, not on the 5s status tick: the only
+    // thing that moves is the quiet-hours clock, and polling it would burn
+    // data he is paying roaming rates for.
+    if (nEls) { nEls.note.textContent = ''; loadPushConfig(); }
     clearInterval(statusTimer);
     statusTimer = setInterval(function () { if (statusOn && !document.hidden) loadStatus(); }, STATUS_MS);
   }
@@ -1877,6 +1912,384 @@
     if (statusOpen) statusOpen.addEventListener('click', showStatus);
     if (statusClose) statusClose.addEventListener('click', hideStatus);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideStatus(); });
+  }
+
+  /*
+   * ---------------------------------------------------------------- alerts
+   *
+   * Three ways to get his attention, each a fallback for the one above:
+   *   1. web push          — reaches him with the tab closed. The real answer.
+   *   2. vibration         — only while the page is open, which is exactly when
+   *                          he needs it least, so it is a fallback and not the
+   *                          feature.
+   *   3. the hamburger dot — what already existed. Never made worse.
+   *
+   * Permission is requested on a deliberate tap and nowhere else. A prompt
+   * fired on page load gets dismissed reflexively, and a denied permission is
+   * a dead feature that cannot be revived from inside the page.
+   */
+  var DEVICE_KEY = 'relay.device';
+  // Must match public/sw.js. Duplicated on purpose: the worker cannot import
+  // from the page, and a shared file would mean shipping a third asset.
+  var VIBE = {
+    'needs-you': [0, 100, 70, 100, 70, 300],
+    done: [0, 50, 90, 50],
+    broken: [0, 300, 100, 300, 100, 300]
+  };
+  var notifyBody = document.getElementById('notifybody');
+  var pushSnap = null;   // last /push/config response
+  var pushReg = null;    // ServiceWorkerRegistration, once we have one
+  var nEls = null;       // built once, then only its text is updated
+  var nBusy = false;
+
+  function notifPermission() {
+    try { return window.Notification ? window.Notification.permission : 'unsupported'; }
+    catch (e) { return 'unsupported'; }
+  }
+  function pushCapable() {
+    return !!(window.Notification && navigator.serviceWorker && window.PushManager && window.isSecureContext);
+  }
+  function canVibrate() { return !!(navigator && typeof navigator.vibrate === 'function'); }
+  function armedHere() { return !!(pushSnap && pushSnap.subscribedHere) && notifPermission() === 'granted'; }
+
+  function deviceId() {
+    var id = pref(DEVICE_KEY);
+    if (!id) {
+      id = 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+      pref(DEVICE_KEY, id);
+    }
+    return id;
+  }
+
+  function b64ToBytes(s) {
+    var pad = '='.repeat((4 - (s.length % 4)) % 4);
+    var raw = window.atob((s + pad).replace(/-/g, '+').replace(/_/g, '/'));
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  /** Buzz with the pattern for a category, if this browser can. */
+  function buzz(category) {
+    if (!canVibrate()) return false;
+    try { return navigator.vibrate(VIBE[category] || VIBE.done); } catch (e) { return false; }
+  }
+
+  /*
+   * A reply landed while the page is open. If push is armed the service worker
+   * is already buzzing for it, so doing it here too would double-buzz for one
+   * event. This is the degradation path, not a parallel one.
+   */
+  function signalArrival(e) {
+    if (armedHere()) return;
+    if (e && e.conversationId && e.conversationId !== activeConv) return;
+    buzz('done');
+  }
+
+  function pushFetch(path, opts) {
+    return fetch(path, opts).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+        return j;
+      });
+    });
+  }
+
+  function loadPushConfig() {
+    return pushFetch('/push/config?deviceId=' + encodeURIComponent(deviceId()), { cache: 'no-store' })
+      .then(function (j) { pushSnap = j; renderNotify(); return j; })
+      .catch(function () { renderNotify(); return null; });
+  }
+
+  function saveConfig(patch) {
+    patch.deviceId = deviceId();
+    return pushFetch('/push/config', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch)
+    }).then(function (j) { pushSnap = j; renderNotify(); }).catch(function (err) {
+      if (nEls) nEls.note.textContent = 'Could not save: ' + err.message;
+    });
+  }
+
+  /*
+   * The deliberate tap. Order matters: ask for permission first so a refusal
+   * costs nothing, and only then register the worker and subscribe.
+   */
+  function armPush() {
+    if (nBusy) return;
+    nBusy = true;
+    nEls.note.textContent = 'Asking this browser for permission…';
+    renderNotify();
+    var perm;
+    try { perm = window.Notification.requestPermission(); } catch (e) { perm = null; }
+    // Older Firefox hands back a callback API rather than a promise.
+    Promise.resolve(perm && perm.then ? perm : new Promise(function (ok) { window.Notification.requestPermission(ok); }))
+      .then(function (state) {
+        if (state !== 'granted') throw new Error(state === 'denied'
+          ? 'Notifications are blocked for this site. Turn them back on in the browser’s site settings, then tap again.'
+          : 'Permission was dismissed. Tap again when you are ready.');
+        return navigator.serviceWorker.register('/sw.js', { scope: '/' });
+      })
+      .then(function (reg) { pushReg = reg; return navigator.serviceWorker.ready; })
+      .then(function (reg) {
+        pushReg = reg || pushReg;
+        return pushReg.pushManager.getSubscription().then(function (existing) {
+          if (existing) return existing;
+          if (!pushSnap || !pushSnap.vapidPublicKey) throw new Error('the server has no push key');
+          return pushReg.pushManager.subscribe({
+            userVisibleOnly: true, // required, and honoured: every push shows a notification
+            applicationServerKey: b64ToBytes(pushSnap.vapidPublicKey)
+          });
+        });
+      })
+      .then(function (sub) {
+        var j = sub.toJSON();
+        return pushFetch('/push/subscribe', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            endpoint: j.endpoint, keys: j.keys, deviceId: deviceId(), ua: navigator.userAgent
+          })
+        });
+      })
+      .then(function () { nEls.note.textContent = 'Armed. Send a test to feel it.'; return loadPushConfig(); })
+      .catch(function (err) {
+        nEls.note.textContent = err.message || String(err);
+        logClient('push-arm-failed', { message: (err && err.message) || String(err) });
+        return loadPushConfig();
+      })
+      .then(function () { nBusy = false; renderNotify(); });
+  }
+
+  function disarmPush() {
+    if (nBusy) return;
+    nBusy = true;
+    nEls.note.textContent = 'Turning alerts off for this browser…';
+    var done = function () {
+      return pushFetch('/push/unsubscribe', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ deviceId: deviceId() })
+      });
+    };
+    Promise.resolve(navigator.serviceWorker ? navigator.serviceWorker.getRegistration() : null)
+      .then(function (reg) { return reg ? reg.pushManager.getSubscription() : null; })
+      .then(function (sub) { return sub ? sub.unsubscribe() : null; })
+      .then(done, done)
+      .catch(function () { /* the server row is what matters; it is gone either way */ })
+      .then(function () { nEls.note.textContent = 'Alerts are off for this browser.'; return loadPushConfig(); })
+      .then(function () { nBusy = false; renderNotify(); });
+  }
+
+  function testPush() {
+    if (nBusy) return;
+    nBusy = true;
+    nEls.note.textContent = 'Sending a test…';
+    renderNotify();
+    pushFetch('/push/test', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ category: 'done' })
+    }).then(function (j) {
+      nEls.note.textContent = j.delivered
+        ? ('Sent to ' + j.delivered + ' browser' + (j.delivered === 1 ? '' : 's') + '. It should arrive in a moment.'
+           + (j.sentDuringQuietHours ? ' (Quiet hours are on: a real alert would have been held back.)' : ''))
+        : 'The push service accepted nothing. Check the device list above.';
+    }).catch(function (err) {
+      nEls.note.textContent = 'Test failed: ' + err.message;
+    }).then(function () { nBusy = false; renderNotify(); });
+  }
+
+  function buildNotifyUi() {
+    if (!notifyBody || nEls) return;
+    var card = scard('Alerts');
+    var state = el('div', 'nstate');
+    state.appendChild(el('span', 'dot'));
+    var stateText = el('span', null, '');
+    state.appendChild(stateText);
+    card.appendChild(state);
+
+    var arm = el('button', 'nbtn primary', 'Alert me on this phone');
+    arm.type = 'button';
+    arm.addEventListener('click', function () { armedHere() ? disarmPush() : armPush(); });
+    card.appendChild(arm);
+
+    var test = el('button', 'nbtn', 'Send a test alert');
+    test.type = 'button';
+    test.addEventListener('click', testPush);
+    card.appendChild(test);
+
+    var note = el('p', 'snote', '');
+    card.appendChild(note);
+
+    // ---- what each buzz means
+    var kinds = scard('What the buzzes mean');
+    var boxes = {};
+    [['needs-you', 'Something needs your answer', 'two taps, then a long one'],
+     ['done', 'Something finished', 'two light taps'],
+     ['broken', 'Something is broken', 'three long pulses']].forEach(function (c) {
+      var row = el('div', 'nrow');
+      var cb = el('input');
+      cb.type = 'checkbox';
+      cb.id = 'ncat-' + c[0];
+      var lab = el('label', null, c[1] + ' — ' + c[2]);
+      lab.setAttribute('for', cb.id);
+      cb.addEventListener('change', function () {
+        var cats = {};
+        cats[c[0]] = cb.checked;
+        saveConfig({ categories: cats });
+      });
+      // Tapping the label text plays the pattern, so he can learn them on the ground.
+      lab.addEventListener('click', function () { buzz(c[0]); });
+      row.appendChild(cb);
+      row.appendChild(lab);
+      kinds.appendChild(row);
+      boxes[c[0]] = cb;
+    });
+
+    // ---- quiet hours
+    var quiet = scard('Quiet hours');
+    var fromRow = el('div', 'nrow');
+    var fromLab = el('label', null, 'Silent from');
+    var from = el('input');
+    from.type = 'time';
+    from.id = 'nquietfrom';
+    fromLab.setAttribute('for', from.id);
+    fromRow.appendChild(fromLab);
+    fromRow.appendChild(from);
+    quiet.appendChild(fromRow);
+
+    var toRow = el('div', 'nrow');
+    var toLab = el('label', null, 'until');
+    var to = el('input');
+    to.type = 'time';
+    to.id = 'nquietto';
+    toLab.setAttribute('for', to.id);
+    toRow.appendChild(toLab);
+    toRow.appendChild(to);
+    quiet.appendChild(toRow);
+
+    var save = el('button', 'nbtn', 'Save quiet hours');
+    save.type = 'button';
+    save.addEventListener('click', function () {
+      saveConfig({ quietFrom: from.value || null, quietTo: to.value || null });
+    });
+    quiet.appendChild(save);
+
+    var brRow = el('div', 'nrow');
+    var br = el('input');
+    br.type = 'checkbox';
+    br.id = 'nbreakthrough';
+    var brLab = el('label', null, 'Let "something is broken" through anyway');
+    brLab.setAttribute('for', br.id);
+    br.addEventListener('change', function () { saveConfig({ brokenOverridesQuiet: br.checked }); });
+    brRow.appendChild(br);
+    brRow.appendChild(brLab);
+    quiet.appendChild(brRow);
+
+    // The timezone in force, stated outright. He changes timezone this week,
+    // and quiet hours that silently run on the wrong clock protect nobody.
+    var tz = el('p', 'ntz', '');
+    quiet.appendChild(tz);
+    var useTz = el('button', 'nbtn', '');
+    useTz.type = 'button';
+    useTz.hidden = true;
+    useTz.addEventListener('click', function () { saveConfig({ timezone: phoneZone() }); });
+    quiet.appendChild(useTz);
+
+    notifyBody.appendChild(card);
+    notifyBody.appendChild(kinds);
+    notifyBody.appendChild(quiet);
+    nEls = { state: state, stateText: stateText, arm: arm, test: test, note: note,
+             boxes: boxes, from: from, to: to, br: br, tz: tz, useTz: useTz };
+  }
+
+  function phoneZone() {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; }
+  }
+
+  function renderNotify() {
+    if (!nEls) return;
+    var perm = notifPermission();
+    var cls = 'nstate';
+    var text;
+    if (!pushCapable()) {
+      cls += ' warn';
+      text = canVibrate()
+        ? 'This browser cannot do push. It will buzz while the page is open.'
+        : 'This browser cannot do push or vibrate. The menu dot is the only signal.';
+    } else if (perm === 'denied') {
+      cls += ' warn';
+      text = 'Blocked in this browser’s settings. It will buzz while the page is open.';
+    } else if (armedHere()) {
+      cls += ' on';
+      text = 'On for this browser — alerts reach you with the tab closed.';
+    } else {
+      text = 'Not set up in this browser.';
+    }
+    nEls.state.className = cls;
+    nEls.stateText.textContent = text;
+    nEls.arm.textContent = armedHere() ? 'Turn alerts off for this browser' : 'Alert me on this phone';
+    nEls.arm.disabled = nBusy || !pushCapable();
+    nEls.test.disabled = nBusy || !pushSnap || !pushSnap.devices || pushSnap.devices.length === 0;
+
+    if (!pushSnap) return;
+    for (var k in nEls.boxes) {
+      if (Object.prototype.hasOwnProperty.call(nEls.boxes, k)) {
+        nEls.boxes[k].checked = pushSnap.categories ? pushSnap.categories[k] !== false : true;
+      }
+    }
+    var q = pushSnap.quiet || {};
+    if (document.activeElement !== nEls.from) nEls.from.value = q.from || '';
+    if (document.activeElement !== nEls.to) nEls.to.value = q.to || '';
+    nEls.br.checked = !!pushSnap.brokenOverridesQuiet;
+
+    var tzText = 'Times are in ' + (q.timezone || 'UTC') + ', where it is now ' + (q.zoneNow || '??:??') + '.';
+    if (!q.zoneKnown) tzText += ' This server does not know "' + q.requestedTimezone + '", so it is using UTC.';
+    if (q.configured) {
+      tzText += q.active
+        ? ' Quiet now — ends in ' + humanMin(q.changesInMin) + '.'
+        : ' Quiet starts in ' + humanMin(q.changesInMin) + '.';
+    } else {
+      tzText += ' No quiet hours set.';
+    }
+    nEls.tz.textContent = tzText;
+
+    var mine = phoneZone();
+    var mismatch = mine && q.timezone && mine !== q.timezone;
+    nEls.useTz.hidden = !mismatch;
+    if (mismatch) nEls.useTz.textContent = 'This phone is in ' + mine + ' — use that instead';
+
+    var n = pushSnap.devices ? pushSnap.devices.length : 0;
+    if (!nBusy && !nEls.note.textContent) {
+      nEls.note.textContent = n ? (n + ' browser' + (n === 1 ? '' : 's') + ' armed.') : '';
+    }
+  }
+
+  function humanMin(m) {
+    if (m === null || m === undefined) return 'a while';
+    if (m < 60) return m + ' min';
+    var h = Math.floor(m / 60);
+    var r = m % 60;
+    return h + 'h' + (r ? ' ' + r + 'm' : '');
+  }
+
+  function initNotify() {
+    if (!notifyBody) return;
+    buildNotifyUi();
+    renderNotify();
+    /*
+     * Passive on load: getRegistration() never prompts and never registers.
+     * Only the button calls register()/requestPermission().
+     */
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistration) {
+      navigator.serviceWorker.getRegistration().then(function (reg) {
+        if (reg) pushReg = reg;
+      }).catch(function () { /* nothing registered yet */ });
+      // The worker tells the page when a push arrived while it was in front, so
+      // the pattern is played by navigator.vibrate — far more reliable on
+      // Firefox Android than the notification's own `vibrate` option.
+      navigator.serviceWorker.addEventListener('message', function (ev) {
+        var d = ev && ev.data;
+        if (d && d.relay === 'notify') buzz(d.category);
+      });
+    }
+    loadPushConfig();
   }
 
   function autosize() {
@@ -3075,7 +3488,12 @@
       var e = list[i];
       if (spoken[e.id]) continue;
       spoken[e.id] = true;
-      if (!booted || !speakOn) continue;
+      if (!booted) continue;
+      // The vibration fallback rides the same choke point as speech: an agent
+      // reply is caught here whether it arrived by SSE or by a poll, and only
+      // once. It is a no-op when push is armed, so one event is one buzz.
+      signalArrival(e);
+      if (!speakOn) continue;
       // Only the conversation on screen is read aloud. Hearing an answer to
       // something in a thread you are not looking at is disorienting, and the
       // menu already flags that it arrived.
@@ -3343,6 +3761,13 @@
   setInterval(refreshTimes, 30000);
   initConvs();
   initStatus();
+  // Builds the panel and reads the current state. Requests no permission —
+  // that happens only when he taps the button inside it.
+  try {
+    initNotify();
+  } catch (err) {
+    logClient('notify-init-failed', { message: (err && err.message) || String(err) });
+  }
   render();
   autosize();
   focusComposer();
