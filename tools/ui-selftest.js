@@ -1,13 +1,20 @@
 'use strict';
 /*
  * ui-selftest — run the page's inline JS against a stub DOM and assert the things
- * that cannot be checked by eye, without a browser or a microphone.
+ * that cannot be checked by eye, without a browser, a microphone or a speaker.
  *
  *   node tools/ui-selftest.js
  *
  * This exists because of a real bug: on a phone the mic button did nothing and
  * said nothing, because browsers withhold getUserMedia from non-https pages. The
  * failure is now explicit, and these tests are what keep it that way.
+ *
+ * It has since grown a second job, which is now the more important one: proving
+ * that **conversation mode cannot hear itself**. With the mic live and a reply
+ * playing, a page that transcribes its own voice will post it, get another
+ * reply, speak that, and loop forever into a real queue that agents act on.
+ * A microphone and a speaker cannot be driven headlessly — but the state machine
+ * between them can, so the gate is tested here frame by frame.
  *
  * Zero dependencies, like everything else here. Node built-ins only.
  */
@@ -16,6 +23,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const PAGE = path.join(__dirname, '..', 'public', 'index.html');
+const FRAME = 512;    // must match V.FRAME in the page
+const FRAME_MS = 32;  // 512 samples at 16 kHz
 
 function inlineScript() {
   const html = fs.readFileSync(PAGE, 'utf8');
@@ -42,12 +51,68 @@ function makeEl(tag) {
   return el;
 }
 
+// ---------------------------------------------------------------- stub audio
+/*
+ * Enough of the Web Audio, MediaStream and EventSource APIs for the page's own
+ * code to run unmodified. The point is that the page is NOT special-cased for
+ * the test: it opens a capture graph, receives frames on a worklet port, gates a
+ * MediaStreamTrack and plays an AudioBufferSourceNode exactly as it would in a
+ * browser — the test just supplies the frames and decides when playback ends.
+ */
+function makeAudio(store) {
+  function Ctx(opts) {
+    this.sampleRate = (opts && opts.sampleRate) || 16000;
+    this.state = 'running';
+    this.destination = {};
+    this.audioWorklet = { addModule: () => Promise.resolve() };
+    store.ctxs.push(this);
+  }
+  Ctx.prototype.createGain = function () { return { gain: {}, connect() {}, disconnect() {} }; };
+  Ctx.prototype.createMediaStreamSource = function () { return { connect() {}, disconnect() {} }; };
+  Ctx.prototype.createBuffer = function () { return { duration: 0 }; };
+  Ctx.prototype.createBufferSource = function () {
+    const src = {
+      buffer: null, onended: null,
+      connect() {}, disconnect() {},
+      start() { store.started.push(src); },
+      stop() { if (src.onended) src.onended(); },
+    };
+    return src;
+  };
+  Ctx.prototype.decodeAudioData = function () { return Promise.resolve({ duration: 1.5 }); };
+  Ctx.prototype.resume = function () { this.state = 'running'; return Promise.resolve(); };
+  Ctx.prototype.suspend = function () { this.state = 'suspended'; return Promise.resolve(); };
+  Ctx.prototype.close = function () { this.state = 'closed'; };
+
+  function Node() { this.port = { onmessage: null }; store.nodes.push(this); }
+  Node.prototype.connect = function () {};
+  Node.prototype.disconnect = function () {};
+
+  return { Ctx, Node };
+}
+
+function workingMic(store) {
+  return {
+    getUserMedia() {
+      if (store.micError) return Promise.reject(store.micError);
+      const track = { kind: 'audio', enabled: true, stopped: false, stop() { this.stopped = true; } };
+      store.tracks.push(track);
+      return Promise.resolve({ getTracks: () => [track], getAudioTracks: () => [track] });
+    },
+  };
+}
+
 function makeEnv(opts) {
-  const ids = ['thread', 'list', 'empty', 'input', 'send', 'err', 'conn', 'mic', 'voice', 'vtext'];
+  const ids = ['thread', 'list', 'empty', 'input', 'send', 'err', 'conn', 'mic', 'voice', 'vtext', 'convo', 'spk', 'vstop'];
   const els = {};
   ids.forEach((id) => { els[id] = makeEl(id === 'input' ? 'textarea' : 'div'); });
   const meter = makeEl('i');
   const posted = [];
+  const store = {
+    ctxs: [], nodes: [], tracks: [], started: [], es: null,
+    sttText: 'check the widget report', ttsFail: false, micError: null,
+  };
+  const audio = makeAudio(store);
 
   const doc = {
     activeElement: null,
@@ -62,6 +127,13 @@ function makeEnv(opts) {
   };
   els.input.focus = function () { doc.activeElement = this; this.focused = true; };
 
+  const jsonRes = (obj, status) => Promise.resolve({
+    ok: (status || 200) < 400, status: status || 200,
+    json: () => Promise.resolve(obj),
+    headers: { get: () => null },
+  });
+
+  const mem = {};
   const sandbox = {
     console,
     // Real delays: the page's own 3 s poll timer must NOT fire during a test, or
@@ -71,6 +143,7 @@ function makeEnv(opts) {
     setInterval: () => ({ unref() {} }),
     clearInterval,
     Promise, JSON, Math, Date, String, Number, Array, Object, Error, isNaN, parseInt,
+    RegExp, Boolean,
     Float32Array, DataView, ArrayBuffer, Uint8Array,
     document: doc,
     navigator: {
@@ -83,9 +156,28 @@ function makeEnv(opts) {
       origin: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901'),
       href: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901') + '/',
     },
+    localStorage: {
+      getItem: (k) => (Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null),
+      setItem: (k, v) => { mem[k] = String(v); },
+    },
+    Blob: function Blob() {},
+    URL: { createObjectURL: () => 'blob:stub', revokeObjectURL: () => {} },
     fetch: (url, init) => {
-      posted.push({ url, body: init && init.body ? JSON.parse(init.body) : null });
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ entries: [], count: 0 }) });
+      const raw = init && init.body;
+      let body = null;
+      if (typeof raw === 'string') { try { body = JSON.parse(raw); } catch (e) { body = raw; } }
+      posted.push({ url, body, bytes: raw && raw.byteLength });
+      if (url === '/stt') return jsonRes({ text: store.sttText, audioMs: 900, tookMs: 120 });
+      if (url === '/tts') {
+        if (store.ttsFail) return jsonRes({ error: 'the text-to-speech engine is down' }, 502);
+        return Promise.resolve({
+          ok: true, status: 200,
+          arrayBuffer: () => Promise.resolve(new ArrayBuffer(2048)),
+          headers: { get: () => null },
+        });
+      }
+      if (url === '/tasks') return jsonRes({ id: 'new-task' }, 201);
+      return jsonRes({ entries: [], count: 0 });
     },
     isSecureContext: !!opts.secure,
     innerHeight: 800,
@@ -94,12 +186,61 @@ function makeEnv(opts) {
     addEventListener(ev, fn) { (this._h = this._h || {})[ev] = ((this._h || {})[ev] || []).concat(fn); },
     dispatchWindow(ev) { (((this._h || {})[ev]) || []).forEach((f) => f.call(this, {})); },
   };
+  if (opts.audio !== false) {
+    sandbox.AudioContext = audio.Ctx;
+    sandbox.AudioWorkletNode = audio.Node;
+  }
   if (opts.AudioContext) sandbox.AudioContext = opts.AudioContext;
+  if (opts.stream !== false) {
+    sandbox.EventSource = function EventSource(url) { this.url = url; store.es = this; };
+    sandbox.EventSource.prototype.close = function () {};
+  }
   sandbox.window = sandbox;
 
   vm.createContext(sandbox);
   vm.runInContext(inlineScript(), sandbox, { filename: 'index.html<script>' });
-  return { sandbox, els, meter, posted, doc };
+
+  // ---- driving helpers -------------------------------------------------
+  /** Push `ms` of audio into the live worklet port. `loud` fakes speech. */
+  function feed(ms, loud) {
+    const node = store.nodes[store.nodes.length - 1];
+    if (!node || !node.port.onmessage) throw new Error('no capture node is listening');
+    const n = Math.ceil(ms / FRAME_MS);
+    for (let i = 0; i < n; i++) {
+      const b = new Float32Array(FRAME);
+      if (loud) for (let j = 0; j < FRAME; j++) b[j] = j % 2 ? 0.3 : -0.3;
+      node.port.onmessage({ data: b });
+    }
+  }
+  /** Calibrate, then say something, then go quiet long enough to end the utterance. */
+  function sayOneThing() {
+    feed(450, false);  // room level
+    feed(600, true);   // speech
+    feed(1300, false); // trailing silence past SILENCE_MS
+  }
+  /** Fire the agent-reply push the page would get over SSE. */
+  function agentReply(text, id) {
+    const ts = new Date().toISOString();
+    if (!store.es || !store.es.onmessage) throw new Error('no SSE stream is open');
+    store.es.onmessage({
+      data: JSON.stringify({
+        entries: [{ id: id || 'reply-1', role: 'agent', text, ts, rev: ts, status: 'done', replyTo: 'x' }],
+      }),
+    });
+  }
+  /** End the reply that is currently playing. */
+  function endPlayback() {
+    for (let i = store.started.length - 1; i >= 0; i--) {
+      if (store.started[i].onended) { store.started[i].onended(); return true; }
+    }
+    return false;
+  }
+  const track = () => store.tracks[store.tracks.length - 1];
+  const sent = () => posted.filter((p) => p.url === '/tasks');
+  const stt = () => posted.filter((p) => p.url === '/stt');
+  const tts = () => posted.filter((p) => p.url === '/tts');
+
+  return { sandbox, els, meter, posted, doc, store, feed, sayOneThing, agentReply, endPlayback, track, sent, stt, tts };
 }
 
 // ---------------------------------------------------------------- assertions
@@ -109,7 +250,30 @@ function check(name, cond, detail) {
   failures++;
   console.log(`  FAIL ${name}${detail ? ' — ' + detail : ''}`);
 }
-const settle = () => new Promise((r) => setTimeout(r, 20));
+const settle = () => new Promise((r) => setTimeout(r, 25));
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/*
+ * A secure page with a working mic, speaker and live stream. The indirection
+ * through `holder` is because the fake microphone needs the env's store, which
+ * does not exist until the page has been built.
+ */
+function liveEnv(extra) {
+  const holder = {};
+  const opts = Object.assign({
+    secure: true, protocol: 'https:', host: 'relay.example.com', finePointer: false,
+    mediaDevices: { getUserMedia: (...a) => holder.impl.getUserMedia(...a) },
+  }, extra || {});
+  const env = makeEnv(opts);
+  holder.impl = workingMic(env.store);
+  return env;
+}
+
+/** Turn conversation mode on and wait for the capture graph to come up. */
+async function startConv(env) {
+  env.els.convo.dispatch('click');
+  await settle();
+}
 
 async function main() {
   console.log('\ninsecure origin (a phone on http:// — the reported bug)');
@@ -119,6 +283,7 @@ async function main() {
     check('mic button is NOT disabled (the tap is what explains)', els.mic.disabled === false);
     check('mic has an explanatory tooltip', /https/i.test(els.mic.title || ''), els.mic.title);
     check('mic has an explanatory aria-label', /https/i.test(els.mic.getAttribute('aria-label') || ''));
+    check('the conversation button is blocked too', els.convo.className === 'off', els.convo.className);
     check('blocked state is reported to the server on load',
       posted.some((p) => p.url === '/client-log' && p.body && p.body.event === 'mic-blocked-on-load'));
 
@@ -183,6 +348,267 @@ async function main() {
     const html = inlineScript();
     check('voice init is wrapped so it cannot break boot', /try\s*\{\s*initVoice\(\);/.test(html));
     check('boot runs before voice is wired', html.indexOf('poll(true)') < html.indexOf('initVoice();'));
+  }
+
+  // ================================================================ conversation
+  console.log('\nconversation mode — one turn end to end');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    check('the mic is open', !!env.track(), 'no track was acquired');
+    check('the conversation button reads as on', env.els.convo.className === 'on', env.els.convo.className);
+    check('it is announced to assistive tech', env.els.convo.getAttribute('aria-pressed') === 'true');
+    check('one-shot dictation is locked out while it runs', env.els.mic.disabled === true);
+    check('the status bar is showing', /show/.test(env.els.voice.className), env.els.voice.className);
+
+    env.sayOneThing();
+    await settle();
+    check('the utterance was sent for transcription', env.stt().length === 1, `${env.stt().length} /stt calls`);
+    check('the transcript was posted as a message', env.sent().length === 1, `${env.sent().length} /tasks calls`);
+    check('it is tagged as conversational voice',
+      env.sent()[0] && env.sent()[0].body.from === 'voice-conversation', JSON.stringify(env.sent()[0] && env.sent()[0].body));
+    check('the mic is still open — it did not stop after one utterance', env.track().stopped === false);
+    check('and it is still listening', /show/.test(env.els.voice.className) && env.track().enabled === true);
+
+    env.sayOneThing();
+    await settle();
+    check('a second utterance posts a second message', env.sent().length === 2, `${env.sent().length} sent`);
+  }
+
+  console.log('\nconversation mode — nothing worthless reaches the queue');
+  {
+    const env = liveEnv();
+    await startConv(env);
+
+    env.store.sttText = '';
+    env.sayOneThing();
+    await settle();
+    check('an empty transcript is not posted', env.sent().length === 0, `${env.sent().length} sent`);
+
+    env.store.sttText = '.';
+    env.sayOneThing();
+    await settle();
+    check('a punctuation-only transcript is not posted', env.sent().length === 0);
+
+    env.store.sttText = 'Thank you.';
+    env.sayOneThing();
+    await settle();
+    check('a known whisper hallucination is not posted', env.sent().length === 0);
+
+    env.store.sttText = 'okay';
+    env.sayOneThing();
+    await settle();
+    check('but a real short answer IS posted', env.sent().length === 1, `${env.sent().length} sent`);
+
+    env.feed(450, false);
+    env.feed(120, true);  // a cough: under MIN_SPEECH_MS
+    env.feed(1300, false);
+    await settle();
+    check('a cough never even reaches the engine', env.stt().length === 4, `${env.stt().length} /stt calls`);
+  }
+
+  console.log('\nconversation mode — a slow transcription does not drop the next utterance');
+  {
+    const env = liveEnv();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const realFetch = env.sandbox.fetch;
+    const starts = [];
+    env.sandbox.fetch = (url, init) => {
+      if (url !== '/stt') return realFetch(url, init);
+      starts.push(url);                       // counted when the page *begins* the call
+      return gate.then(() => realFetch(url, init));
+    };
+    await startConv(env);
+
+    env.sayOneThing();       // first utterance: transcription now hangs
+    await settle();
+    env.sayOneThing();       // second one arrives while the first is in flight
+    env.sayOneThing();       // and a third
+    await settle();
+    check('only one transcription is in flight at a time', starts.length === 1, `${starts.length} concurrent`);
+    check('the later utterances are queued, not dropped', starts.length === 1 && env.stt().length === 0);
+    release();
+    await settle();
+    await settle();
+    check('all three are transcribed once the queue drains', env.stt().length === 3, `${env.stt().length} /stt calls`);
+    check('all three reach the queue', env.sent().length === 3, `${env.sent().length} sent`);
+  }
+
+  // ================================================================ THE ECHO LOOP
+  console.log('\nTHE FEEDBACK LOOP — a spoken reply must not become a new message');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    check('conversation turns spoken replies on by default', env.els.spk.className === 'on', env.els.spk.className);
+
+    env.agentReply('Forty two widgets are on hand and three are backordered.');
+    await settle();
+    check('the reply is sent to the speech engine', env.tts().length === 1, `${env.tts().length} /tts calls`);
+
+    // DEFENCE 1: the track itself is muted, not merely ignored.
+    check('DEFENCE 1 — the mic track is disabled while speaking', env.track().enabled === false);
+    check('the button shows the mic is muted', /gated/.test(env.els.convo.className), env.els.convo.className);
+    check('the status line says so in as many words', /mic off/i.test(env.els.vtext.textContent), env.els.vtext.textContent);
+
+    // DEFENCE 2 + 3: pour the agent's own voice into the mic at full volume.
+    const sttBefore = env.stt().length;
+    const sentBefore = env.sent().length;
+    env.store.sttText = 'Forty two widgets are on hand and three are backordered.';
+    env.feed(3000, true);   // loud audio, exactly as if the speaker were feeding back
+    env.feed(2000, false);
+    await settle();
+    check('DEFENCE 2 — nothing is captured while the reply plays', env.stt().length === sttBefore,
+      `${env.stt().length - sttBefore} extra /stt calls`);
+    check('*** no new message was posted from our own voice ***', env.sent().length === sentBefore,
+      `${env.sent().length - sentBefore} phantom messages`);
+
+    // Playback finishes; the mic must stay shut for the settle window.
+    env.endPlayback();
+    await settle();
+    check('DEFENCE 4 — the mic stays shut during the settle delay', env.track().enabled === false);
+    env.feed(1200, true);
+    await settle();
+    check('and audio during the settle delay is still ignored', env.stt().length === sttBefore);
+
+    await wait(700); // > C.SETTLE_MS
+    check('the mic comes back on its own once it is safe', env.track().enabled === true);
+    check('the button drops the muted look', env.els.convo.className === 'on', env.els.convo.className);
+
+    // DEFENCE 5: even with the gate wide open, our own words are recognised.
+    env.sayOneThing();
+    await settle();
+    check('DEFENCE 5 — an echoing transcript is dropped even off-gate',
+      env.sent().length === sentBefore, `${env.sent().length - sentBefore} phantom messages`);
+    check('and it says why, rather than silently eating it',
+      /own voice/i.test(env.els.vtext.textContent), env.els.vtext.textContent);
+    check('the drop is reported to the server',
+      env.posted.some((p) => p.url === '/client-log' && p.body && p.body.event === 'conv-dropped'
+        && p.body.detail && p.body.detail.why === 'echo'));
+
+    // ...but a genuine reply still gets through.
+    env.store.sttText = 'now check the inventory again please';
+    env.sayOneThing();
+    await settle();
+    check('a genuine utterance after a reply still posts', env.sent().length === sentBefore + 1,
+      `${env.sent().length - sentBefore} posted`);
+  }
+
+  console.log('\nspoken replies — muting, backlog and honest failure');
+  {
+    const env = liveEnv();
+    await settle();
+    check('the speaker is off until asked for', env.els.spk.className === '', env.els.spk.className);
+    env.agentReply('a reply arriving with the speaker muted', 'r-muted');
+    await settle();
+    check('nothing is spoken while muted', env.tts().length === 0, `${env.tts().length} /tts calls`);
+
+    env.els.spk.dispatch('click');
+    await settle();
+    check('tapping the speaker turns it on', env.els.spk.className === 'on', env.els.spk.className);
+    env.agentReply('now this one should be spoken', 'r-spoken');
+    await settle();
+    check('a reply after unmuting is spoken', env.tts().length === 1, `${env.tts().length} /tts calls`);
+
+    env.els.spk.dispatch('click');
+    await settle();
+    check('tapping again mutes it', env.els.spk.className === '', env.els.spk.className);
+    env.agentReply('and this one should stay silent', 'r-silent');
+    await settle();
+    check('muting is independent of the mic and takes effect at once', env.tts().length === 1);
+  }
+
+  console.log('\nspoken replies — the backlog is never read aloud');
+  {
+    const env = liveEnv();
+    env.els.spk.dispatch('click'); // speaker on
+    await settle();
+    const before = env.tts().length;
+    // A full read, as happens on load/refresh, carrying old agent replies.
+    env.store.es.onmessage({ data: JSON.stringify({ entries: [] }) });
+    await settle();
+    check('an empty push speaks nothing', env.tts().length === before);
+    check('history present at boot was marked spoken, not queued', before === 0, `${before} /tts calls at boot`);
+  }
+
+  console.log('\nspoken replies — what is worth listening to');
+  {
+    const env = liveEnv();
+    env.els.spk.dispatch('click');
+    await settle();
+    env.agentReply(
+      'Done — see https://example.com/very/long/path?x=1 for details.\n' +
+      '```\ncurl -s http://127.0.0.1:3901/health | jq .\nsecond line\n```\n' +
+      'The file is at /etc/nginx/nginx.conf and the id is 9f8e7d6c5b4a39281706abcdef0123456789.',
+      'r-condense',
+    );
+    await settle();
+    const said = env.tts()[0] && env.tts()[0].body.text;
+    check('something was spoken', !!said, String(said));
+    check('the URL is not read out character by character', !/https?:\/\//.test(said || ''), said);
+    check('the code block is not read out', !/curl/.test(said || ''), said);
+    check('the file path is not spelled out', !/nginx\.conf/.test(said || ''), said);
+    check('the long identifier is not read out', !/9f8e7d6c/.test(said || ''), said);
+    check('it says a link was there rather than dropping the clause', /a link/.test(said || ''), said);
+    check('it says there was a code block', /code block/.test(said || ''), said);
+    check('the actual sentence survives', /Done/.test(said || '') && /for details/.test(said || ''), said);
+  }
+
+  console.log('\nspoken replies — a dead TTS engine is loud about it');
+  {
+    const env = liveEnv();
+    env.els.spk.dispatch('click');
+    await settle();
+    env.store.ttsFail = true;
+    await startConv(env);
+    env.agentReply('this cannot be synthesised', 'r-fail');
+    await settle();
+    check('the failure is shown, not swallowed', /show/.test(env.els.err.className), env.els.err.className);
+    check('it says the reply is still on screen', /on screen/i.test(env.els.err.textContent), env.els.err.textContent);
+    check('it says the mic is unaffected', /microphone is unaffected/i.test(env.els.err.textContent));
+    check('it is reported to the server',
+      env.posted.some((p) => p.url === '/client-log' && p.body && p.body.event === 'tts-failed'));
+    await wait(700);
+    check('a TTS failure still releases the mic gate', env.track().enabled === true);
+  }
+
+  console.log('\nstopping is instant');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.agentReply('a long reply that is midway through being spoken', 'r-stop');
+    await settle();
+    check('it is speaking', env.track().enabled === false);
+
+    env.els.convo.dispatch('click'); // tap to stop, mid-sentence
+    check('the microphone is released immediately', env.track().stopped === true);
+    check('the button is off immediately', env.els.convo.className === '', env.els.convo.className);
+    check('aria-pressed is cleared', env.els.convo.getAttribute('aria-pressed') === 'false');
+    check('the status bar is gone immediately', env.els.voice.className === '', env.els.voice.className);
+    check('one-shot dictation is available again', env.els.mic.disabled === false);
+
+    const sentBefore = env.sent().length;
+    env.store.sttText = 'this should never be posted';
+    try { env.feed(2000, true); env.feed(1400, false); } catch (e) { /* the graph is gone: also fine */ }
+    await settle();
+    check('nothing captured before the stop is posted afterwards', env.sent().length === sentBefore,
+      `${env.sent().length - sentBefore} posted after stopping`);
+    check('the stop is reported to the server',
+      env.posted.some((p) => p.url === '/client-log' && p.body && p.body.event === 'conv-stop'));
+  }
+
+  console.log('\nconversation mode when the mic is refused');
+  {
+    const env = makeEnv({
+      secure: true, protocol: 'https:', host: 'relay.example.com',
+      mediaDevices: { getUserMedia: () => Promise.reject(Object.assign(new Error('denied'), { name: 'NotAllowedError' })) },
+    });
+    env.els.convo.dispatch('click');
+    await settle();
+    check('the conversation does not stay half-on', env.els.convo.className === '', env.els.convo.className);
+    check('the button is usable again', env.els.convo.disabled === false);
+    check('permission denial is explained', /permission denied/i.test(env.els.err.textContent), env.els.err.textContent);
+    check('one-shot dictation is not left locked out', env.els.mic.disabled === false);
   }
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');

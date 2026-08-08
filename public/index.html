@@ -41,6 +41,25 @@
   header b { font-size: 16px; font-weight: 650; letter-spacing: .01em; }
   #conn { margin-left: auto; font-size: 13px; color: var(--off); display: none; }
   #conn.show { display: inline; }
+  /* Speaker toggle: mutes spoken replies independently of the microphone. */
+  #spk {
+    position: relative; margin-left: auto;
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px; padding: 0;
+    color: var(--muted); background: transparent;
+    border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #conn.show + #spk { margin-left: 8px; }
+  #spk svg { width: 20px; height: 20px; fill: currentColor; pointer-events: none; }
+  #spk.on { color: var(--user-bg); border-color: var(--user-bg); }
+  /* Muted is drawn struck through, the same language the blocked mic uses. */
+  #spk:not(.on)::after {
+    content: ''; position: absolute; left: 9px; top: 19px;
+    width: 21px; height: 2px; border-radius: 2px;
+    background: currentColor; transform: rotate(-45deg);
+  }
+  #spk.busy { color: var(--rec); border-color: var(--rec); }
 
   #thread {
     flex: 1 1 auto; min-height: 0;
@@ -80,13 +99,27 @@
   #meter i { display: block; height: 100%; width: 0%; background: var(--user-bg); border-radius: 3px; }
   #voice.hearing { color: var(--fg); }
   #voice.hearing #meter i { background: var(--rec); }
+  /* Mic is hard-gated while a reply plays; the bar says so in as many words. */
+  #voice.speaking { color: var(--user-bg); }
+  #voice.speaking #meter i { background: var(--user-bg); width: 100%; animation: sweep 1.1s ease-in-out infinite; }
+  @keyframes sweep { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { #voice.speaking #meter i { animation: none; } }
+  #vstop {
+    margin-left: auto; flex: 0 0 auto;
+    font-family: inherit; font-size: 14px; font-weight: 650;
+    min-height: 32px; padding: 0 12px;
+    color: var(--err-fg); background: transparent;
+    border: 1px solid currentColor; border-radius: 10px; cursor: pointer;
+    -webkit-appearance: none; appearance: none; display: none;
+  }
+  #voice.live #vstop { display: inline-flex; align-items: center; }
 
   #composer {
     flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end;
     padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom));
     background: var(--panel); border-top: 1px solid var(--line);
   }
-  #mic {
+  #mic, #convo {
     position: relative;
     flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
     width: 48px; height: 48px; padding: 0;
@@ -94,12 +127,12 @@
     border: 1px solid var(--line); border-radius: 15px; cursor: pointer;
     -webkit-appearance: none; appearance: none;
   }
-  #mic svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
-  #mic:disabled { opacity: .5; }
+  #mic svg, #convo svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
+  #mic:disabled, #convo:disabled { opacity: .5; }
   /* Unusable here (almost always: not an https page). Struck through so it reads as
      blocked rather than broken — but still tappable, because the tap is what explains. */
-  #mic.off { color: var(--muted); border-style: dashed; }
-  #mic.off::after {
+  #mic.off, #convo.off { color: var(--muted); border-style: dashed; }
+  #mic.off::after, #convo.off::after {
     content: ''; position: absolute; left: 11px; top: 22px;
     width: 24px; height: 2px; border-radius: 2px;
     background: currentColor; transform: rotate(-45deg);
@@ -107,6 +140,10 @@
   #mic.on { color: #fff; background: var(--rec); border-color: var(--rec); animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .62; } }
   @media (prefers-reduced-motion: reduce) { #mic.on { animation: none; } }
+  /* Conversation mode shares the mic's visual language; `on` is the same red. */
+  #convo.on { color: #fff; background: var(--rec); border-color: var(--rec); }
+  /* Muted while the agent is talking — steady blue, not the recording red. */
+  #convo.gated { color: #fff; background: var(--user-bg); border-color: var(--user-bg); animation: none; }
   #input {
     flex: 1 1 auto; min-width: 0;
     font-family: inherit; font-size: 16px; line-height: 1.4;
@@ -126,7 +163,12 @@
 </style>
 </head>
 <body>
-  <header><b>relay</b><span id="conn">offline &mdash; retrying</span></header>
+  <header>
+    <b>relay</b><span id="conn">offline &mdash; retrying</span>
+    <button id="spk" type="button" aria-label="Spoken replies are off" title="Spoken replies are off" aria-pressed="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4 4 0 0 0-2.5-3.7v7.4a4 4 0 0 0 2.5-3.7zM13 3.2v2.1a6.8 6.8 0 0 1 0 13.4v2.1a8.8 8.8 0 0 0 0-17.6z"/></svg>
+    </button>
+  </header>
 
   <main id="thread">
     <div id="list"></div>
@@ -135,11 +177,17 @@
 
   <p id="err"></p>
 
-  <div id="voice" aria-live="polite"><span id="meter" aria-hidden="true"><i></i></span><span id="vtext"></span></div>
+  <div id="voice" aria-live="polite">
+    <span id="meter" aria-hidden="true"><i></i></span><span id="vtext"></span>
+    <button id="vstop" type="button">Stop</button>
+  </div>
 
   <div id="composer">
     <button id="mic" type="button" aria-label="Dictate a message" title="Dictate a message">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
+    </button>
+    <button id="convo" type="button" aria-label="Start a hands-free conversation" title="Hands-free conversation" aria-pressed="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3c-4.97 0-9 3.13-9 7 0 1.9.97 3.62 2.55 4.88-.16 1.2-.66 2.3-1.4 3.15-.24.28-.05.72.31.7 1.86-.1 3.5-.75 4.71-1.6 .9.23 1.85.36 2.83.36 4.97 0 9-3.13 9-7s-4.03-7-9-7zm-3.6 8.4a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8zm3.6 0a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8zm3.6 0a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8z"/></svg>
     </button>
     <textarea id="input" rows="1" placeholder="Message&hellip;" maxlength="8000"
       autocapitalize="sentences" autocomplete="off" spellcheck="true" enterkeyhint="send"></textarea>
@@ -171,6 +219,8 @@
   var fails = 0, polls = 0, timer = null, errTimer = null;
   var everRendered = false, sending = false;
   var stream = null, streamOk = false;
+  var freshAgent = [];       // agent entries merged since the last speech harvest
+  var booted = false;        // true once the first read has landed; see harvestSpeech()
 
   var STATUS = { pending: 'pending', claimed: 'claimed', done: 'answered' };
 
@@ -247,7 +297,13 @@
       var e = arr[i];
       if (!e || typeof e.id !== 'string') continue;
       var s = sigOf(e);
-      if (sigs.get(e.id) !== s) { sigs.set(e.id, s); entries.set(e.id, e); changed = true; }
+      if (sigs.get(e.id) !== s) {
+        sigs.set(e.id, s); entries.set(e.id, e); changed = true;
+        // Candidates for reading aloud. Collected here rather than at the two
+        // call sites so an agent reply is caught whether it arrived by SSE push
+        // or by a poll — they merge through the identical code path.
+        if (e.role === 'agent') freshAgent.push(e);
+      }
       var r = ms(e.rev || e.ts);
       if (r > cursorMs) cursorMs = r;
     }
@@ -294,6 +350,7 @@
       .then(function (j) {
         var arr = (j && Array.isArray(j.entries)) ? j.entries : [];
         if (merge(arr) || !everRendered) render();
+        harvestSpeech();
         fails = 0; setConn(true);
         return true;
       })
@@ -334,6 +391,7 @@
       try { j = JSON.parse(e.data); } catch (err) { return; }
       var arr = (j && Array.isArray(j.entries)) ? j.entries : [];
       if (merge(arr)) render();
+      harvestSpeech();
       fails = 0; setConn(true);
     };
     stream.onerror = function () {
@@ -348,6 +406,20 @@
     input.style.height = Math.min(input.scrollHeight + 2, cap) + 'px';
   }
 
+  /** The one write path for a new message. Rejects with a readable Error. */
+  function postTask(text, from) {
+    return fetch('/tasks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: text, from: from })
+    }).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok) throw new Error((j && j.error) || ('send failed (HTTP ' + r.status + ')'));
+        return j;
+      });
+    });
+  }
+
   // `from` marks the origin of the message: 'web' when typed, 'voice' when dictated.
   function doSend(from) {
     if (sending) return Promise.resolve(false);
@@ -359,16 +431,7 @@
     }
     var ok = true;
     sending = true; sendBtn.disabled = true; clearErr();
-    return fetch('/tasks', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: text, from: from === 'voice' ? 'voice' : 'web' })
-    }).then(function (r) {
-      return r.json().catch(function () { return null; }).then(function (j) {
-        if (!r.ok) throw new Error((j && j.error) || ('send failed (HTTP ' + r.status + ')'));
-        return j;
-      });
-    }).then(function () {
+    return postTask(text, from === 'voice' ? 'voice' : 'web').then(function () {
       input.value = '';            // cleared only after the POST succeeded
       autosize();
       return poll(false);
@@ -422,8 +485,21 @@
 
   window.addEventListener('focus', focusComposer);
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { clearTimeout(timer); fails = 0; tick(); focusComposer(); }
+    if (!document.hidden) { clearTimeout(timer); fails = 0; tick(); focusComposer(); resumeAudio(); }
   });
+
+  /*
+   * Phones suspend a backgrounded tab's audio, and both contexts come back
+   * suspended — a conversation left running would sit there deaf and mute. Ask
+   * them to resume on the way back in. This cannot always work (iOS may require
+   * a fresh gesture), which is why the conversation says what state it is in
+   * rather than pretending.
+   */
+  function resumeAudio() {
+    [playCtx, vox && vox.ctx].forEach(function (ctx) {
+      try { if (ctx && ctx.state === 'suspended' && ctx.resume) ctx.resume(); } catch (e) {}
+    });
+  }
   window.addEventListener('resize', function () { if (nearBottom()) scrollBottom(); });
 
   // ------------------------------------------------------------------ voice dictation
@@ -458,6 +534,58 @@
     TAIL_MS: 300         // audio kept after speech stopped
   };
 
+  /*
+   * Conversation mode + spoken replies.
+   *
+   * THE PROBLEM THIS SECTION EXISTS TO SOLVE: with the microphone live and the
+   * speaker playing, the page hears its own voice, transcribes it, posts it as a
+   * message, gets a reply, speaks that, hears it... forever. Six independent
+   * defences, so that no single one failing produces that loop:
+   *
+   *   1. `track.enabled = false` on the mic track before playback starts. The
+   *      browser then hands us digital silence — this is the load-bearing one,
+   *      and it holds even if every line of JS below is wrong.
+   *   2. onFrame() returns immediately while gated: nothing is buffered, no
+   *      loudness is measured, endpointing cannot fire.
+   *   3. Whatever was half-captured when the gate closed is thrown away, so a
+   *      fragment cannot be stitched onto the next utterance.
+   *   4. SETTLE_MS of silence after playback ends before the mic is trusted
+   *      again — room reverb and Bluetooth latency outlive `onended`.
+   *   5. A transcript that overlaps what we just said is dropped as an echo,
+   *      even if it somehow got through 1-4.
+   *   6. `echoCancellation: true` on the capture stream. Real AEC where the
+   *      device offers it — a bonus, never the defence.
+   *
+   * Tuning notes: SETTLE_MS is the one to raise if a reply's tail ever comes
+   * back as a message (Bluetooth speakers are the likely culprit). ECHO_OVERLAP
+   * is the one to raise if genuine replies get eaten for quoting the agent.
+   */
+  var C = {
+    SETTLE_MS: 500,          // quiet gap after playback before the mic is live again
+    ECHO_WINDOW_MS: 4000,    // how long a transcript is still suspected of being our own voice
+    ECHO_OVERLAP: 0.7,       // share of heard words that must be in what we just said
+    MIN_SPEECH_MS: 350,      // stricter than one-shot: nothing here is confirmed before posting
+    IDLE_RECALIB_MS: 10000,  // re-measure the room after this long hearing nothing
+    MAX_QUEUE: 4,            // utterances allowed to pile up behind transcription
+    MAX_SPEAK: 900           // characters sent to /tts; the rest stays on screen
+  };
+
+  var convOn = false;        // conversation mode engaged
+  var micGated = false;      // defence 1-3: the mic is muted because we are talking
+  var convQueue = [];        // captured utterances waiting to be transcribed
+  var convBusy = false;      // a transcription is in flight
+  var speakOn = false;       // spoken replies enabled (independent of the mic)
+  var audioUnlocked = false; // a user gesture has been spent on unlocking playback
+  var playCtx = null;        // AudioContext used only for playback
+  var playing = null;        // { token } of the reply currently being spoken
+  var playToken = 0;
+  var speakQueue = [];       // replies waiting to be spoken
+  var speaking = false;
+  var lastSpokenText = '';   // defence 5
+  var lastSpokenAt = 0;
+  var spoken = Object.create(null); // entry id -> already spoken (or suppressed)
+  var audioWarned = false;
+
   // Runs on the audio thread; batches 128-sample quanta into FRAME-sized frames.
   var WORKLET = 'class P extends AudioWorkletProcessor{' +
     'constructor(o){super();this.n=o.processorOptions.n;this.b=new Float32Array(this.n);this.i=0;}' +
@@ -468,16 +596,24 @@
     'registerProcessor("pcm",P);';
 
   var micBtn = document.getElementById('mic');
+  var convoBtn = document.getElementById('convo');
+  var spkBtn = document.getElementById('spk');
+  var stopBtn = document.getElementById('vstop');
   var voiceBar = document.getElementById('voice');
   var vtext = document.getElementById('vtext');
   var meter = document.querySelector('#meter i');
-  var vox = null; // the live dictation session, or null
+  var vox = null; // the live capture session (one-shot or conversation), or null
 
-  function vStatus(msg, hearing) {
+  // `mood` is '' | 'hearing' | 'speaking'. While a conversation is running the
+  // bar also gets `live`, which is what reveals the Stop button.
+  function vStatus(msg, mood) {
     vtext.textContent = msg;
-    voiceBar.className = 'show' + (hearing ? ' hearing' : '');
+    voiceBar.className = 'show' + (convOn ? ' live' : '') + (mood ? ' ' + mood : '');
   }
-  function vHide() { voiceBar.className = ''; vtext.textContent = ''; meter.style.width = '0%'; }
+  function vHide() {
+    if (convOn) return; // the conversation's status line is permanent while it runs
+    voiceBar.className = ''; vtext.textContent = ''; meter.style.width = '0%';
+  }
 
   function resample(x, inRate, outRate) {
     if (inRate === outRate) return x;
@@ -522,6 +658,52 @@
     try { s.ctx.close(); } catch (e) {}
   }
 
+  function newSession(stream, ctx, mode) {
+    return {
+      mode: mode, stream: stream, ctx: ctx, rate: ctx.sampleRate,
+      source: null, node: null, sink: null,
+      blocks: [], length: 0, dropped: 0, elapsedMs: 0, loudRunMs: 0,
+      lastLoudMs: 0, speechStartMs: 0,
+      noiseSum: 0, noiseN: 0, threshold: V.RMS_FLOOR, phase: 'calib'
+    };
+  }
+
+  /*
+   * Ready the session for the *next* utterance without touching the mic. This is
+   * what makes a conversation a conversation: the stream, the graph and the
+   * measured room level all survive, only the per-utterance bookkeeping resets.
+   * Passing `recalibrate` re-measures the room, which is worth doing after we
+   * have been talking over it or after a long silence.
+   */
+  function resetUtterance(s, recalibrate) {
+    s.blocks = []; s.length = 0; s.dropped = 0; s.elapsedMs = 0;
+    s.loudRunMs = 0; s.lastLoudMs = 0; s.speechStartMs = 0;
+    s.phase = recalibrate ? 'calib' : 'wait';
+    if (recalibrate) { s.noiseSum = 0; s.noiseN = 0; }
+  }
+
+  /*
+   * While waiting for speech, keep only enough history for the pre-roll. Without
+   * this a conversation left listening quietly would grow `blocks` until the tab
+   * died. `dropped` records how many samples fell off the front so the absolute
+   * sample offsets used for trimming stay meaningful.
+   */
+  function trimIdle(s) {
+    if (s.phase === 'speak') return;
+    var keep = Math.ceil((V.PRE_ROLL_MS / 1000) * s.rate) * 3;
+    while (s.blocks.length > 1 && (s.length - s.dropped) - s.blocks[0].length > keep) {
+      s.dropped += s.blocks[0].length;
+      s.blocks.shift();
+    }
+  }
+
+  /** The captured utterance as 16 kHz int16 PCM, trimmed to speech + pre-roll + tail. */
+  function utterancePcm(s) {
+    var from = Math.max(s.dropped, Math.floor(((s.speechStartMs - V.PRE_ROLL_MS) / 1000) * s.rate));
+    var to = Math.min(s.length, Math.ceil(((s.lastLoudMs + V.TAIL_MS) / 1000) * s.rate));
+    return toInt16(resample(flatten(s.blocks, from - s.dropped, to - s.dropped), s.rate, V.RATE));
+  }
+
   function stopVoice(reason) {
     var s = vox;
     if (!s) return;
@@ -534,13 +716,11 @@
   }
 
   function transcribeAndSend(s) {
-    var from = Math.max(0, Math.floor(((s.speechStartMs - V.PRE_ROLL_MS) / 1000) * s.rate));
-    var to = Math.min(s.length, Math.ceil(((s.lastLoudMs + V.TAIL_MS) / 1000) * s.rate));
     if (s.lastLoudMs - s.speechStartMs < V.MIN_SPEECH_MS) {
       vHide(); showErr('That was too short to make out — try again.'); return;
     }
-    var pcm = toInt16(resample(flatten(s.blocks, from, to), s.rate, V.RATE));
-    vStatus('Transcribing…', false);
+    var pcm = utterancePcm(s);
+    vStatus('Transcribing…', '');
     micBtn.disabled = true;
     fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: pcm })
       .then(function (r) {
@@ -578,6 +758,9 @@
   function onFrame(block) {
     var s = vox;
     if (!s) return;
+    // DEFENCE 2. Nothing is buffered and no loudness is measured while we are
+    // speaking, so no endpoint can fire and no audio exists to transcribe.
+    if (micGated) return;
     s.blocks.push(block);
     s.length += block.length;
 
@@ -590,8 +773,8 @@
       s.noiseSum += rms; s.noiseN++;
       if (s.elapsedMs >= V.CALIB_MS) {
         s.threshold = Math.max(V.RMS_FLOOR, (s.noiseSum / s.noiseN) * V.NOISE_MULT);
-        s.phase = 'wait';
-        vStatus('Listening — go ahead.', false);
+        resetUtterance(s, false); // the calibration audio is not part of any utterance
+        idleStatus();
       }
       return;
     }
@@ -604,14 +787,45 @@
       if (s.phase === 'wait' && s.loudRunMs >= V.START_MS) {
         s.phase = 'speak';
         s.speechStartMs = s.elapsedMs - s.loudRunMs;
-        vStatus('Listening…', true);
+        vStatus('Listening…', 'hearing');
       }
     } else {
       s.loudRunMs = 0;
-      if (s.phase === 'speak' && s.elapsedMs - s.lastLoudMs >= V.SILENCE_MS) return stopVoice('done');
-      if (s.phase === 'wait' && s.elapsedMs >= V.NO_SPEECH_MS) return stopVoice('nospeech');
+      if (s.phase === 'speak' && s.elapsedMs - s.lastLoudMs >= V.SILENCE_MS) return endUtterance(s);
+      // A conversation is allowed to sit in silence indefinitely — that is the
+      // whole point of it. One-shot dictation still gives up.
+      if (s.phase === 'wait' && s.elapsedMs >= V.NO_SPEECH_MS) {
+        if (s.mode !== 'conv') return stopVoice('nospeech');
+        resetUtterance(s, s.elapsedMs >= C.IDLE_RECALIB_MS); // re-measure a room that has gone quiet
+        return;
+      }
     }
-    if (s.elapsedMs >= V.MAX_MS) stopVoice(s.phase === 'speak' ? 'done' : 'nospeech');
+    if (s.elapsedMs >= V.MAX_MS) {
+      if (s.mode === 'conv') return endUtterance(s);
+      return stopVoice(s.phase === 'speak' ? 'done' : 'nospeech');
+    }
+    trimIdle(s);
+  }
+
+  /*
+   * End of one utterance inside a conversation. The mic is NOT stopped: the PCM
+   * is handed to the transcription queue and capture resets for the next thing
+   * said, so talking again while the previous sentence is still being
+   * transcribed does not lose it.
+   */
+  function endUtterance(s) {
+    if (s.mode !== 'conv') return stopVoice('done');
+    var speechMs = s.lastLoudMs - s.speechStartMs;
+    var pcm = speechMs >= C.MIN_SPEECH_MS ? utterancePcm(s) : null;
+    resetUtterance(s, false); // listening again before the transcript even starts
+    if (!pcm) { idleStatus(); return; } // a cough, a door, a chair — never a message
+    if (convQueue.length >= C.MAX_QUEUE) {
+      convQueue.shift(); // the engine is falling behind; the oldest is the least useful
+      logClient('conv-queue-overflow', { depth: convQueue.length });
+    }
+    convQueue.push(pcm);
+    convPump();
+    idleStatus();
   }
 
   // A muted sink keeps the graph pulled without anything being audible.
@@ -672,14 +886,80 @@
       'so the page cannot record at all. Try Chrome, Safari or Firefox.';
   }
 
-  function markMicBlocked(reason) {
+  function markBlocked(btn, reason) {
+    if (!btn) return;
     var msg = micBlockedMessage(reason);
-    micBtn.className = 'off';           // struck-through, but deliberately NOT disabled:
-    micBtn.title = msg;                 // a disabled button swallows the tap that explains it
-    micBtn.setAttribute('aria-label', msg);
+    btn.className = 'off';              // struck-through, but deliberately NOT disabled:
+    btn.title = msg;                    // a disabled button swallows the tap that explains it
+    btn.setAttribute('aria-label', msg);
+  }
+  function markMicBlocked(reason) { markBlocked(micBtn, reason); }
+
+  /*
+   * Open the microphone and wire up the capture graph. Shared by one-shot
+   * dictation and conversation mode: they differ in what happens when an
+   * utterance *ends*, not in how audio is acquired.
+   */
+  function openCapture(mode) {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    return navigator.mediaDevices.getUserMedia({
+      // DEFENCE 6. Real acoustic echo cancellation where the device offers it.
+      // It is a bonus on top of the hard gate and never a substitute: plenty of
+      // devices ignore the hint, and none of them can cancel a loudspeaker
+      // across the room.
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (stream) {
+      var s = null;
+      try {
+        var ctx;
+        // Ask for 16 kHz outright — the browser resamples better than we can. If it
+        // refuses, we get its native rate and resample in resample() instead.
+        try { ctx = new AC({ sampleRate: V.RATE }); } catch (e) { ctx = new AC(); }
+        s = newSession(stream, ctx, mode);
+        s.source = ctx.createMediaStreamSource(stream);
+      } catch (err) {
+        // The mic is already live by now — hand it back before bailing out, or the
+        // recording indicator stays lit with nothing listening.
+        if (s) teardown(s);
+        else try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        throw captureErr(err, 'could not open an audio context');
+      }
+      return attach(s).then(function () {
+        if (s.ctx.state === 'suspended' && s.ctx.resume) s.ctx.resume();
+        return s;
+      }).catch(function (err) {
+        teardown(s);
+        throw captureErr(err, 'could not start audio capture');
+      });
+    });
+  }
+
+  /** Turn a getUserMedia/capture rejection into a message worth reading. */
+  function micError(err) {
+    var name = (err && err.name) || '';
+    var msg, sticky = false;
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
+      // Distinct from 'insecure': the browser *can* record, you said no.
+      msg = 'Microphone permission denied — this site is blocked from using the mic. ' +
+        'Allow it in the browser\'s site settings (the icon by the address bar), then tap the mic again.';
+      sticky = true;
+    } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      msg = 'No microphone found — this device has no input the browser can see.';
+      sticky = true;
+    } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+      msg = 'The microphone is busy — another app is holding it. Close that and tap the mic again.';
+      sticky = true;
+    } else if (err && err.capture) {
+      msg = 'Could not start recording — ' + ((err && err.message) || 'audio capture failed') + '.';
+    } else {
+      msg = 'Microphone unavailable — ' + ((err && err.message) || name || 'unknown error') + '.';
+    }
+    showErr(msg, sticky);
+    logClient('mic-error', { name: name, message: (err && err.message) || '', capture: !!(err && err.capture) });
   }
 
   function startVoice() {
+    if (convOn) { stopConversation('user'); return; }  // the two cannot share the mic
     if (vox) { stopVoice(vox.phase === 'speak' ? 'done' : 'cancel'); return; } // tap again to stop
 
     var blocked = micBlockedReason();
@@ -690,66 +970,18 @@
       return;
     }
     micBtn.className = ''; // usable after all (e.g. reopened over https)
-
-    var AC = window.AudioContext || window.webkitAudioContext;
     micBtn.disabled = true;
     clearErr();
-    vStatus('Starting…', false);
-    navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    }).then(function (stream) {
-      var s = null;
-      try {
-        var ctx;
-        // Ask for 16 kHz outright — the browser resamples better than we can. If it
-        // refuses, we get its native rate and resample in resample() instead.
-        try { ctx = new AC({ sampleRate: V.RATE }); } catch (e) { ctx = new AC(); }
-        s = {
-          stream: stream, ctx: ctx, rate: ctx.sampleRate, source: null, node: null, sink: null,
-          blocks: [], length: 0, elapsedMs: 0, loudRunMs: 0, lastLoudMs: 0, speechStartMs: 0,
-          noiseSum: 0, noiseN: 0, threshold: V.RMS_FLOOR, phase: 'calib'
-        };
-        s.source = ctx.createMediaStreamSource(stream);
-      } catch (err) {
-        // The mic is already live by now — hand it back before bailing out, or the
-        // recording indicator stays lit with nothing listening.
-        if (s) teardown(s);
-        else try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-        throw captureErr(err, 'could not open an audio context');
-      }
-      return attach(s).then(function () {
-        vox = s;
-        micBtn.className = 'on';
-        micBtn.disabled = false;
-        vStatus('Getting the room level…', false);
-        if (ctx.state === 'suspended') ctx.resume();
-      }).catch(function (err) {
-        teardown(s);
-        throw captureErr(err, 'could not start audio capture');
-      });
+    vStatus('Starting…', '');
+    openCapture('once').then(function (s) {
+      vox = s;
+      micBtn.className = 'on';
+      micBtn.disabled = false;
+      vStatus('Getting the room level…', '');
     }).catch(function (err) {
       micBtn.disabled = false;
       vHide();
-      var name = (err && err.name) || '';
-      var msg, sticky = false;
-      if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
-        // Distinct from 'insecure': the browser *can* record, you said no.
-        msg = 'Microphone permission denied — this site is blocked from using the mic. ' +
-          'Allow it in the browser\'s site settings (the icon by the address bar), then tap the mic again.';
-        sticky = true;
-      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-        msg = 'No microphone found — this device has no input the browser can see.';
-        sticky = true;
-      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
-        msg = 'The microphone is busy — another app is holding it. Close that and tap the mic again.';
-        sticky = true;
-      } else if (err && err.capture) {
-        msg = 'Could not start recording — ' + ((err && err.message) || 'audio capture failed') + '.';
-      } else {
-        msg = 'Microphone unavailable — ' + ((err && err.message) || name || 'unknown error') + '.';
-      }
-      showErr(msg, sticky);
-      logClient('mic-error', { name: name, message: (err && err.message) || '', capture: !!(err && err.capture) });
+      micError(err);
     });
   }
 
@@ -760,16 +992,479 @@
     return e;
   }
 
+  // ------------------------------------------------------------------ conversation mode
+  var noteTimer = null;
+  var noteUntil = 0;
+
+  /** The resting status line: what the bar says when it is just listening. */
+  function idleStatus() {
+    if (micGated) return;             // "Speaking — mic off." owns the bar until the gate lifts
+    if (Date.now() < noteUntil) return; // ...and a note gets its moment to be read
+    if (!convOn) { vStatus('Listening — go ahead.', ''); return; }
+    var waiting = convQueue.length + (convBusy ? 1 : 0);
+    vStatus(waiting ? 'Listening — ' + waiting + ' still transcribing…' : 'Listening — go ahead.', '');
+  }
+  /*
+   * A short-lived message ("didn't catch that") that decays back to idle. The
+   * `noteUntil` guard is load-bearing: dropping an utterance is immediately
+   * followed by the pump's own idleStatus() call, which would otherwise wipe the
+   * explanation off the screen in the same tick and leave the user wondering why
+   * nothing was sent.
+   */
+  function convNote(msg) {
+    if (!convOn) return;
+    vStatus(msg, '');
+    noteUntil = Date.now() + 1600;
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(function () { noteUntil = 0; idleStatus(); }, 1600);
+  }
+
+  function startConversation() {
+    if (convOn) return;
+    var blocked = micBlockedReason();
+    if (blocked) {
+      markBlocked(convoBtn, blocked);
+      markMicBlocked(blocked);
+      showErr(micBlockedMessage(blocked), true);
+      logClient('mic-blocked', { reason: blocked, origin: location.origin, secure: !!window.isSecureContext, mode: 'conversation' });
+      return;
+    }
+    if (vox) stopVoice('cancel'); // one-shot dictation gives way
+
+    convOn = true;
+    convQueue = []; convBusy = false; micGated = false;
+    convoBtn.className = 'on';
+    convoBtn.disabled = true;      // until the mic is actually open
+    convoBtn.setAttribute('aria-pressed', 'true');
+    convoBtn.setAttribute('aria-label', 'Stop the hands-free conversation');
+    micBtn.disabled = true;
+    clearErr();
+    vStatus('Starting…', '');
+    openCapture('conv').then(function (s) {
+      if (!convOn) { teardown(s); return; } // stopped while the mic was still opening
+      vox = s;
+      convoBtn.disabled = false;
+      vStatus('Getting the room level…', '');
+      logClient('conv-start', { rate: s.rate, speak: speakOn });
+    }).catch(function (err) {
+      convOn = false;
+      convoBtn.className = '';
+      convoBtn.disabled = false;
+      convoBtn.setAttribute('aria-pressed', 'false');
+      micBtn.disabled = false;
+      vHide();
+      micError(err);
+    });
+  }
+
+  /*
+   * Stopping is immediate and total: the queue is dropped, playback is cut, the
+   * microphone tracks are stopped (so the browser's recording indicator goes out
+   * at once) and the bar disappears. Nothing already captured is posted after
+   * this returns — "off" has to mean off, instantly, or nobody will trust it.
+   */
+  function stopConversation(why) {
+    if (!convOn) return;
+    convOn = false;
+    convQueue = [];
+    speakQueue = [];
+    stopSpeaking();
+    micGated = false;
+    clearTimeout(noteTimer);
+    var s = vox;
+    vox = null;
+    if (s) teardown(s);
+    convoBtn.className = '';
+    convoBtn.disabled = false;
+    convoBtn.setAttribute('aria-pressed', 'false');
+    convoBtn.setAttribute('aria-label', 'Start a hands-free conversation');
+    micBtn.disabled = false;
+    vHide();
+    logClient('conv-stop', { why: why || 'user' });
+  }
+
+  var NOISE_PHRASES = {
+    'you': 1, 'thank you': 1, 'thanks': 1, 'thank you very much': 1, 'thanks for watching': 1,
+    'thank you for watching': 1, 'bye': 1, 'bye bye': 1, 'goodbye': 1, 'so': 1, 'um': 1,
+    'uh': 1, 'hmm': 1, 'mm': 1, 'ah': 1, 'oh': 1, 'blank audio': 1, 'silence': 1, 'music': 1,
+    'applause': 1, 'the end': 1, 'please subscribe': 1, 'subscribe': 1, 'amen': 1
+  };
+
+  function words(s) {
+    return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').split(/\s+/).filter(Boolean);
+  }
+
+  /*
+   * Whisper tiny-int8 hallucinates a small, very recognisable set of phrases when
+   * handed noise or near-silence. That is a known property of the model and it is
+   * not being upgraded, so the phrases are filtered here instead. A false trigger
+   * posts into a real queue that agents act on, which is why the bar is set this
+   * way round. "okay", "yes" and "no" are deliberately absent: they are rarely
+   * hallucinated and are entirely plausible things to say to an agent.
+   */
+  function isNoisePhrase(text) { return NOISE_PHRASES[words(text).join(' ')] === 1; }
+
+  /*
+   * DEFENCE 5. If the mic gate leaked, what comes back will be the words we just
+   * said. Overlap is measured against what was *heard*, not what was said, so a
+   * three-word fragment of a long reply is still caught.
+   */
+  function looksLikeEcho(text) {
+    if (!lastSpokenText || Date.now() - lastSpokenAt > C.ECHO_WINDOW_MS) return false;
+    var heard = words(text);
+    if (heard.length < 2) return false; // too short to judge; "yes" is not an echo
+    var said = Object.create(null), mine = words(lastSpokenText), i;
+    for (i = 0; i < mine.length; i++) said[mine[i]] = 1;
+    var hits = 0;
+    for (i = 0; i < heard.length; i++) if (said[heard[i]]) hits++;
+    return hits / heard.length >= C.ECHO_OVERLAP;
+  }
+
+  /** Why this transcript must not become a message, or null if it may. */
+  function rejectReason(text) {
+    if (!text) return 'empty';
+    if (!/[a-z0-9]/i.test(text)) return 'punctuation'; // a lone "." or "?"
+    if (isNoisePhrase(text)) return 'noise';
+    if (looksLikeEcho(text)) return 'echo';
+    return null;
+  }
+
+  /*
+   * Drains captured utterances one at a time. Serialised on purpose: capture
+   * keeps running while this is in flight (so nothing said meanwhile is lost),
+   * but messages must reach the queue in the order they were spoken.
+   */
+  function convPump() {
+    if (convBusy || !convQueue.length || !convOn) return;
+    convBusy = true;
+    var pcm = convQueue.shift();
+    idleStatus();
+    fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: pcm })
+      .then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+          if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+          return j;
+        });
+      })
+      .then(function (j) {
+        if (!convOn) return; // stopped while this was in flight
+        var text = ((j && j.text) || '').trim();
+        var why = rejectReason(text);
+        if (why) {
+          logClient('conv-dropped', { why: why, text: text.slice(0, 80) });
+          convNote(why === 'echo' ? 'Ignored my own voice.' : 'Didn’t catch that.');
+          return;
+        }
+        return postTask(text, 'voice-conversation')
+          .then(function () { return poll(false); })
+          .catch(function (err) {
+            // Never lose words: they land in the composer, exactly as a failed
+            // typed message does, and can be sent by hand.
+            var draft = input.value.replace(/\s+$/, '');
+            input.value = draft ? draft + ' ' + text : text;
+            autosize();
+            showErr('Not sent — ' + ((err && err.message) || 'network error') + '. The words are in the box.');
+          });
+      })
+      .catch(function (err) {
+        showErr('Transcription failed — ' + ((err && err.message) || 'the server could not be reached') + '.');
+        logClient('conv-stt-failed', { message: (err && err.message) || 'network error' });
+      })
+      .then(function () {
+        convBusy = false;
+        idleStatus();
+        convPump();
+      });
+  }
+
+  // ------------------------------------------------------------------ spoken replies
+  /*
+   * What is worth listening to.
+   *
+   * Read out verbatim an agent reply is miserable: a URL becomes half a minute of
+   * "h t t p s colon slash slash", and a code block is unlistenable at any speed.
+   * The rule is **say what it is, not what it says** — the exact characters are
+   * already on screen where they can be read and copied, so the spoken version
+   * names the thing and moves on. Every replacement is announced rather than
+   * silently dropped, so a sentence never sounds like it is missing a clause.
+   */
+  function speakable(raw) {
+    var t = String(raw == null ? '' : raw);
+    t = t.replace(/```[\s\S]*?```/g, ' (a code block) ');       // fenced code
+    t = t.replace(/```[\s\S]*$/, ' (a code block) ');           // unterminated fence
+    t = t.replace(/\[([^\]\n]{1,80})\]\([^)\s]+\)/g, '$1');     // [label](url) -> label
+    t = t.replace(/(?:https?:\/\/|www\.)\S+/gi, ' (a link) ');
+    t = t.replace(/^[ \t]*[$#>]\s+\S[^\n]*$/gm, ' (a command) '); // shell prompt lines
+    t = t.replace(/\b(?:curl|docker|git|npm|node|sudo|ssh|kubectl)\s+[^\n.]{12,}/gi, ' (a command) ');
+    t = t.replace(/`([^`\n]*)`/g, function (m, code) {
+      return /^\S{1,24}$/.test(code) ? code : ' (some code) '; // short identifiers are fine to say
+    });
+    t = t.replace(/(?:[A-Za-z]:[\\/]\S*|(?:[\\/][A-Za-z][\w.\-]*){2,}[\\/]?)/g, ' (a file path) ');
+    t = t.replace(/\b[A-Za-z0-9+/=_-]{24,}\b/g, ' (a long identifier) '); // hashes, ids, base64
+    // Emoji and arrows: nothing here is speech, and engines read them as noise.
+    t = t.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[←-⯿☀-➿️]/g, ' ');
+    t = t.replace(/^[ \t]*#{1,6}\s*/gm, '');                    // headings
+    t = t.replace(/^[ \t]*[-*+•]\s+/gm, '');               // bullets
+    t = t.replace(/^[ \t]*\|.*\|[ \t]*$/gm, ' (a table row) '); // tables
+    t = t.replace(/[*_~]{1,3}(\S[^*_~\n]*)[*_~]{1,3}/g, '$1');  // emphasis
+    t = t.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{2,}/g, '\n');
+    // "(a link) (a link) (a link)" is worse than one; collapse runs of the same note.
+    t = t.replace(/\((a code block|a link|a command|some code|a file path|a long identifier|a table row)\)(?:\s*\(\1\))+/g, '($1)');
+    t = t.trim();
+    if (t.length > C.MAX_SPEAK) {
+      var cut = t.slice(0, C.MAX_SPEAK);
+      var stop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+      t = (stop > C.MAX_SPEAK * 0.5 ? cut.slice(0, stop + 1) : cut.replace(/\s+\S*$/, '')) +
+        ' … that is the first part. The rest is on screen.';
+    }
+    return t;
+  }
+
+  /*
+   * Decide which merged entries get read out. Called after every merge, from
+   * both the SSE path and the poll path, so it does not matter which delivered
+   * the reply. Everything present at boot is marked spoken without speaking it:
+   * reading the whole backlog aloud on each refresh would be intolerable.
+   */
+  function harvestSpeech() {
+    var list = freshAgent;
+    freshAgent = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (spoken[e.id]) continue;
+      spoken[e.id] = true;
+      if (!booted || !speakOn) continue;
+      var text = speakable(e.text);
+      if (text) speakQueue.push(text);
+    }
+    speakPump();
+  }
+
+  function speakPump() {
+    if (speaking || !speakQueue.length) return;
+    if (!speakOn) { speakQueue = []; return; }
+    if (!audioUnlocked) { speakQueue = []; warnLocked(); return; }
+
+    var text = speakQueue.shift();
+    speaking = true;
+    spkBtn.className = 'on busy';
+    // DEFENCE 1-3, taken before a single sample can play. Deliberately closed for
+    // the whole turn — synthesis included — rather than at playback start: it
+    // costs a second of listening but removes any window where playback could
+    // begin part-way through an utterance we were already recording.
+    gateMic(true);
+    vStatus('Getting the reply ready…', 'speaking');
+    ttsFetch(text)
+      .then(function (buf) {
+        if (!speakOn) return null; // muted while it was being synthesised
+        vStatus('Speaking — mic off.', 'speaking');
+        // Recorded before playback, not after: if the gate leaks, the echo
+        // arrives while we are still talking, and defence 5 must already know.
+        lastSpokenText = text;
+        lastSpokenAt = Date.now();
+        return play(buf);
+      })
+      .then(function () { lastSpokenAt = Date.now(); })
+      .catch(function (err) {
+        var m = (err && err.message) || 'playback failed';
+        showErr('Could not speak the reply — ' + m + '. It is on screen above; the microphone is unaffected.', true);
+        logClient('tts-failed', { message: m });
+      })
+      .then(function () {
+        speaking = false;
+        spkBtn.className = speakOn ? 'on' : '';
+        releaseMic();
+        speakPump();
+      });
+  }
+
+  function ttsFetch(text) {
+    return fetch('/tts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: text })
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+          throw new Error((j && j.error) || ('HTTP ' + r.status));
+        });
+      }
+      return r.arrayBuffer();
+    });
+  }
+
+  /*
+   * DEFENCE 1 + 3. `enabled = false` makes the browser hand us digital silence at
+   * the track level, which holds even if every line of JS above is wrong, and
+   * whatever was half-captured is thrown away so no fragment can be stitched onto
+   * the next utterance.
+   */
+  function gateMic(on) {
+    micGated = !!on;
+    var s = vox;
+    if (s) {
+      try {
+        var tracks = s.stream.getAudioTracks ? s.stream.getAudioTracks() : s.stream.getTracks();
+        for (var i = 0; i < tracks.length; i++) tracks[i].enabled = !micGated;
+      } catch (e) { /* the JS-level gate in onFrame still holds */ }
+      resetUtterance(s, true); // and re-measure the room once we are listening again
+    }
+    if (convOn) convoBtn.className = micGated ? 'on gated' : 'on';
+    if (micGated) meter.style.width = '0%';
+  }
+
+  /* DEFENCE 4. Reverb, Bluetooth latency and speaker ring-out all outlive `onended`. */
+  function releaseMic() {
+    setTimeout(function () {
+      if (speaking) return; // the next reply started; it owns the gate now
+      gateMic(false);
+      idleStatus();
+    }, C.SETTLE_MS);
+  }
+
+  function ensurePlayCtx() {
+    if (playCtx) return playCtx;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { playCtx = new AC(); } catch (e) { return null; }
+    return playCtx;
+  }
+
+  /*
+   * iOS Safari will not make a sound unless playback has first been started
+   * inside a real user gesture, and Chrome's autoplay policy is nearly as
+   * strict. So the tap that turns on the speaker or starts a conversation spends
+   * itself unlocking audio: resume the context and push one silent buffer
+   * through it. Everything after that is allowed to play on its own.
+   */
+  function unlockAudio() {
+    var ctx = ensurePlayCtx();
+    if (!ctx) return false;
+    try { if (ctx.state === 'suspended' && ctx.resume) ctx.resume(); } catch (e) {}
+    try {
+      var src = ctx.createBufferSource();
+      src.buffer = ctx.createBuffer(1, 1, 22050);
+      src.connect(ctx.destination);
+      src.start(0);
+    } catch (e) { /* the resume alone is often enough */ }
+    audioUnlocked = true;
+    return true;
+  }
+
+  function warnLocked() {
+    if (audioWarned) return;
+    audioWarned = true;
+    showErr('Spoken replies need one tap first — browsers only let audio start from a tap, ' +
+      'so nothing can be played until you press the speaker button. Press it and the next reply is read out.', true);
+    logClient('tts-locked', { reason: 'no user gesture yet' });
+  }
+
+  /** decodeAudioData is a promise in modern browsers and a callback in old Safari. */
+  function decode(ctx, buf) {
+    return new Promise(function (resolve, reject) {
+      var p;
+      try { p = ctx.decodeAudioData(buf, resolve, reject); } catch (e) { reject(e); return; }
+      if (p && p.then) p.then(resolve, reject);
+    });
+  }
+
+  /** Resolves when the reply has finished playing (or has been cut short). */
+  function play(buf) {
+    var ctx = ensurePlayCtx();
+    if (!ctx || !ctx.decodeAudioData) return playViaElement(buf);
+    return decode(ctx, buf).then(function (audio) {
+      return new Promise(function (resolve) {
+        var token = ++playToken;
+        var src = ctx.createBufferSource();
+        src.buffer = audio;
+        src.connect(ctx.destination);
+        src.onended = function () { if (playing && playing.token === token) playing = null; resolve(); };
+        playing = { token: token, stop: function () { try { src.stop(0); } catch (e) { resolve(); } } };
+        try { if (ctx.state === 'suspended' && ctx.resume) ctx.resume(); } catch (e) {}
+        src.start(0);
+      });
+    }).catch(function () {
+      return playViaElement(buf); // Web Audio refused it; try the plain element
+    });
+  }
+
+  /** Fallback path: a blob URL in an <audio> element (CSP already allows blob: media). */
+  function playViaElement(buf) {
+    if (!window.Audio || !window.Blob || !window.URL || !URL.createObjectURL) {
+      return Promise.reject(new Error('this browser cannot play audio'));
+    }
+    return new Promise(function (resolve, reject) {
+      var url = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+      var token = ++playToken;
+      var el = new Audio(url);
+      var cleanup = function () { try { URL.revokeObjectURL(url); } catch (e) {} };
+      var done = function () { cleanup(); if (playing && playing.token === token) playing = null; resolve(); };
+      playing = { token: token, stop: function () { try { el.pause(); } catch (e) {} done(); } };
+      el.onended = done;
+      el.onerror = function () { cleanup(); reject(new Error('the browser could not play the audio')); };
+      var p = el.play();
+      if (p && p.catch) p.catch(function (e) { cleanup(); reject(e); });
+    });
+  }
+
+  function stopSpeaking() {
+    speakQueue = [];
+    var p = playing;
+    playing = null;
+    playToken++;
+    if (p) { try { p.stop(); } catch (e) {} }
+  }
+
+  function pref(key, val) {
+    try {
+      if (val === undefined) return window.localStorage.getItem(key);
+      window.localStorage.setItem(key, val);
+    } catch (e) { /* private mode or storage disabled: the toggle just will not persist */ }
+    return null;
+  }
+
+  function setSpeak(on, remember) {
+    speakOn = !!on;
+    spkBtn.className = speakOn ? 'on' : '';
+    spkBtn.setAttribute('aria-pressed', speakOn ? 'true' : 'false');
+    var label = speakOn ? 'Spoken replies are on' : 'Spoken replies are off';
+    spkBtn.title = label;
+    spkBtn.setAttribute('aria-label', label);
+    if (remember) pref('relay.speak', speakOn ? '1' : '0');
+    if (!speakOn) stopSpeaking(); // muting cuts the current reply off mid-word, on purpose
+  }
+
   function initVoice() {
     if (!micBtn) return;
     var blocked = micBlockedReason();
     if (blocked) {
       markMicBlocked(blocked);
+      markBlocked(convoBtn, blocked);
       // Reported without waiting for a tap, so "the mic didn't work" is already
       // in the server log by the time anyone asks about it.
       logClient('mic-blocked-on-load', { reason: blocked, origin: location.origin });
     }
     micBtn.addEventListener('click', startVoice);
+
+    // Spoken replies need neither a microphone nor a secure context, so the
+    // speaker still works on the plain-http LAN page where the mic cannot.
+    if (spkBtn) {
+      setSpeak(pref('relay.speak') === '1', false);
+      spkBtn.addEventListener('click', function () {
+        var on = !speakOn;
+        if (on) unlockAudio(); // must happen inside the gesture to count
+        setSpeak(on, true);
+      });
+    }
+    if (convoBtn) {
+      convoBtn.addEventListener('click', function () {
+        if (convOn) { stopConversation('user'); return; }
+        unlockAudio(); // the deliberate tap that buys us playback for the session
+        if (pref('relay.speak') === null) setSpeak(true, true); // conversing implies hearing
+        startConversation();
+      });
+    }
+    if (stopBtn) stopBtn.addEventListener('click', function () { stopConversation('user'); });
   }
 
   // The queue UI boots first and does not depend on any of the audio code above.
@@ -777,7 +1472,9 @@
   render();
   autosize();
   focusComposer();
-  poll(true).then(schedule);
+  // `booted` flips only after the first read has landed, which is what stops the
+  // existing thread from being read aloud on every refresh.
+  poll(true).then(function () { booted = true; }).then(schedule);
   openStream();
 
   // Voice is wired last and defensively: this is a messaging app with dictation
