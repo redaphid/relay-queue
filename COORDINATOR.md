@@ -326,6 +326,19 @@ overturned the theory two agents were working from. **His throwaway line is
 usually the root cause.** Never plan off the status board either — it truncates
 hard and silently, and one message that previewed as four asks contained six.
 
+**The plausible mechanism is usually wrong. Only measurement catches it.**
+Three times in one night, in three unrelated areas, reading the code produced a
+confident, coherent, wrong answer: an address bar was blamed for a composer that
+was actually behind the keyboard (`innerHeight` cheerfully reports an occluded
+element as on screen); "something must be poking Iceland" described a nudger
+pinned to an agent name that no longer exists; and an offline read that looked
+perfectly correct in source did nothing at all, because Firefox does not route
+`cache: 'no-store'` fetches through the service worker. Every one was caught by
+running it in a real browser or against the real process, and not one was
+catchable by reading. **Assume the platform lies until a real instance proves
+otherwise**, and treat "I read the code and it must be X" as a hypothesis you
+still owe a measurement — especially when it is elegant.
+
 **When two causes produce the same symptom, ship both and stop relitigating.**
 His composer kept vanishing. "They hide when I scroll" points squarely at the
 address bar collapsing a `100dvh` layout; "the keyboard covers my chat input"
