@@ -72,6 +72,12 @@ fixes('the meta mcp hub', 'the MetaMCP hub');
 fixes('use tail scale for that', 'use Tailscale for that');
 fixes('push it to git hub', 'push it to GitHub');
 
+console.log('\nfound by round-tripping real speech through the engine');
+// Observed live: piper said "cloud" and "mind about", Whisper heard these instead.
+fixes('Ask clown to check mine to belt for me',
+  'Ask Claude to check mindmeld for me');
+leaves('stop clowning around');
+
 console.log('\nsound-alikes it was never explicitly told about');
 // "coordinateor" is not in the dictionary; it reaches "coordinator" purely by
 // sounding identical, which is the whole point of the phonetic pass.

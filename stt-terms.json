@@ -27,7 +27,7 @@
     {
       "term": "Claude",
       "heard": [
-        "cloud", "claud", "cloude", "clode", "quad", "quaad",
+        "cloud", "claud", "cloude", "clode", "quad", "quaad", "clown", "clowd",
         "cloud e u", "cloudeu", "c l o u d e u", "cloud eu"
       ],
       "note": "The worst offender — three messages in a row failed on this one, including a spelled-out attempt. 'cloud' is listed knowingly: this user says 'Claude' constantly and bare 'cloud' almost never; the common collocations ('the cloud', 'cloud storage', 'cloud nine') are protected below, and the longer 'Cloudflare' wins the match ahead of it. 'clawed', 'cloudy' and 'clod' were tried and REMOVED — they are ordinary words, and rewriting 'he clawed at the door' is exactly the kind of mistake that costs more trust than the fix is worth. If bare 'cloud' ever bites, delete it from this list."
@@ -39,8 +39,11 @@
     },
     {
       "term": "mindmeld",
-      "heard": ["mind about", "mine mall", "mind meld", "mind mall", "mine meld", "mind melt", "mind mel", "mined meld"],
-      "note": "Broken across a word boundary every time, and never phonetically close enough to catch by sound alone."
+      "heard": [
+        "mind about", "mine mall", "mind meld", "mind mall", "mine meld", "mind melt",
+        "mind mel", "mined meld", "mine to belt", "mind to belt", "mine melt"
+      ],
+      "note": "Broken across a word boundary every time, and never phonetically close enough to catch by sound alone. The 'to belt' variants came from round-tripping through piper rather than from the user; they are nonsense phrases, so listing them costs nothing."
     },
     {
       "term": "Vikunja",
@@ -119,7 +122,7 @@
     "code", "cord", "card", "cared", "curd",
     "cloud nine", "the cloud", "cloud storage", "cloud computing", "cloud provider",
     "in the cloud", "cloud native", "cloud services", "cloud cover", "point cloud",
-    "clawed", "cloudy", "clod", "clawing",
+    "clawed", "cloudy", "clod", "clawing", "clowning", "clowns", "clown around",
     "mind", "mine", "mines", "melt", "meld", "mall", "mail",
     "never mind about", "mind about that", "mind about it", "mind about the",
     "coordinate her", "communicate her", "coordinate the", "coordinate with",
