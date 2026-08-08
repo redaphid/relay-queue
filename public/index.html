@@ -870,6 +870,77 @@
   var convErr = document.getElementById('converr');
   var convList = document.getElementById('convlist');
 
+  /*
+   * ---- the conversation lives in the address bar --------------------------
+   *
+   * WHY. Reloading is what this user does when the page looks stuck, and the
+   * page looking stuck is exactly the failure being fixed elsewhere in this
+   * file. Before this, every reload landed back on the default conversation
+   * without saying so, so the next message went to whichever agent happened to
+   * own `main` rather than the one being talked to. A silently misrouted
+   * message is worse than an error: nobody finds out until an agent acts on
+   * something that was never meant for it.
+   *
+   * A HASH, NOT A PATH. The server is a hand-rolled node:http app with an
+   * explicit route table; `/c/<id>` would need a catch-all that serves the page
+   * for any unmatched path, and that catch-all is precisely the thing that
+   * turns a genuine 404 — a typo'd API call, a missing asset — into a silent
+   * 200 of HTML. A fragment needs no server change at all, is never sent to the
+   * server, and therefore behaves identically through the Cloudflare tunnel and
+   * Access. `#/c/` rather than a bare `#<id>` so a later view can have its own
+   * route without colliding.
+   */
+  var CONV_HASH = /^#\/c\/(.*)$/;
+
+  function convFromUrl() {
+    var m = CONV_HASH.exec(String(location.hash || ''));
+    if (!m || !m[1]) return null;
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+  }
+
+  /*
+   * `replace` for anything the user did not choose — the first paint, and
+   * repairing a dead link. Only a deliberate switch earns a history entry, or
+   * Back would walk through states nobody navigated to.
+   */
+  function setUrl(id, replace) {
+    var h = '#/c/' + encodeURIComponent(id);
+    if (location.hash === h) return;
+    try {
+      if (window.history && window.history.pushState) {
+        window.history[replace ? 'replaceState' : 'pushState'](null, '', h);
+        return;
+      }
+    } catch (e) { /* fall through to the assignment below */ }
+    // No History API: still correct, just always a new entry. The hashchange
+    // this fires is absorbed by the already-there guard in onUrlChange().
+    location.hash = h;
+  }
+
+  /*
+   * Back and forward move between conversations instead of leaving the app.
+   * Both events are listened for because pushState-with-a-fragment fires
+   * popstate, hashchange, or both depending on the browser; the guard below
+   * makes a duplicate harmless.
+   */
+  function onUrlChange() {
+    var id = convFromUrl() || DEFAULT_CONV; // hash hand-edited away: go home
+    if (id === activeConv) return;
+    // The URL is already right, so this must not push another entry.
+    return switchConv(id, true, 'none').then(function () {
+      /*
+       * Unlike a tap, a URL can name a conversation this page has never heard
+       * of — pasted from another device, or archived since. `switchConv` does
+       * not validate, so without this the page sits on an empty thread with a
+       * title of "relay" until the ten-minute repair poll comes round, which is
+       * indistinguishable from the app being broken. Refreshing the list settles
+       * it either way: a conversation made elsewhere simply appears, and a dead
+       * one is repaired to the default by loadConvs().
+       */
+      if (!convById(id)) return loadConvs();
+    });
+  }
+
   function markMenu() {
     var any = false;
     for (var k in convNew) { if (k !== activeConv) { any = true; break; } }
@@ -891,10 +962,23 @@
       .then(function (j) {
         if (j && typeof j.defaultId === 'string') DEFAULT_CONV = j.defaultId;
         convs = (j && Array.isArray(j.conversations)) ? j.conversations : [];
-        // The remembered conversation may have been archived or never existed.
+        // The conversation in the URL — or the remembered one — may have been
+        // archived, or may never have existed. Land on the default rather than
+        // on a blank page, say which thread this now is, and REPLACE the bad
+        // address so it cannot survive into the next reload. Silence here would
+        // be the same misrouting bug wearing a different hat.
         var here = false;
         for (var i = 0; i < convs.length; i++) if (convs[i].id === activeConv) here = true;
-        if (!here && convs.length) return switchConv(DEFAULT_CONV, true);
+        if (!here && convs.length) {
+          var missing = activeConv;
+          return switchConv(DEFAULT_CONV, true, 'replace').then(function (ok) {
+            var c = convById(DEFAULT_CONV);
+            showErr('That conversation is not here any more — showing ' +
+              ((c && c.title) || 'the main thread') + ' instead.');
+            logClient('conv-missing', { wanted: missing });
+            return ok;
+          });
+        }
         applyHue(activeConv);
         renderConvs();
         setTitle();
@@ -1062,10 +1146,11 @@
    * not strand a live microphone — and anything already captured still posts to
    * the conversation it was spoken into.
    */
-  function switchConv(id, quiet) {
+  function switchConv(id, quiet, urlMode) {
     if (!quiet && id === activeConv) { closeDrawer(); return Promise.resolve(true); }
     activeConv = id;
     pref('relay.conv', id);
+    if (urlMode !== 'none') setUrl(id, urlMode === 'replace');
     applyHue(id);
     delete convNew[id];
     entries.clear(); sigs.clear();
@@ -1134,8 +1219,23 @@
   }
 
   function initConvs() {
+    /*
+     * Precedence: the URL, then what this device last had open, then the
+     * default. The URL wins because it is the only one of the three that
+     * someone can have deliberately chosen — a shared link, or a reload of a
+     * thread this phone was already in. localStorage stays as the fallback so
+     * that opening the bare bookmarked address still comes back where it was.
+     */
     var saved = pref('relay.conv');
-    if (saved) activeConv = saved;
+    var fromUrl = convFromUrl();
+    if (fromUrl) activeConv = fromUrl;
+    else if (saved) activeConv = saved;
+    // Put it in the address bar from the first paint, without adding a history
+    // entry for a page nobody navigated to. Whether the id is real is not known
+    // until /conversations answers; loadConvs() repairs it if it is not.
+    setUrl(activeConv, true);
+    window.addEventListener('popstate', onUrlChange);
+    window.addEventListener('hashchange', onUrlChange);
     applyHue(activeConv);
     if (menuBtn) menuBtn.addEventListener('click', function () {
       if (drawerOpen) closeDrawer(); else openDrawer();

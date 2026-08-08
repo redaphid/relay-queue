@@ -197,6 +197,70 @@ function REACHABLE(sel) {
   const closed = await page.evaluate(() => document.querySelector('#drawer').hidden);
   check('Escape closes it again', closed === true, String(closed));
 
+  console.log('\nthe conversation survives a reload, in a real browser');
+  {
+    // Switch by tapping, exactly as the user does.
+    await page.click('#menu');
+    await page.waitForTimeout(600);
+    await page.click('#convlist .conv:nth-child(2)');
+    await page.waitForTimeout(1500);
+    const url = page.url();
+    check('tapping a conversation puts it in the address bar', /#\/c\/iceland$/.test(url), url);
+    const title = await page.evaluate(() => document.querySelector('#title').textContent);
+    check('the header follows', title === 'Iceland', title);
+
+    // THE ACTUAL BUG: a reload used to land back in `main`.
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForTimeout(1500);
+    const after = await page.evaluate(() => document.querySelector('#title').textContent);
+    check('*** a real reload stays in the same conversation ***', after === 'Iceland', after);
+    check('...and the address bar still names it', /#\/c\/iceland$/.test(page.url()), page.url());
+
+    // Back must move between conversations, not leave the app.
+    await page.goBack({ waitUntil: 'commit' });
+    await page.waitForTimeout(1500);
+    const back = await page.evaluate(() => document.querySelector('#title').textContent);
+    check('*** Back moves to the previous conversation, not out of the app ***',
+      back === 'Main', back + ' at ' + page.url());
+    await page.goForward({ waitUntil: 'commit' });
+    await page.waitForTimeout(1500);
+    const fwd = await page.evaluate(() => document.querySelector('#title').textContent);
+    check('Forward returns', fwd === 'Iceland', fwd + ' at ' + page.url());
+
+    /*
+     * A dead link must land somewhere usable and say so. Two different paths
+     * reach it and only one of them reloads: pasting a link into a page that is
+     * already open changes the fragment without a navigation, so the page has
+     * to notice for itself. That is the case that was broken.
+     */
+    await page.evaluate(() => { location.hash = '#/c/archived-last-week'; });
+    await page.waitForTimeout(2000);
+    const inPage = await page.evaluate(() => ({
+      title: document.querySelector('#title').textContent,
+      err: document.querySelector('#err').textContent,
+    }));
+    check('a dead link pasted into an open page is repaired too',
+      inPage.title === 'Main' && /not here any more/i.test(inPage.err), JSON.stringify(inPage));
+
+    await page.goto(base + '#/c/archived-last-week', { waitUntil: 'load' });
+    await page.waitForTimeout(1800);
+    const dead = await page.evaluate(() => ({
+      title: document.querySelector('#title').textContent,
+      err: document.querySelector('#err').textContent,
+      msgs: document.querySelectorAll('#list .msg').length,
+    }));
+    check('*** an unknown conversation is not a blank page ***',
+      dead.title === 'Main' && dead.msgs > 0, JSON.stringify(dead));
+    check('it says so rather than switching silently', /not here any more/i.test(dead.err), dead.err);
+    check('and the address is repaired', /#\/c\/main$/.test(page.url()), page.url());
+
+    // Everything you touch must still be reachable after all that navigation.
+    for (const [name, sel] of [['the message box', '#input'], ['the hamburger menu', '#menu'], ['Send', '#send']]) {
+      const r = await page.evaluate(REACHABLE, sel);
+      check(`${name} is still reachable after navigating`, r.ok, r.why);
+    }
+  }
+
   console.log('\nthe live path still works');
   const ts = new Date().toISOString();
   const pushed = { id: 'live-1', role: 'agent', status: 'done', text: 'pushed over SSE', ts, rev: ts, conversationId: 'main' };

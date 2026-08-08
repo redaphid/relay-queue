@@ -165,7 +165,9 @@ function makeEnv(opts) {
     headers: { get: () => null },
   });
 
-  const mem = {};
+  // `stored` models a device that has been used before: the remembered
+  // conversation, the speaker setting, and so on.
+  const mem = Object.assign({}, opts.stored || {});
   const sandbox = {
     console,
     // Real delays: the page's own 3 s poll timer must NOT fire during a test, or
@@ -187,6 +189,19 @@ function makeEnv(opts) {
       host: opts.host || '10.0.136.62:3901',
       origin: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901'),
       href: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901') + '/',
+      // The conversation lives here. Starts wherever the test says it does, so
+      // "opened from a shared link" is expressible.
+      hash: opts.hash || '',
+    },
+    /*
+     * Enough History API to tell a deliberate switch (pushState, so Back
+     * returns to it) from a repair (replaceState, so Back does not walk into a
+     * conversation that does not exist). `entries` is what the tests assert on.
+     */
+    history: {
+      entries: [],
+      pushState(_s, _t, url) { this.entries.push({ how: 'push', url }); sandbox.location.hash = url; },
+      replaceState(_s, _t, url) { this.entries.push({ how: 'replace', url }); sandbox.location.hash = url; },
     },
     localStorage: {
       getItem: (k) => (Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null),
@@ -935,6 +950,121 @@ async function main() {
     await settle();
     check('a sent message goes to the conversation you are in',
       env.sent()[0] && env.sent()[0].body.conversationId === 'c2', JSON.stringify(env.sent()[0] && env.sent()[0].body));
+  }
+
+  // ===================================== the conversation lives in the URL
+  /*
+   * The bug this closes: reloading the page silently put you back in `main`.
+   * Reloading is what this user does whenever the page looks stuck, so the next
+   * message went to whichever agent owns `main` rather than the one being
+   * talked to. Nothing announced the switch — a misrouted message is only
+   * discovered when an agent acts on something never meant for it.
+   */
+  console.log('\nthe URL — the conversation survives a reload');
+  {
+    const env = liveEnv();
+    await settle();
+    check('a bare address gets the conversation written into it',
+      env.sandbox.location.hash === '#/c/main', env.sandbox.location.hash);
+    check('...by replacing, so Back does not step into a state nobody chose',
+      env.sandbox.history.entries.length === 1 && env.sandbox.history.entries[0].how === 'replace',
+      JSON.stringify(env.sandbox.history.entries));
+
+    env.els.convlist.children[1].dispatch('click'); // switch to "Widget audit"
+    await settle();
+    check('switching puts that conversation in the address bar',
+      env.sandbox.location.hash === '#/c/c2', env.sandbox.location.hash);
+    check('...and that one IS a history entry, so Back comes back',
+      env.sandbox.history.entries.slice(-1)[0].how === 'push',
+      JSON.stringify(env.sandbox.history.entries));
+  }
+
+  console.log('\nthe URL — a link opens the thread it names');
+  {
+    const env = liveEnv({ hash: '#/c/c2' });
+    await settle();
+    check('*** a reload lands in the conversation it was in ***',
+      env.els.title.textContent === 'Widget audit', env.els.title.textContent);
+    check('and it is that conversation that gets read',
+      /conversation=c2/.test(env.reads().slice(-1)[0].url), env.reads().slice(-1)[0].url);
+
+    env.els.input.value = 'a message after the reload';
+    env.els.send.dispatch('click');
+    await settle();
+    check('*** so the next message cannot be misrouted ***',
+      env.sent()[0] && env.sent()[0].body.conversationId === 'c2',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body));
+  }
+
+  console.log('\nthe URL — it outranks what this device last had open');
+  {
+    const env = liveEnv({ hash: '#/c/c2', stored: { 'relay.conv': 'main' } });
+    await settle();
+    check('a shared link wins over the remembered conversation',
+      env.els.title.textContent === 'Widget audit', env.els.title.textContent);
+
+    const remembered = liveEnv({ stored: { 'relay.conv': 'c2' } });
+    await settle();
+    check('...but with no link, the remembered one is still honoured',
+      remembered.els.title.textContent === 'Widget audit', remembered.els.title.textContent);
+    check('...and it is written into the address bar too',
+      remembered.sandbox.location.hash === '#/c/c2', remembered.sandbox.location.hash);
+  }
+
+  console.log('\nthe URL — Back and Forward move between conversations');
+  {
+    const env = liveEnv();
+    await settle();
+    env.els.convlist.children[1].dispatch('click');
+    await settle();
+    check('we are in the second conversation', env.els.title.textContent === 'Widget audit');
+
+    // What the browser does on Back: the fragment changes, then it tells us.
+    env.sandbox.location.hash = '#/c/main';
+    env.sandbox.dispatchWindow('popstate');
+    await settle();
+    check('*** Back returns to the previous conversation ***',
+      env.els.title.textContent === 'Main', env.els.title.textContent);
+    check('...and it does not push a new entry for a move it did not make',
+      env.sandbox.history.entries.slice(-1)[0].url === '#/c/c2',
+      JSON.stringify(env.sandbox.history.entries));
+
+    env.sandbox.location.hash = '#/c/c2';
+    env.sandbox.dispatchWindow('hashchange');
+    await settle();
+    check('Forward works the same way', env.els.title.textContent === 'Widget audit',
+      env.els.title.textContent);
+  }
+
+  console.log('\nthe URL — a dead link degrades to the default, out loud');
+  {
+    const env = liveEnv({ hash: '#/c/archived-last-week' });
+    await settle();
+    check('*** an unknown conversation does not leave a blank page ***',
+      env.els.title.textContent === 'Main', env.els.title.textContent);
+    check('it says so rather than switching you silently',
+      /not here any more/i.test(env.els.err.textContent), JSON.stringify(env.els.err.textContent));
+    check('and the bad address is repaired, so a reload does not repeat it',
+      env.sandbox.location.hash === '#/c/main', env.sandbox.location.hash);
+    check('...by replacing, so Back does not lead to the dead link',
+      env.sandbox.history.entries.slice(-1)[0].how === 'replace',
+      JSON.stringify(env.sandbox.history.entries));
+
+    /*
+     * The same link pasted into a page that is already open. This one is not a
+     * reload — the fragment changes and nothing else does — so the page has to
+     * notice by itself. It did not, and sat on an empty thread titled "relay"
+     * until the ten-minute repair poll; a real browser caught what the stub
+     * above could not, because the stub had reloaded.
+     */
+    const open = liveEnv();
+    await settle();
+    open.sandbox.location.hash = '#/c/archived-last-week';
+    open.sandbox.dispatchWindow('hashchange');
+    await settle();
+    check('a dead link pasted into an already-open page is repaired too',
+      open.els.title.textContent === 'Main' && /not here any more/i.test(open.els.err.textContent),
+      `${open.els.title.textContent} / ${open.els.err.textContent}`);
   }
 
   console.log('\nconversations — activity elsewhere is flagged, not merged');
