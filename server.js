@@ -1602,6 +1602,12 @@ function resultTask(res, id, body) {
     return fail(res, 409, 'task already has a result', { status: task.status, id: task.id });
   }
   if (!('result' in body)) return fail(res, 400, 'result is required');
+  // Without this, `{"result": null}` produces a task that is `done` carrying no
+  // answer — which the relayed guard then (correctly) refuses to close, leaving
+  // the message permanently unanswerable. Refuse it here, where it is fixable.
+  if (body.result === null) {
+    return fail(res, 400, 'result is null: a null answer is not an answer. Send the text the human should read.');
+  }
   // A result may be posted straight to a pending task; no claim required.
   appendEvent({ t: 'patch', id, patch: { status: 'done', result: body.result, resultTs: nowIso() } });
   send(res, 200, task);
@@ -1673,10 +1679,32 @@ function updateConversation(res, id, body) {
   send(res, 200, conv);
 }
 
+/*
+ * `relayed` means "this has been delivered to whoever it was for". A task with
+ * no result has not been answered, so there is nothing to deliver, and flagging
+ * it closes the human's question with silence — permanently, since the thread
+ * offers no way to notice a message that is marked done.
+ *
+ * On the night of 2026-08-07 this happened four times. The shape every time: an
+ * agent chained the result POST and the relayed POST in one command, the result
+ * POST failed (400, a malformed body), the relayed POST succeeded anyway, and
+ * the question was left `result: null, relayed: true`. Nobody would ever have
+ * been told. Client-side ordering discipline was the only thing standing in the
+ * way, and discipline is not a mechanism — so the server refuses instead.
+ */
 function relayTask(res, id) {
   const task = tasks.get(id);
   if (!task) return fail(res, 404, `no task with id "${id}"`);
   if (!task.relayed) {
+    // Only the false -> true transition is guarded; re-flagging an already
+    // relayed task stays idempotent, including for records written before this.
+    if (task.result === null || task.result === undefined) {
+      return fail(res, 409, 'cannot mark relayed: this task has no result, so there is nothing to deliver. POST /tasks/:id/result first, and check that it returned 200 before flagging.', {
+        id: task.id,
+        status: task.status,
+        relayed: task.relayed,
+      });
+    }
     appendEvent({ t: 'patch', id, patch: { relayed: true, relayedAt: nowIso() } });
   }
   send(res, 200, task); // idempotent: re-flagging keeps the original relayedAt

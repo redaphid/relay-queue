@@ -43,6 +43,8 @@ const OLD_LOG = [
   { t: 'create', task: { id: 'old-3', role: 'user', instruction: 'a third, never answered', from: 'voice', ts: '2026-01-01T00:04:00.000Z', status: 'pending', claimedBy: null, claimedAt: null, result: null, resultTs: null, relayed: false, relayedAt: null } },
 ];
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 let failures = 0;
 function check(name, cond, detail) {
   if (cond) { console.log(`  ok   ${name}`); return; }
@@ -76,11 +78,11 @@ function stop(proc) {
   return gone;
 }
 
-async function waitForBoot(proc) {
+async function waitForBoot(proc, base = BASE) {
   for (let i = 0; i < 100; i++) {
     if (proc.exitCode !== null) throw new Error(`server exited early with code ${proc.exitCode}`);
     try {
-      const r = await fetch(`${BASE}/health`);
+      const r = await fetch(`${base}/health`);
       if (r.ok) return;
     } catch { /* not listening yet */ }
     await new Promise((r) => setTimeout(r, 100));
@@ -216,6 +218,7 @@ async function main() {
   }
 
   await statusChecks();
+  await protocolChecks();
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
@@ -379,6 +382,92 @@ async function stuckChecks() {
     check('*** an idle agent with an empty queue is not "stuck" ***',
       cs2.agentState.state !== 'stuck' && cs2.agentState.state !== 'silent',
       JSON.stringify(cs2.agentState));
+  } finally {
+    await stop(proc);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
+  }
+}
+
+/*
+ * The protocol guarantees added after the 2026-08-07 retrospective, each one
+ * written against the failure that produced it rather than against the feature
+ * that fixes it. Own server, own scratch dir, so queue state is exactly known
+ * and nothing here can be explained away by leftovers from another phase.
+ */
+async function protocolChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-protocol-'));
+  const port = PORT + 3;
+  const base = `http://127.0.0.1:${port}`;
+  const proc = spawn(process.execPath, [SERVER], {
+    env: {
+      ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1',
+      WATCH_SOURCE: '0', CLAIM_LEASE_MS: '1200',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout.on('data', () => {});
+  proc.stderr.on('data', () => {});
+  const g = (p) => getAt(base, p);
+  const p_ = (path_, body) => postAt(base, path_, body);
+
+  try {
+    await waitForBoot(proc, base);
+
+    /*
+     * 4.4, verbatim. An agent chains result-then-relayed in one command; the
+     * result POST fails on a malformed body; the relayed POST must not then
+     * close the human's question with nothing in it.
+     */
+    console.log('\nrelayed — a question can never be closed with no answer in it');
+    const q = await p_('/tasks', { text: 'what time is the flight?', from: 'voice' });
+    check('the question is posted', q.status === 201, `HTTP ${q.status}`);
+    const bad = await p_(`/tasks/${q.body.id}/result`, { notTheField: 'malformed body' });
+    check('a malformed result is refused, as it was on the night', bad.status === 400, `HTTP ${bad.status}`);
+    const premature = await p_(`/tasks/${q.body.id}/relayed`, {});
+    check('*** relayed is REFUSED while result is null ***', premature.status === 409, `HTTP ${premature.status}`);
+    check('...and the refusal names the actual problem, not a missing field',
+      /no result/i.test(premature.body.error || ''), premature.body.error);
+    const still = await g(`/tasks/${q.body.id}`);
+    check('...so the question is still open, not silently closed',
+      still.relayed === false && still.result === null,
+      `relayed=${still.relayed} result=${JSON.stringify(still.result)}`);
+    check('...and it is still visible to an unread poll',
+      (await g('/tasks?unread=1')).tasks.some((t) => t.id === q.body.id));
+
+    const good = await p_(`/tasks/${q.body.id}/result`, { result: 'boards at 07:40' });
+    check('the real answer still lands', good.status === 200, `HTTP ${good.status}`);
+    const ok = await p_(`/tasks/${q.body.id}/relayed`, {});
+    check('...and NOW it can be marked relayed', ok.status === 200, `HTTP ${ok.status}`);
+    const again = await p_(`/tasks/${q.body.id}/relayed`, {});
+    check('re-flagging stays idempotent', again.status === 200 && again.body.relayed === true);
+    check('...and keeps the original relayedAt',
+      again.body.relayedAt === (await g(`/tasks/${q.body.id}`)).relayedAt);
+    const empty = await p_('/tasks', { text: 'answerable with very little' });
+    check('an empty-string answer still counts as an answer',
+      (await p_(`/tasks/${empty.body.id}/result`, { result: '' })).status === 200
+      && (await p_(`/tasks/${empty.body.id}/relayed`, {})).status === 200);
+    const nulled = await p_('/tasks', { text: 'and this one gets a null' });
+    check('...but a literal null result is refused at the point it is fixable',
+      (await p_(`/tasks/${nulled.body.id}/result`, { result: null })).status === 400,
+      'otherwise it lands `done` with nothing in it and can never be closed');
+    check('...leaving that question open rather than done-and-empty',
+      (await g(`/tasks/${nulled.body.id}`)).status === 'pending');
+
+    console.log('\nit all survives a restart, because it is only ever the event log');
+    await stop(proc);
+    const proc2 = spawn(process.execPath, [SERVER], {
+      env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    proc2.stdout.on('data', () => {});
+    proc2.stderr.on('data', () => {});
+    try {
+      await waitForBoot(proc2, base);
+      check('the relayed guard still holds after a replay',
+        (await p_(`/tasks/${(await p_('/tasks', { text: 'fresh' })).body.id}/relayed`, {})).status === 409);
+    } finally {
+      await stop(proc2);
+    }
   } finally {
     await stop(proc);
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
