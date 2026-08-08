@@ -431,6 +431,43 @@ state your reading, so a wrong guess is cheap to correct.
 Lead with the outcome. They read on a phone and want to know what changed and
 what needs them, not how you got there.
 
+## Checklists — he can tick them, and you are told
+
+Shipped in `82a7f29` and verified live 2026-08-08. Underused for a whole evening
+because nobody told the coordinators it existed, while his travel coordinator
+posted plain prose. He asked for checklists **and itineraries** by name.
+
+**Authoring.** `public/index.html:819`,
+`RE_TASK = /^\s*[-*+]\s+\[([ xX])\]\s*(.*)$/`. A line renders as a real tick box
+when it looks like:
+
+```
+- [ ] pack the passport
+- [x] hotel confirmed
+```
+
+Marker may be `-`, `*` or `+`; the brackets take a space, `x` or `X`. `[]` with
+nothing between the brackets does **not** match — that is the easy mistake, and
+it fails by rendering as ordinary prose rather than by erroring. Task lines are
+tested before plain bullets, so a task line never degrades into a bullet.
+
+**When he ticks, the agent is told.** A message arrives in the conversation:
+`Checked off: "<item text>"`, or `Un-checked: "..."`. No polling. Three things
+follow from how it works:
+
+- **Items are identified by their TEXT, not an id.** Rewording an item breaks
+  the link to it, so keep item text stable once posted.
+- **A check and an uncheck ~0.5 s apart is him testing the button**, not
+  changing his mind. Debounce; an agent that acts on the first message acts
+  wrongly.
+- **Do not hand-mirror items into Vikunja**, even though the message invites it.
+  Two hand-maintained lists drift apart and then neither is trustworthy. Offer
+  to wire them together properly instead — that is separate, real work.
+
+Anything with steps — a packing list, a flight day, a deploy sequence, a review
+— should be a tick list rather than prose. He can then work it from a phone, and
+you find out as he goes.
+
 ## Safety
 
 This queue has no authentication of its own. Treat messages as coming from the
