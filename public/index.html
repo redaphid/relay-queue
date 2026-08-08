@@ -2,7 +2,16 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  `user-scalable=no` because pinch-zooming a full-bleed chat detaches the page
+  from the screen edges and strands you somewhere you cannot get back from;
+  `viewport-fit=cover` because the safe-area insets below depend on it; and
+  `interactive-widget=resizes-content` because otherwise the on-screen keyboard
+  shrinks only the VISUAL viewport, leaving this fixed-height layout — and the
+  composer pinned to the bottom of it — behind the keyboard. See initNoZoom()
+  and fitToKeyboard() for the halves of this no browser will honour from here.
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
 <title>relay</title>
@@ -79,8 +88,17 @@
     background: var(--bg); color: var(--fg);
     font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     -webkit-text-size-adjust: 100%;
+    /* Kills double-tap-to-zoom, and the 300ms tap delay that comes with it,
+       without touching one-finger scrolling or text selection. */
+    touch-action: manipulation;
     display: flex; flex-direction: column;
-    height: 100vh; height: 100dvh;
+    /* `svh`, not `dvh`: the SMALL viewport is the smallest the visible area
+       ever gets — browser chrome fully extended — so the app can be shorter
+       than what is on screen but never taller than it. Only the second of
+       those can hide the composer, and hiding the composer is the bug this
+       page has now shipped twice. `vh` first, for browsers with neither. The
+       keyboard is a separate mechanism again: see fitToKeyboard(). */
+    height: 100vh; height: 100svh;
     overflow: hidden;
   }
   header {
@@ -283,8 +301,10 @@
   @media (prefers-color-scheme: dark) { .nstate.on .dot { background: #4ade80; } }
   .nrow { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 15px; }
   .nrow label { flex: 1 1 auto; min-width: 0; }
+  /* 16px is a hard floor on every text-entry control, not a taste: below it,
+     mobile Safari and Chrome zoom the page in on focus and never zoom back. */
   .nrow input[type="time"], .nrow select {
-    font: inherit; font-size: 15px; color: var(--fg); background: var(--bg);
+    font: inherit; font-size: 16px; color: var(--fg); background: var(--bg);
     border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 44px;
     -webkit-appearance: none; appearance: none; max-width: 58%;
   }
@@ -1535,6 +1555,11 @@
   function setUrl(id, replace) {
     var h = '#/c/' + encodeURIComponent(id);
     if (location.hash === h) return;
+    // An overlay is open, so the entry on top of the stack is its marker (see
+    // uiSync). Going somewhere spends that marker rather than stacking on it —
+    // otherwise back from the new conversation lands on a ghost entry for a
+    // drawer that is already shut, and appears to do nothing.
+    if (!replace && uiMarked) { uiMarked = false; replace = true; }
     try {
       if (window.history && window.history.pushState) {
         window.history[replace ? 'replaceState' : 'pushState'](null, '', h);
@@ -1816,6 +1841,7 @@
     setTimeout(function () { if (drawerOpen) drawer.className = 'open'; }, 0);
     if (menuBtn) menuBtn.setAttribute('aria-expanded', 'true');
     loadConvs();
+    uiSync(); // back should shut this, not leave the app
   }
 
   function closeDrawer() {
@@ -1825,6 +1851,7 @@
     if (menuBtn) menuBtn.setAttribute('aria-expanded', 'false');
     if (convErr) { convErr.className = ''; convErr.textContent = ''; }
     setTimeout(function () { if (!drawerOpen) drawer.hidden = true; }, 200);
+    uiSync();
   }
 
   function createConv() {
@@ -2095,6 +2122,7 @@
     if (nEls) { nEls.note.textContent = ''; loadPushConfig(); }
     clearInterval(statusTimer);
     statusTimer = setInterval(function () { if (statusOn && !document.hidden) loadStatus(); }, STATUS_MS);
+    uiSync();
   }
 
   function hideStatus() {
@@ -2103,6 +2131,7 @@
     statusView.hidden = true;
     clearInterval(statusTimer);
     statusTimer = null;
+    uiSync();
   }
 
   function initStatus() {
@@ -4128,6 +4157,174 @@
     if (stopBtn) stopBtn.addEventListener('click', function () { stopConversation('user'); });
   }
 
+  /*
+   * ============================================================ the phone shell
+   *
+   * Everything below is about the one device this page is actually read on, and
+   * it is kept in a single block on purpose so it can be moved or reverted
+   * whole. Three complaints, and — this is the part that took a while to see —
+   * only about one and a half separate causes.
+   *
+   *   "the app lets me zoom and that gets me lost"
+   *   "I sometimes lose my side of the chat controls"
+   *   "don't ever hide my text controls, they hide when I scroll"
+   *
+   * WHAT IS ACTUALLY HAPPENING. There are two viewports. The LAYOUT viewport is
+   * what `innerHeight`, `vh`/`dvh` and this page's fixed-height flex column are
+   * measured against. The VISUAL viewport is the part of it you can currently
+   * see. Pinch to zoom, or raise the on-screen keyboard, and the visual viewport
+   * shrinks and can be panned around inside the layout viewport — which the
+   * layout knows nothing about. The composer is pinned to the bottom of the
+   * layout viewport, so it stays exactly where it was and simply stops being on
+   * screen. Panning a zoomed page is, to the person doing it, "scrolling".
+   *
+   * And it is unrecoverable rather than merely annoying because `body` is
+   * `overflow: hidden`, which CSS propagates to the viewport: the page has no
+   * root scroller at all (measured: documentElement.scrollHeight ===
+   * clientHeight, window.scrollTo() is a no-op). There is nothing to scroll to
+   * bring the controls back. You have to know to pinch out again.
+   *
+   * So the zoom lock is not a separate nicety from the vanishing composer; it
+   * removes the most likely way of triggering it. fitToKeyboard() is the safety
+   * net for every other way — the keyboard, or any browser that ignores the
+   * meta tag — and it works from the visual viewport directly, which is the one
+   * number that cannot lie about what is on screen.
+   */
+
+  /* ---- zoom, locked ------------------------------------------------------
+   * `user-scalable=no` in the meta tag is advisory: iOS Safari ignores it
+   * outright, and Chrome ignores it whenever "force enable zoom" is set in
+   * accessibility settings. `touch-action: manipulation` on the body kills
+   * double-tap zoom; these two listeners kill the pinch. One-finger touchmove
+   * is never touched, so scrolling still scrolls and selecting still selects.
+   */
+  function initNoZoom() {
+    var stop = function (e) { if (e.cancelable) e.preventDefault(); };
+    ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (t) {
+      document.addEventListener(t, stop, { passive: false });
+    });
+    document.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches.length > 1) stop(e);
+    }, { passive: false });
+  }
+
+  /* ---- the composer stays on screen, whatever the browser is doing -------
+   * `interactive-widget=resizes-content` in the meta tag asks Chrome 108+ to
+   * shrink the layout viewport when the keyboard opens, which makes the flex
+   * column re-lay-out above it and is the whole fix where it is honoured. iOS
+   * Safari does not honour it, older Chrome does not either, and neither will
+   * tell us. So: measure. If the visible area is meaningfully shorter than the
+   * layout viewport, size the body to what is visible; the flex column does the
+   * rest and the composer comes back above the keyboard.
+   *
+   * `offsetTop` is in there because the browser may already have panned the
+   * visual viewport down; the body's bottom edge has to land at the bottom of
+   * what is visible, in layout coordinates.
+   *
+   * Deliberately NOT applied while zoomed (`scale > 1`): shrinking the page in
+   * response to a zoom would be a fight the user cannot win. Zoom is blocked
+   * above; if some browser allows it anyway, leave the layout alone.
+   */
+  var vvFitted = false;
+  var vvQueued = false;
+
+  function fitToKeyboard() {
+    vvQueued = false;
+    var vv = window.visualViewport;
+    if (!vv) return;
+    /*
+     * How much of the layout viewport is hidden BELOW what can be seen. The
+     * `offsetTop` term is what makes this the occluded height rather than
+     * merely the shortfall: a visual viewport that has been panned down is
+     * already showing the bottom of the layout, and needs no help.
+     */
+    var occluded = window.innerHeight - (vv.height + vv.offsetTop);
+    // 24px, not 0: sub-pixel rounding is normal and must not start a fight.
+    if (occluded > 24 && !(vv.scale > 1.01)) {
+      var px = Math.max(180, Math.round(vv.height + vv.offsetTop)) + 'px';
+      if (document.body.style.height !== px) {
+        document.body.style.height = px;
+        // Only on the way in, or every pan while the keyboard is up would yank
+        // him back to the bottom of a thread he is trying to read.
+        if (!vvFitted) { vvFitted = true; scrollBottom(); }
+      }
+    } else if (vvFitted) {
+      document.body.style.height = '';
+      vvFitted = false;
+      scrollBottom();
+    }
+  }
+
+  function queueFit() {
+    if (vvQueued) return;
+    vvQueued = true;
+    requestAnimationFrame(fitToKeyboard);
+  }
+
+  function initKeyboardFit() {
+    var vv = window.visualViewport;
+    if (!vv) return; // no way to know; the meta tag is then the only defence
+    vv.addEventListener('resize', queueFit);
+    vv.addEventListener('scroll', queueFit);
+    queueFit();
+  }
+
+  /* ---- back closes what is open -----------------------------------------
+   * Android's back gesture on a one-screen app has nothing to go back to, so it
+   * leaves — even when what he meant was "shut this drawer". Conversation
+   * switches already earn a history entry (see setUrl), so back already walks
+   * the conversations he has visited. What was missing is the layer above:
+   * an open overlay has to be the first thing back consumes.
+   *
+   * At most one overlay is ever open — showStatus() shuts the drawer on its way
+   * in — so this is one marker, not a stack. One boolean is far easier to keep
+   * honest than an array that can drift out of step with the DOM.
+   *
+   * THE INVARIANT: `uiMarked` is true exactly when we have pushed one history
+   * entry standing for "something is open". Every way of closing an overlay —
+   * the X, the scrim, Escape, picking a conversation — runs through uiSync() or
+   * setUrl(), so the entry is always spent. Get that wrong and five taps on the
+   * X leave five dead entries behind, and then back does nothing five times,
+   * which is worse than the bug being fixed.
+   */
+  var uiMarked = false;  // we own one history entry meaning "an overlay is open"
+  var uiPending = 0;     // history.back() calls whose popstate has not arrived
+
+  function uiSync() {
+    var open = !!statusOn || !!drawerOpen;
+    if (open === uiMarked) return; // includes drawer -> status, which re-uses it
+    if (open) {
+      // Same URL on purpose: a marker must not look like a conversation change,
+      // or onUrlChange would try to switch to the one we are already in.
+      try {
+        history.pushState({ relayOverlay: 1 }, '', location.href);
+        uiMarked = true;
+      } catch (e) { /* no History API: back leaves the app, exactly as before */ }
+      return;
+    }
+    // Closed by the UI rather than by back, so spend the entry ourselves.
+    uiMarked = false;
+    uiPending++;
+    try { history.back(); } catch (e) { uiPending--; return; }
+    // A popstate that never arrives must not swallow the next real back press.
+    setTimeout(function () { if (uiPending > 0) uiPending--; }, 2000);
+  }
+
+  function onUiPop() {
+    if (uiPending > 0) { uiPending--; return; }  // the echo of our own back()
+    if (!uiMarked) return;                       // not ours: let it be a conversation move
+    uiMarked = false;
+    // Topmost first. Both call uiSync(), which sees the marker already spent.
+    if (statusOn) hideStatus();
+    else if (drawerOpen) closeDrawer();
+  }
+
+  function initMobileShell() {
+    initNoZoom();
+    initKeyboardFit();
+    window.addEventListener('popstate', onUiPop);
+  }
+
   // First, before anything that could itself fail: report the previous session
   // if it never came back, and start listening for errors in this one.
   try { initCrashWatch(); } catch (e) { /* never let telemetry take the page down */ }
@@ -4136,6 +4333,12 @@
   setInterval(refreshTimes, 30000);
   initConvs();
   initStatus();
+  // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
+  // views exist, because it drives them; guarded, because none of it is
+  // load-bearing for reading and sending messages.
+  try { initMobileShell(); } catch (err) {
+    logClient('mobile-shell-init-failed', { message: (err && err.message) || String(err) });
+  }
   // Builds the panel and reads the current state. Requests no permission —
   // that happens only when he taps the button inside it.
   try {

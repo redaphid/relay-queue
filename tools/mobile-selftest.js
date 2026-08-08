@@ -607,6 +607,293 @@ function REACHABLE(sel) {
       (await page.evaluate(() => document.getElementById('statusview').hidden)) === true);
   }
 
+  /*
+   * ==================================================================
+   * The phone shell: zoom, the keyboard, and the back gesture.
+   *
+   * These belong in THIS suite and not in ui-selftest.js for the reason
+   * in the header: every one of them is a geometry or a browser
+   * question, and a stub DOM answers all of them "fine".
+   * ==================================================================
+   */
+
+  console.log('\nthe page cannot be zoomed into a corner');
+  {
+    const meta = await page.evaluate(() => {
+      const m = document.querySelector('meta[name=viewport]');
+      return m ? m.content : '';
+    });
+    check('the viewport forbids user scaling', /user-scalable\s*=\s*no/.test(meta), meta);
+    check('...and pins the scale', /maximum-scale\s*=\s*1\b/.test(meta), meta);
+    check('...and still opts into the safe-area insets', /viewport-fit\s*=\s*cover/.test(meta), meta);
+    check('...and asks the keyboard to resize the layout, not just the view',
+      /interactive-widget\s*=\s*resizes-content/.test(meta), meta);
+
+    const ta = await page.evaluate(() => getComputedStyle(document.body).touchAction);
+    check('double-tap zoom is off at the body', /manipulation|none/.test(ta), ta);
+
+    /*
+     * The one that actually bites, and that no meta tag can prevent: mobile
+     * Safari and Chrome zoom the whole page in when you focus a text field
+     * smaller than 16px, and they never zoom back out. Every text-entry
+     * control counts, including the ones in the Status panel while it is shut.
+     */
+    const small = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, textarea, select').forEach((el) => {
+        if (el.type === 'checkbox' || el.type === 'radio') return; // no text to read, never zooms
+        const px = parseFloat(getComputedStyle(el).fontSize);
+        if (!(px >= 16)) out.push((el.id || el.name || el.type || el.tagName) + ' = ' + px + 'px');
+      });
+      return out;
+    });
+    check('*** no text field is small enough to trigger focus zoom ***',
+      small.length === 0, small.join(', '));
+
+    // Pinch is a two-finger touchmove; one finger must still scroll and select.
+    const gestures = await page.evaluate(() => {
+      const mk = (n) => {
+        const t = [];
+        for (let i = 0; i < n; i++) {
+          t.push(new Touch({ identifier: i, target: document.body, clientX: 40 * (i + 1), clientY: 300 }));
+        }
+        return t;
+      };
+      const fire = (n) => {
+        const e = new TouchEvent('touchmove', {
+          bubbles: true, cancelable: true, touches: mk(n), targetTouches: mk(n), changedTouches: mk(n),
+        });
+        document.body.dispatchEvent(e);
+        return e.defaultPrevented;
+      };
+      return { two: fire(2), one: fire(1) };
+    }).catch(() => null);
+    if (gestures) {
+      check('a two-finger pinch is refused', gestures.two === true, JSON.stringify(gestures));
+      check('...but one finger still scrolls', gestures.one === false, JSON.stringify(gestures));
+    }
+  }
+
+  console.log('\nthe composer survives the on-screen keyboard');
+  {
+    /*
+     * `innerHeight` LIES here, which is how this shipped broken twice. When the
+     * keyboard — or a pinch-zoom pan — shrinks the VISUAL viewport, the layout
+     * viewport is unchanged, so a composer pinned to the bottom of the layout
+     * reports itself as "on screen" by innerHeight and is behind the keyboard
+     * all the same. Every assertion below is against visualViewport.
+     */
+    const seen = () => {
+      const c = document.getElementById('composer').getBoundingClientRect();
+      const vv = window.visualViewport;
+      const top = vv ? vv.offsetTop : 0;
+      const bot = vv ? vv.offsetTop + vv.height : window.innerHeight;
+      return {
+        composer: [Math.round(c.top), Math.round(c.bottom)],
+        visible: [Math.round(top), Math.round(bot)],
+        inView: c.bottom <= bot + 0.5 && c.top >= top - 0.5,
+        bodyH: document.body.style.height || '(from css)',
+      };
+    };
+
+    let g = await page.evaluate(seen);
+    check('with the thread full of messages, the composer is in the visible viewport',
+      g.inView, JSON.stringify(g));
+
+    // Scroll the message list right up: the composer must not move at all.
+    await page.evaluate(() => { document.getElementById('thread').scrollTop = 0; });
+    await page.waitForTimeout(250);
+    const scrolled = await page.evaluate(seen);
+    check('...and scrolling the thread does not move it',
+      scrolled.inView && scrolled.composer[1] === g.composer[1], JSON.stringify(scrolled));
+    await page.evaluate(() => { const t = document.getElementById('thread'); t.scrollTop = t.scrollHeight; });
+
+    /*
+     * Raise a keyboard. Firefox has no on-screen keyboard, so the visual
+     * viewport is stubbed — which is faithful, because a real Android keyboard
+     * under Chrome's default `interactive-widget=resizes-visual` does exactly
+     * this: shrink visualViewport.height and leave innerHeight alone.
+     */
+    const KEY = 320;
+    const raise = (h) => page.evaluate((hh) => {
+      const vv = window.visualViewport;
+      Object.defineProperty(vv, 'height', { configurable: true, get: () => hh });
+      Object.defineProperty(vv, 'offsetTop', { configurable: true, get: () => 0 });
+      vv.dispatchEvent(new Event('resize'));
+    }, h);
+
+    await raise(VIEWPORT.height - KEY);
+    await page.waitForTimeout(300);
+    g = await page.evaluate(seen);
+    check('*** the keyboard does not take the composer with it ***', g.inView, JSON.stringify(g));
+
+    // The worst case he actually hits: a long dictated draft AND the keyboard.
+    await page.fill('#input', Array(80).fill('a long line of dictated text that keeps going').join(' '));
+    await page.waitForTimeout(300);
+    g = await page.evaluate(seen);
+    const sendSeen = await page.evaluate(() => {
+      const s = document.getElementById('send').getBoundingClientRect();
+      const vv = window.visualViewport;
+      return {
+        s: [Math.round(s.top), Math.round(s.bottom)],
+        bot: Math.round(vv.offsetTop + vv.height),
+        ok: s.bottom <= vv.offsetTop + vv.height + 0.5 && s.top >= vv.offsetTop - 0.5,
+      };
+    });
+    check('a long dictated draft plus the keyboard still leaves the composer up',
+      g.inView, JSON.stringify(g));
+    check('...and Send with it', sendSeen.ok, JSON.stringify(sendSeen));
+    const threadLeft = await page.evaluate(() =>
+      Math.round(document.getElementById('thread').getBoundingClientRect().height));
+    check('...without collapsing the thread to nothing', threadLeft > 0, String(threadLeft));
+
+    // Put the keyboard away: the layout must go back exactly as it was.
+    await page.fill('#input', '');
+    await raise(VIEWPORT.height);
+    await page.waitForTimeout(300);
+    g = await page.evaluate(seen);
+    check('dismissing the keyboard restores the full-height layout',
+      g.inView && g.bodyH === '(from css)' && g.composer[1] === VIEWPORT.height,
+      JSON.stringify(g));
+
+    /*
+     * The other half of the same problem, and the one the meta tag is for:
+     * `interactive-widget=resizes-content` makes the keyboard shrink the
+     * LAYOUT viewport instead, which a real viewport resize models exactly.
+     * With the cursor in the box, which is the only time a keyboard is up.
+     */
+    await page.click('#input');
+    for (const h of [400, 340]) {
+      await page.setViewportSize({ width: VIEWPORT.width, height: h });
+      await page.waitForTimeout(400);
+      const shrunk = await page.evaluate(seen);
+      const reach = await page.evaluate(REACHABLE, '#input');
+      const reachSend = await page.evaluate(REACHABLE, '#send');
+      check(`with the layout shrunk to ${h}px the composer is still up`,
+        shrunk.inView && shrunk.composer[1] <= h + 0.5, JSON.stringify(shrunk));
+      check(`...and the box and Send are still tappable at ${h}px`,
+        reach.ok && reachSend.ok, [reach.why, reachSend.why].filter(Boolean).join(' | '));
+    }
+    await page.setViewportSize(VIEWPORT);
+    await page.waitForTimeout(400);
+  }
+
+  console.log('\nthe controls are reachable at more than one phone size');
+  {
+    // 390x844 is covered above. A break at any other width used to pass in
+    // silence, because this suite only ever drove the one viewport.
+    for (const size of [{ width: 360, height: 740 }, { width: 414, height: 896 }, { width: 768, height: 1024 }]) {
+      await page.setViewportSize(size);
+      await page.waitForTimeout(400);
+      const bad = [];
+      for (const sel of ['#menu', '#input', '#send', '#mic', '#convo']) {
+        const r = await page.evaluate(REACHABLE, sel);
+        if (!r.ok) bad.push(sel + ': ' + r.why);
+      }
+      check(`everything is reachable at ${size.width}x${size.height}`, bad.length === 0, bad.join(' | '));
+    }
+    await page.setViewportSize(VIEWPORT);
+    await page.waitForTimeout(400);
+  }
+
+  console.log('\nback closes what is open instead of leaving the app');
+  {
+    /*
+     * `history.length` alone cannot prove a push happened — a push on top of a
+     * stack that has forward entries truncates them, so the length stays put.
+     * The marker state is the direct evidence, and the length is still the
+     * right way to prove entries are NOT piling up across repeated opens.
+     */
+    const ui = () => ({
+      len: history.length,
+      hash: location.hash,
+      marker: !!(history.state && history.state.relayOverlay),
+      drawer: !document.getElementById('drawer').hidden,
+      status: !document.getElementById('statusview').hidden,
+    });
+    const alive = () => page.evaluate(() => !!document.getElementById('composer')).catch(() => false);
+    const uiOf = () => page.evaluate(ui).catch(() => ({ len: -1, hash: 'page gone', drawer: false, status: false }));
+
+    // Land somewhere known first: earlier sections leave history where they like.
+    await page.evaluate(() => { location.hash = '#/c/main'; });
+    await page.waitForTimeout(1000);
+
+    const before = await uiOf();
+    await page.click('#menu');
+    await page.waitForTimeout(500);
+    const opened = await uiOf();
+    check('opening the drawer earns a history entry',
+      opened.drawer === true && opened.marker === true && before.marker === false,
+      JSON.stringify({ before, opened }));
+    check('...without pretending to be a conversation change',
+      opened.hash === before.hash, JSON.stringify(opened));
+
+    await page.goBack();
+    await page.waitForTimeout(700);
+    const popped = await uiOf();
+    check('*** back closes the drawer rather than unloading the page ***',
+      (await alive()) && popped.drawer === false, JSON.stringify(popped));
+    check('...and the marker goes with it', popped.marker === false, JSON.stringify(popped));
+
+    /*
+     * The failure that makes this feature worse than not having it: close the
+     * drawer with the X five times and, if the pushed entries are not spent as
+     * they go, five back presses then do nothing at all.
+     */
+    const base0 = (await uiOf()).len;
+    for (let i = 0; i < 5; i++) {
+      await page.click('#menu');
+      await page.waitForTimeout(300);
+      await page.click('#drawerclose');
+      await page.waitForTimeout(450);
+    }
+    const after5 = await uiOf();
+    check('*** closing it by hand spends the entry, five times over ***',
+      after5.len === base0 && after5.drawer === false, JSON.stringify({ base0, after5 }));
+
+    // The scrim is the other way out, and must behave identically.
+    await page.click('#menu');
+    await page.waitForTimeout(300);
+    await page.evaluate(() => document.getElementById('scrim').click());
+    await page.waitForTimeout(550);
+    const scrimmed = await uiOf();
+    check('tapping the scrim spends it too', scrimmed.len === base0, JSON.stringify(scrimmed));
+
+    // Drawer -> Status is one overlay replacing another, so it stays one entry.
+    await page.click('#menu');
+    await page.waitForTimeout(350);
+    const drawerLen = (await uiOf()).len;
+    await page.click('#statusopen');
+    await page.waitForTimeout(800);
+    const st = await uiOf();
+    check("Status opened from the drawer re-uses the drawer's entry",
+      st.status === true && st.drawer === false && st.marker === true && st.len === drawerLen,
+      JSON.stringify({ drawerLen, st }));
+    await page.goBack();
+    await page.waitForTimeout(800);
+    const unstatused = await uiOf();
+    check('*** back leaves the stats page instead of the app ***',
+      (await alive()) && unstatused.status === false, JSON.stringify(unstatused));
+
+    /*
+     * And with nothing open, back is still what it always was: the previous
+     * conversation. Switching from inside the drawer must not leave a ghost
+     * entry behind, or that takes two presses instead of one.
+     */
+    await page.click('#menu');
+    await page.waitForTimeout(600);
+    await page.click('#convlist .conv:nth-child(2)');
+    await page.waitForTimeout(1600);
+    check('picking a conversation from the drawer moves the address bar',
+      /#\/c\/iceland$/.test(page.url()), page.url());
+    await page.goBack({ waitUntil: 'commit' });
+    await page.waitForTimeout(1600);
+    const title = await page.evaluate(() => document.getElementById('title').textContent);
+    const ghost = await uiOf();
+    check('*** one back press returns to the previous conversation, not a ghost drawer ***',
+      title === 'Main' && ghost.drawer === false, title + ' at ' + page.url());
+  }
+
   console.log('\na tab that dies is reported by the next one');
   clientLogs.length = 0;
   await page.evaluate(() => { setTimeout(() => { throw new Error('deliberate selftest error'); }, 0); });
