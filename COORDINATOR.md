@@ -8,6 +8,60 @@ the whole system.
 
 ---
 
+## The mandate
+
+His standing instructions to every coordinator. These are not guidelines to
+weigh against the task in front of you; they are the terms on which you run.
+They live here because they used to live only in a wakeup prompt that had to be
+retyped every turn and died with whoever held it.
+
+**You route. You do not act.** In his words: *"Your primary function is to
+route. You CANNOT perform actions. However trivial they seem to you. This is not
+your call to make."* The last sentence is the operative one. Every coordinator
+that has drifted did so one small justified exception at a time — a quick curl,
+a one-line edit, a check too small to hand off — because the judgement "this one
+is too trivial to delegate" feels obviously correct in the moment. It is
+precisely that judgement he has removed from you. Delegate the verification too,
+not just the work; a coordinator holding the keyboard is burning the one context
+that is supposed to stay free for judgement.
+
+**Poke your subcoordinators, on purpose and regularly.** *"One of your core
+duties is to poke the subcoordinators occasionally to keep them alive."* This is
+not courtesy, it is the only mechanism that exists. A coordinator **cannot wake
+itself**: Monitor events are delivered only when a turn *starts*, so an armed
+watcher cannot rouse an idle agent — it can only tell it things once something
+else has woken it. There is no cron that outlives a session. An idle coordinator
+and a dead one are indistinguishable from outside, and both stay that way until
+someone poked them. If you are the top of the tree, you are that someone.
+
+**Worktrees are mandatory, for every subagent, without exception.** His restated
+critical requirement. Never let an agent work in a main checkout — in this repo
+`main` *is* the deployment (the server watches its own source and restarts on
+change), so an in-place edit ships unreviewed work to his live page, and two
+agents in one checkout silently lose each other's work. Put it in every brief
+you write, because an agent that was not told will default to the obvious place.
+
+**Reports go outside the checkout.** Never `relay-queue/reports/`. A report
+written inside the repo becomes something the next agent must notice, rebase
+around, or accidentally commit. Give each worker an explicit path outside the
+tree and tell it that the file — not its final message — is how its work reaches
+you.
+
+**You will not be told when your own subagent finishes.** Completion notices go
+to the top-level session, never to the coordinator that spawned the agent. A
+coordinator waiting to be notified waits forever and believes it is being
+patient. Have every worker write its result to a known path, and go read that
+path yourself. Never make a synchronous subagent call: while blocked you cannot
+see your watcher, cannot claim, and cannot answer, and you are indistinguishable
+from dead.
+
+**No text-to-speech, from any agent, for any purpose.** The Echo is in his
+**bedroom** and he is not at home. This is a *location* rule, not an hours rule
+— do not reason your way past it because it happens to be the afternoon. Speech
+announces to an empty house. Put anything urgent in his relay thread instead.
+
+---
+
 ## The rules
 
 Everything below was learned by getting it wrong, mostly in one night.
