@@ -124,7 +124,15 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:relay@hypnodroid.com'
 const KEYS_FILE = path.join(DATA_DIR, 'push-keys.json');
 const MAX_SUBS = 20;
 const MAX_PUSH_BODY = 140; // chars of preview; the rest is on the page
-const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 20);
+/*
+ * The hourly ceiling — the last line of defence, not the first. It was 20,
+ * which is far too generous for his bar: the 16 "done" pushes of 2026-08-08
+ * fit inside it comfortably and `suppressedBudget` stayed 0, so the ceiling
+ * never fired once during the incident it should have caught. 6 an hour is
+ * about the most a human wants from a channel he cannot walk away from. The
+ * env override is intact for an operator who disagrees.
+ */
+const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 6);
 
 const CATEGORIES = ['needs-you', 'done', 'broken'];
 const NOTIFY_VALUES = new Set([...CATEGORIES, 'none']);
@@ -2161,12 +2169,50 @@ function pushConfigRoute(res, body) {
  * Categorisation. Pure and exported, because this is the rule that must never
  * regress: agent-to-agent traffic on `channel` carries visibility:'internal'
  * and must not reach his phone under any category, any hint, or any config.
+ *
+ * WHY PUSHING IS OPT-IN
+ * --------------------
+ * This function used to end `if (kind === 'result' || kind === 'message')
+ * return 'done'`, so every agent result and every agent message posted into one
+ * of his conversations buzzed his phone by default. On 2026-08-08 that
+ * delivered 17 pushes in one hour — 16 of them saying nothing more than "done"
+ * — while he was abroad. Nothing was suppressed (suppressedBudget was 0); the
+ * ceiling never even came near being hit. He had reined in the room speaker for
+ * exactly this a day earlier, and the phone is a channel he cannot walk away
+ * from. The lesson is that a default of "notify" turns ordinary agent chatter
+ * into a pager, and agents chatter constantly.
+ *
+ * His bar, made mechanical here rather than left to agent politeness. He wants
+ * to hear about: (1) things that need him, (2) things he was waiting on that
+ * finished, (3) things that are broken. NOT progress, NOT status, NOT
+ * acknowledgements. So:
+ *
+ *   message  -> null. Agent chatter never buzzes him. An agent that genuinely
+ *               needs to reach him says so, by passing notify:"done" |
+ *               "needs-you" | "broken". Saying nothing wakes nobody.
+ *   result   -> 'done' ONLY when it answers a task HE HIMSELF posted, i.e.
+ *               role:'user' AND `from` is one of his page origins. That is
+ *               precisely "something he was waiting on that finished", so it
+ *               stays. A result on an agent-posted task is one agent answering
+ *               another and is silent — that is the bulk of the 16.
+ *   task     -> unchanged: an agent asking him something is "needs you"; a task
+ *               he typed himself never buzzes the phone that sent it.
+ *
+ * An explicit `notify` hint still wins over all of it (that is the opt-in), and
+ * notify:"none" still silences everything, including rule zero's own categories.
+ * If you are about to widen a default here: don't. Add a hint at the caller.
  */
 function classify(kind, task, hint) {
   if (!task || isInternal(task)) return null; // rule zero, before anything else
   if (hint === 'none') return null;
   if (hint && NOTIFY_VALUES.has(hint)) return hint;
-  if (kind === 'result' || kind === 'message') return 'done';
+  // Opt-in: an agent speaking without asking to be heard is not an event.
+  if (kind === 'message') return null;
+  if (kind === 'result') {
+    // Only an answer to something he posted from the page counts as "the thing
+    // I was waiting on finished". Anything else is agent-to-agent bookkeeping.
+    return task.role === 'user' && PAGE_ORIGINS.has(task.from) ? 'done' : null;
+  }
   if (kind === 'task') {
     // He typed it himself. Never buzz the phone that just sent the message.
     if (PAGE_ORIGINS.has(task.from)) return null;
@@ -2331,6 +2377,13 @@ async function sendToAll(payload, category) {
 
 /*
  * POST /push/test — let him prove it works with his thumb, before he needs it.
+ *
+ * SELF-TEST ONLY. Nothing routine may call this. It bypasses BOTH the debounce
+ * and quiet hours by design, it ignores the hourly budget, and it cannot carry
+ * custom text — so it is not a notification channel, it is a wiring check, and
+ * an agent reaching for it to "just let him know" would buzz his handset at
+ * 3am with the word "Test". Use POST /messages with an explicit `notify` hint
+ * instead; that path respects the debounce, the budget and quiet hours.
  *
  * A deliberate action, so it skips the debounce and is not silenced by quiet
  * hours; it says which it did. It reports per-device HTTP status rather than a
