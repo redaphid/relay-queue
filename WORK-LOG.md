@@ -140,6 +140,20 @@ work. Prune this section when you finish something, not later.)*
 
 ## Reusable capabilities worth knowing
 
+- **Web push works, confirmed on his handset (2026-08-08).** Not merely accepted
+  by the push service — he saw the notification. This is the first channel that
+  reaches him with no page open, no session, and no speaker in the room, which
+  makes it the right tool for anything remote or overnight. `POST /push/test`
+  sends one; `GET /push/config` shows registered devices, per-category toggles
+  and the quiet-hours state. **Subscriptions are per browser** (Firefox uses
+  Mozilla autopush, Chrome uses FCM), so "enabled" in one says nothing about the
+  other, and the panel reports only the browser you are looking at. A `201` from
+  the push service means *accepted*, **not displayed** — the last hop is
+  invisible from here, so never report a push as delivered on a 201 alone.
+  **Spend it as carefully as the speaker**: completions he was waiting on,
+  blockers, failures. Never progress or status; `channel` traffic is excluded by
+  design.
+
 - **Anything can speak aloud, with no MCP and no Claude session.**
   `POST http://127.0.0.1:12020/speak` `{"text":"..."}` — plain unauthenticated
   HTTP on loopback, renders through wyoming-piper, plays on the **Echo Studio**
