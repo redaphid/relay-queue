@@ -364,6 +364,26 @@ LAN can post to. **Before writing a feature, grep `main` for it, read the commit
 that added it, and assume any odd-looking implementation is load-bearing until
 the commit message says otherwise.**
 
+**`EADDRINUSE` is not a regression, and a harness abort is not a pass.** This
+class fooled three different agents on 2026-08-08 and will fool the next one,
+because it fails in the shape of a real bug. The selftests bind hardcoded ports
+— `mobile-selftest` 3995, `replay-selftest` 3917, `watch-selftest` 3987 — so
+running suites back-to-back, or twice in a minute, throws `EADDRINUSE` *inside a
+spawned child*, which reads exactly like the change under test having broken
+something. Three specifics worth knowing:
+
+- Windows makes it worse: libuv does not set `SO_REUSEADDR`, so sockets sitting
+  in `TIME_WAIT` block a rebind with **no live process to find**. `OwningProcess
+  0` means there is nothing to kill, and "ask a human to kill it" is the wrong
+  escalation.
+- The env vars differ per suite. `mobile-selftest` reads **`PORT`**
+  (`tools/mobile-selftest.js:34`); `watch-selftest` reads **`TEST_PORT`**.
+  Passing the wrong one looks like it worked and changes nothing.
+- **Gate on the exit code, never on the absence of the word `FAIL`.** An aborted
+  harness emits no pass/fail line at all, so "no failures" and "never ran" are
+  textually identical. Treating the second as the first is the same error as the
+  173 assertions that passed on an unreachable composer.
+
 **A working tree is not a branch.** Grepping a worktree while another agent is
 live in it yields a confident, wrong, alarming answer. On 2026-08-08 a
 coordinator grepped `mobile-zoom-back` moments before merging and found *zero*
