@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const NAME = 'relay-queue';
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -25,6 +25,16 @@ const UI_FILES = [
 ].filter(Boolean);
 const MAX_BODY = 1024 * 1024; // 1 MiB
 const MAX_TEXT = 8000; // per-message cap for instruction/text; results are only bounded by MAX_BODY
+
+// --- conversations ---------------------------------------------------------
+// Every task belongs to exactly one conversation. Records written before
+// conversations existed have no conversationId and replay into DEFAULT_CONV, so
+// the whole existing history lands in one sensible thread and every pre-existing
+// curl call (which sends no conversationId) keeps working unchanged.
+const DEFAULT_CONV = 'main';
+const DEFAULT_CONV_TITLE = 'Main';
+const MAX_TITLE = 200;
+const MAX_AGENT = 200;
 
 // --- speech to text (POST /stt) -------------------------------------------
 // Audio is relayed to a Wyoming ASR server (wyoming-whisper) over a plain TCP
@@ -55,16 +65,53 @@ const DEFAULT_ROLE = 'user'; // records written before roles existed are the hum
 // ---------------------------------------------------------------- event log
 /** @type {Map<string, object>} id -> task (insertion order == creation order) */
 const tasks = new Map();
+/** @type {Map<string, object>} id -> conversation (insertion order == creation order) */
+const conversations = new Map();
 let logFd = null;
+let mutations = 0; // bumped on every applied event; memoisation keys off it
+
+function newConversation(id, title, agent) {
+  return {
+    id,
+    title,
+    agent: agent || null, // who is meant to answer here; set and read by the agent side
+    createdAt: nowIso(),
+    archived: false,
+    archivedAt: null,
+  };
+}
+
+/*
+ * The default conversation always exists, and is created in memory rather than
+ * written to the log. That keeps `events.jsonl` untouched for an install that
+ * has never used conversations: nothing is rewritten, nothing is migrated, and
+ * a log written by the previous version replays byte for byte as before.
+ * A rename lands as an ordinary `convpatch` on top of it.
+ */
+function ensureDefaultConv() {
+  if (!conversations.has(DEFAULT_CONV)) {
+    conversations.set(DEFAULT_CONV, newConversation(DEFAULT_CONV, DEFAULT_CONV_TITLE, null));
+  }
+}
 
 function applyEvent(ev) {
+  mutations++;
   if (ev.t === 'create') {
     // Records logged before `role` existed replay as the human's messages.
     if (ev.task.role !== 'agent') ev.task.role = DEFAULT_ROLE;
+    // ...and records logged before conversations existed belong to the default one.
+    if (typeof ev.task.conversationId !== 'string' || !ev.task.conversationId) {
+      ev.task.conversationId = DEFAULT_CONV;
+    }
     tasks.set(ev.task.id, ev.task);
   } else if (ev.t === 'patch') {
     const task = tasks.get(ev.id);
     if (task) Object.assign(task, ev.patch);
+  } else if (ev.t === 'conv') {
+    conversations.set(ev.conv.id, ev.conv);
+  } else if (ev.t === 'convpatch') {
+    const conv = conversations.get(ev.id);
+    if (conv) Object.assign(conv, ev.patch);
   }
 }
 
@@ -75,7 +122,9 @@ function appendEvent(ev) {
     fs.fsyncSync(logFd); // best effort; some bind-mounted FSes reject fsync
   } catch { /* the write itself already left our process buffers */ }
   applyEvent(ev);
-  broadcast(ev.t === 'create' ? ev.task.id : ev.id); // push to live pages, post-durability
+  // Push to live pages, post-durability.
+  if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
+  else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
 }
 
 function replay() {
@@ -98,11 +147,12 @@ function replay() {
 // ---------------------------------------------------------------- helpers
 const nowIso = () => new Date().toISOString();
 
-function newId() {
+function newId(into) {
+  const taken = into || tasks;
   let id;
   do {
     id = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-  } while (tasks.has(id));
+  } while (taken.has(id));
   return id;
 }
 
@@ -167,6 +217,11 @@ function parseSince(raw) {
 
 /** Applies status / unread / since / limit query filters. Throws {code,message}. */
 function applyFilters(list, q) {
+  // `conversation` is the canonical name; `conversationId` is accepted too, since
+  // that is what the record field is called and both are natural to reach for.
+  const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+  if (conv !== null && conv !== '') list = list.filter((t) => convIdOf(t) === conv);
+
   const status = q.get('status');
   if (status !== null) {
     if (!STATUSES.includes(status)) throw httpErr(400, `invalid status "${status}"`);
@@ -220,6 +275,7 @@ const asText = (v) => (typeof v === 'string' ? v : v === null || v === undefined
 function entriesOf(t) {
   const createdMs = msOf(t.ts);
   const revMs = Math.max(createdMs, msOf(t.claimedAt), msOf(t.resultTs));
+  const conversationId = convIdOf(t);
   const out = [{
     id: t.id,
     role: t.role === 'agent' ? 'agent' : 'user',
@@ -227,6 +283,7 @@ function entriesOf(t) {
     ts: t.ts,
     status: t.status,
     rev: new Date(revMs).toISOString(),
+    conversationId,
   }];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
@@ -238,16 +295,73 @@ function entriesOf(t) {
       status: 'done',
       rev: new Date(Math.max(msOf(at), createdMs)).toISOString(),
       replyTo: t.id,
+      conversationId,
     });
   }
   return out;
 }
 
-function threadEntries() {
+/** A task's conversation, defaulting for records written before they existed. */
+const convIdOf = (t) => (typeof t.conversationId === 'string' && t.conversationId ? t.conversationId : DEFAULT_CONV);
+
+function threadEntries(conversationId) {
   const out = [];
-  for (const t of tasks.values()) out.push(...entriesOf(t));
+  for (const t of tasks.values()) {
+    if (conversationId && convIdOf(t) !== conversationId) continue;
+    out.push(...entriesOf(t));
+  }
   // Stable sort: a reply is pushed after its parent, so equal timestamps keep order.
   return out.sort((a, b) => msOf(a.ts) - msOf(b.ts));
+}
+
+/*
+ * Conversations with their derived summary: counts, when they were last active,
+ * and a snippet of the newest message so the menu can show a hint of it.
+ *
+ * Memoised on `mutations`, which is bumped by every applied event. The page
+ * polls this alongside the thread, so recomputing a full scan per request would
+ * be wasteful — but a scan is trivially correct, and invalidating on any write
+ * keeps it that way. Nothing here reads the event log; it is all in memory.
+ */
+let summaryCache = { at: -1, list: null };
+
+function conversationSummaries() {
+  if (summaryCache.at === mutations) return summaryCache.list;
+  const acc = new Map();
+  for (const c of conversations.values()) {
+    acc.set(c.id, {
+      ...c,
+      counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
+      messages: 0,
+      lastTs: null,
+      lastRole: null,
+      lastText: '',
+    });
+  }
+  for (const t of tasks.values()) {
+    const id = convIdOf(t);
+    let a = acc.get(id);
+    if (!a) {
+      // A task pointing at a conversation that was never recorded. Surfacing it
+      // under a placeholder beats hiding the user's messages.
+      a = { ...newConversation(id, id, null), counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
+        messages: 0, lastTs: null, lastRole: null, lastText: '', missing: true };
+      acc.set(id, a);
+    }
+    a.counts[t.status]++;
+    if (!t.relayed) a.counts.unrelayed++;
+    a.messages++;
+    const hasResult = t.result !== null && t.result !== undefined;
+    const at = hasResult ? (t.resultTs || t.ts) : t.ts;
+    if (!a.lastTs || msOf(at) >= msOf(a.lastTs)) {
+      a.lastTs = at;
+      a.lastRole = hasResult ? 'agent' : (t.role === 'agent' ? 'agent' : 'user');
+      a.lastText = asText(hasResult ? t.result : t.instruction).replace(/\s+/g, ' ').trim().slice(0, 140);
+    }
+  }
+  const list = [...acc.values()].sort((a, b) => msOf(b.lastTs || b.createdAt) - msOf(a.lastTs || a.createdAt));
+  summaryCache = { at: mutations, list };
+  return list;
 }
 
 // ---------------------------------------------------------------- live stream
@@ -266,14 +380,32 @@ const MAX_STREAMS = 50;
 const SSE_PING_MS = 25000; // under the ~100 s idle timeout proxies typically use
 const SSE_RETRY_MS = 3000; // client reconnect delay
 
+function push(payload) {
+  if (streams.size === 0) return;
+  const frame = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of streams) {
+    try { res.write(frame); } catch { /* socket already going away; 'close' will evict it */ }
+  }
+}
+
+/*
+ * Every frame names its conversation, so a page showing one conversation can
+ * merge its own updates and merely *flag* the others. Deliberately not filtered
+ * server-side: one stream carries everything, which is what lets the menu light
+ * up for a conversation you are not looking at without a second connection.
+ */
 function broadcast(taskId) {
   if (streams.size === 0) return;
   const task = tasks.get(taskId);
   if (!task) return;
-  const frame = `data: ${JSON.stringify({ now: nowIso(), entries: entriesOf(task) })}\n\n`;
-  for (const res of streams) {
-    try { res.write(frame); } catch { /* socket already going away; 'close' will evict it */ }
-  }
+  push({ now: nowIso(), conversationId: convIdOf(task), entries: entriesOf(task) });
+}
+
+function broadcastConv(id) {
+  if (streams.size === 0) return;
+  const conv = conversations.get(id);
+  if (!conv) return;
+  push({ now: nowIso(), conversation: conv });
 }
 
 function sseRoute(req, res) {
@@ -623,9 +755,18 @@ function createTask(res, body) {
   if (instruction.length > MAX_TEXT) {
     return fail(res, 400, `message too long: ${instruction.length} chars, max ${MAX_TEXT}`);
   }
+  // Omitting conversationId puts the message in the default conversation, which
+  // is what every call written before conversations existed does.
+  const conversationId = typeof body.conversationId === 'string' && body.conversationId
+    ? body.conversationId
+    : (typeof body.conversation === 'string' && body.conversation ? body.conversation : DEFAULT_CONV);
+  if (!conversations.has(conversationId)) {
+    return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
+  }
   const task = {
     id: newId(),
     role: DEFAULT_ROLE, // server-set, never taken from the client
+    conversationId,
     instruction,
     from: typeof body.from === 'string' && body.from ? body.from : null,
     ts: nowIso(),
@@ -668,6 +809,72 @@ function resultTask(res, id, body) {
   send(res, 200, task);
 }
 
+/*
+ * Conversations. The write path is the same append-only, fsync-before-response
+ * event log every other mutation uses — there is no second store.
+ *
+ * `agent` is the field the agent side owns: it names whoever is meant to answer
+ * in this conversation. relay-queue never acts on it and never spawns anything;
+ * it is a passive queue, and this is a place to record routing that something
+ * else decides. `assignee` is accepted as an alias for it.
+ */
+function createConversation(res, body) {
+  const title = typeof body.title === 'string' ? body.title.trim() : '';
+  if (!title) return fail(res, 400, 'title is required and must be a non-empty string');
+  if (title.length > MAX_TITLE) {
+    return fail(res, 400, `title too long: ${title.length} chars, max ${MAX_TITLE}`);
+  }
+  const agent = readAgent(body);
+  if (agent instanceof Error) return fail(res, 400, agent.message);
+  const conv = newConversation(newId(conversations), title, agent);
+  appendEvent({ t: 'conv', conv });
+  send(res, 201, conv);
+}
+
+function readAgent(body) {
+  const raw = body.agent !== undefined ? body.agent : body.assignee;
+  if (raw === undefined) return undefined;
+  if (raw === null || raw === '') return null; // explicit unassign
+  if (typeof raw !== 'string') return new Error('agent must be a string or null');
+  if (raw.length > MAX_AGENT) return new Error(`agent too long: ${raw.length} chars, max ${MAX_AGENT}`);
+  return raw;
+}
+
+function updateConversation(res, id, body) {
+  const conv = conversations.get(id);
+  if (!conv) return fail(res, 404, `no conversation with id "${id}"`);
+  const patch = {};
+
+  if (body.title !== undefined) {
+    if (typeof body.title !== 'string' || !body.title.trim()) {
+      return fail(res, 400, 'title must be a non-empty string');
+    }
+    if (body.title.length > MAX_TITLE) {
+      return fail(res, 400, `title too long: ${body.title.length} chars, max ${MAX_TITLE}`);
+    }
+    patch.title = body.title.trim();
+  }
+
+  const agent = readAgent(body);
+  if (agent instanceof Error) return fail(res, 400, agent.message);
+  if (agent !== undefined) patch.agent = agent;
+
+  if (body.archived !== undefined) {
+    if (typeof body.archived !== 'boolean') return fail(res, 400, 'archived must be true or false');
+    // The default conversation is where every pre-conversation message lives and
+    // where an omitted conversationId lands, so it cannot be archived away.
+    if (body.archived && id === DEFAULT_CONV) {
+      return fail(res, 400, `the default conversation "${DEFAULT_CONV}" cannot be archived`);
+    }
+    patch.archived = body.archived;
+    patch.archivedAt = body.archived ? nowIso() : null;
+  }
+
+  if (!Object.keys(patch).length) return fail(res, 400, 'nothing to update (title, agent or archived)');
+  appendEvent({ t: 'convpatch', id, patch });
+  send(res, 200, conv);
+}
+
 function relayTask(res, id) {
   const task = tasks.get(id);
   if (!task) return fail(res, 404, `no task with id "${id}"`);
@@ -703,6 +910,7 @@ async function route(req, res) {
       name: NAME,
       version: VERSION,
       counts: counts(),
+      conversations: conversations.size,
       streams: streams.size,
       uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
     });
@@ -715,6 +923,40 @@ async function route(req, res) {
       return send(res, 200, { count: list.length, tasks: list });
     }
     if (m === 'POST') return createTask(res, await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /conversations
+  if (seg.length === 1 && seg[0] === 'conversations') {
+    if (m === 'GET') {
+      let list = conversationSummaries();
+      // Archived ones are hidden unless asked for; `archived=only` shows just them.
+      const archived = q.get('archived');
+      if (archived === 'only') list = list.filter((c) => c.archived);
+      else if (archived === null || archived === 'false' || archived === '0') list = list.filter((c) => !c.archived);
+      // `pending=1` is the agent side's question: where is there work waiting?
+      const pending = q.get('pending');
+      if (pending !== null && pending !== 'false' && pending !== '0') {
+        list = list.filter((c) => c.counts.pending > 0);
+      }
+      const unread = q.get('unread');
+      if (unread !== null && unread !== 'false' && unread !== '0') {
+        list = list.filter((c) => c.counts.unrelayed > 0);
+      }
+      return send(res, 200, { count: list.length, defaultId: DEFAULT_CONV, conversations: list });
+    }
+    if (m === 'POST') return createConversation(res, await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /conversations/:id
+  if (seg.length === 2 && seg[0] === 'conversations') {
+    if (m === 'GET') {
+      const found = conversationSummaries().find((c) => c.id === seg[1]);
+      if (!found) return fail(res, 404, `no conversation with id "${seg[1]}"`);
+      return send(res, 200, found);
+    }
+    if (m === 'POST') return updateConversation(res, seg[1], await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
   }
 
@@ -753,7 +995,8 @@ async function route(req, res) {
   // /thread — chronological human + agent view; `since` filters on `rev`, `limit` takes the LAST N
   if (seg.length === 1 && seg[0] === 'thread') {
     if (!need('GET')) return;
-    let list = threadEntries();
+    const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+    let list = threadEntries(conv || null); // no filter = the whole queue, as before
 
     const since = q.get('since');
     if (since !== null) {
@@ -804,7 +1047,9 @@ const server = http.createServer((req, res) => {
 
 // ---------------------------------------------------------------- boot
 fs.mkdirSync(DATA_DIR, { recursive: true });
+ensureDefaultConv(); // before replay, so a rename of it replays onto something
 const replayed = replay();
+ensureDefaultConv(); // ...and after, in case the log somehow removed it
 server.listen(PORT, HOST, () => {
   const c = counts();
   console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
