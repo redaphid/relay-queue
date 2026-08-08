@@ -207,6 +207,62 @@ Established empirically, so nobody re-derives it:
 - Therefore **something outside must poke you.** Today that is the main session.
   Nothing inside a Claude session outlives Claude.
 
+## Being asked to stop
+
+The human can ask a coordinator to wind down from the UI. He cannot *make* it —
+nothing outside a Claude session can stop one, for the same reason nothing
+outside can wake one. So the request is a note left on the conversation, and it
+is only worth anything if you look for it and answer it.
+
+**Check `stopRequested` on your conversation whenever you poll.** It is on
+`GET /conversations` and `GET /conversations/<id>`, and it survives restarts.
+
+When you find it set, do this and nothing else:
+
+1. Post a result for anything you have claimed, or the work is orphaned — a
+   claimed task with no result is invisible to every future poll.
+2. Tell the server you are going, and hand back your worktrees:
+
+```sh
+curl -X POST localhost:3901/conversations/<id>/stop-ack \
+  -H 'content-type: application/json' \
+  -d '{"agent":"me","phase":"stopping","worktrees":["D:/Projects/relay-foo"]}'
+```
+
+3. Then, once you are actually finished:
+
+```sh
+curl -X POST localhost:3901/conversations/<id>/stop-ack \
+  -H 'content-type: application/json' -d '{"agent":"me","phase":"stopped"}'
+```
+
+`stopped` unassigns you from the conversation. It is the only thing in the
+system entitled to say an agent is gone, which is exactly why no timer will ever
+write it for you: until you send it, the UI correctly assumes you are still
+running and still holding whatever you checked out. Do not send it early.
+
+## Saying what you are doing
+
+Optional, and everything works without it — but a coordinator that reports gets
+a panel showing its subagents instead of an empty box. Post as you go:
+
+```sh
+curl -X POST localhost:3901/conversations/<id>/activity \
+  -H 'content-type: application/json' \
+  -d '{"agent":"me","kind":"spawned","subagent":"agent-foo","task":"build the thing"}'
+# ...and when it comes back
+  -d '{"agent":"me","kind":"finished","subagent":"agent-foo","ok":true}'
+```
+
+`kind` is `spawned`, `finished`, `tool` or `note`. Spawns and finishes are
+durable and survive a restart, because "what is still running out there" is the
+one thing worth keeping. Tool calls are kept in memory only and are dropped on
+restart: they are a live view, not history.
+
+None of this counts as being alive. Liveness is judged on claims and results —
+real work — precisely so that an agent busily reporting tool calls from inside a
+poll loop cannot look healthy while achieving nothing.
+
 ## The human
 
 They post from a phone, usually by voice, so expect transcription errors —
