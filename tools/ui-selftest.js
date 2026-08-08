@@ -202,7 +202,52 @@ function makeEnv(opts) {
     sttText: 'check the widget report', ttsFail: false, micError: null,
     convs: [conv('main', 'Main', { lastText: 'the first thread' }),
       conv('c2', 'Widget audit', { lastText: 'how many widgets', counts: { pending: 2, claimed: 0, done: 0, unrelayed: 0 } })],
+    /*
+     * A model of the server's checklist store, because checkbox state is server
+     * state now. `texts` is what each entry actually said, so the model parses
+     * items exactly as server.js does rather than inventing them — a stub that
+     * makes up its own list would let a real off-by-one through.
+     */
+    online: true,
+    texts: {},              // entryId -> message text
+    checked: {},            // "entryId#index" -> { on, by, at }
+    checkFail: null,        // null | 'network' | 'refused'
+    checkCalls: [],
   };
+
+  /* Mirrors parseChecklist() in server.js. Fenced code is not a task list. */
+  function modelItems(entryId) {
+    const lines = String(store.texts[entryId] || '').split(/\r?\n/);
+    const out = [];
+    let fenced = false;
+    for (const line of lines) {
+      if (/^\s*(?:```|~~~)/.test(line)) { fenced = !fenced; continue; }
+      if (fenced) continue;
+      const m = /^(\s*)[-*+]\s+\[([ xX])\]\s*(.*)$/.exec(line);
+      if (!m) continue;
+      const idx = out.length;
+      const rec = store.checked[`${entryId}#${idx}`];
+      out.push({
+        index: idx,
+        label: m[3].trim(),
+        depth: 0,
+        checked: rec ? !!rec.on : /x/i.test(m[2]),
+        source: rec ? 'checked' : 'text',
+        by: rec ? rec.by : null,
+        at: rec ? rec.at : null,
+      });
+    }
+    return out;
+  }
+  function modelChecklist(entryId) {
+    const items = modelItems(entryId);
+    if (!items.length) return null;
+    return {
+      entryId, taskId: entryId.replace(/:r$/, ''), conversationId: 'main', role: 'agent',
+      total: items.length, done: items.filter((i) => i.checked).length,
+      remaining: items.filter((i) => !i.checked).length, items,
+    };
+  }
   const audio = makeAudio(store);
 
   const rootStyle = { props: {}, setProperty(k, v) { this.props[k] = v; } };
@@ -247,6 +292,9 @@ function makeEnv(opts) {
     navigator: {
       userAgent: opts.ua || 'stub/1.0',
       mediaDevices: opts.mediaDevices, // undefined models an insecure/unsupported origin
+      // Flipped by tests to model a phone in a tunnel. The page must tell the
+      // difference between "no signal" and "the server said no".
+      get onLine() { return store.online; },
     },
     location: {
       protocol: opts.protocol || 'http:',
@@ -288,6 +336,18 @@ function makeEnv(opts) {
         });
       }
       if (url === '/tasks') return jsonRes({ id: 'new-task' }, 201);
+      // POST /tasks/:entryId/checks — one checkbox, written server-side.
+      const mChecks = /^\/tasks\/([^/]+)\/checks$/.exec(String(url));
+      if (mChecks) {
+        const entryId = decodeURIComponent(mChecks[1]);
+        store.checkCalls.push({ entryId, body });
+        // A phone in a tunnel: fetch itself rejects. Nothing is written.
+        if (store.checkFail === 'network') return Promise.reject(new Error('network error'));
+        // The server actively refusing (a 4xx) — a message that no longer exists.
+        if (store.checkFail === 'refused') return jsonRes({ error: 'no checklist on entry' }, 404);
+        store.checked[`${entryId}#${body.index}`] = { on: !!body.on, by: body.by, at: new Date().toISOString() };
+        return jsonRes({ changed: true, checklist: modelChecklist(entryId) });
+      }
       if (url === '/conversations') {
         if (init && init.method === 'POST') {
           const made = conv('c-new', (body && body.title) || 'untitled', { lastText: '' });
@@ -346,15 +406,33 @@ function makeEnv(opts) {
     feed(600, true);
     feed(3200, false);
   }
+  /*
+   * An entry exactly as /thread and /events emit it. `checklist` is attached
+   * only once something has actually been ticked, which is what the real server
+   * does — before that the message text is the only statement about the boxes.
+   */
+  function entryOf(id, text, extra) {
+    const ts = new Date().toISOString();
+    store.texts[id] = text;
+    const e = Object.assign({ id, role: 'agent', text, ts, rev: ts, status: 'done' }, extra || {});
+    const hasTick = Object.keys(store.checked).some((k) => k.slice(0, k.lastIndexOf('#')) === id);
+    if (hasTick) {
+      const cl = modelChecklist(id);
+      if (cl) e.checklist = { total: cl.total, done: cl.done, items: cl.items };
+    }
+    return e;
+  }
+
   /** Fire the agent-reply push the page would get over SSE. */
   function agentReply(text, id) {
-    const ts = new Date().toISOString();
     if (!store.es || !store.es.onmessage) throw new Error('no SSE stream is open');
     store.es.onmessage({
-      data: JSON.stringify({
-        entries: [{ id: id || 'reply-1', role: 'agent', text, ts, rev: ts, status: 'done', replyTo: 'x' }],
-      }),
+      data: JSON.stringify({ entries: [entryOf(id || 'reply-1', text, { replyTo: 'x' })] }),
     });
+  }
+  /** Re-push an entry the server already knows about, as a poll would. */
+  function repush(id) {
+    store.es.onmessage({ data: JSON.stringify({ entries: [entryOf(id, store.texts[id] || '')] }) });
   }
   /** End the reply that is currently playing. */
   function endPlayback() {
@@ -383,7 +461,7 @@ function makeEnv(opts) {
 
   return {
     sandbox, els, meter, posted, doc, store, cssVar,
-    feed, sayOneThing, sayAgain, agentReply, endPlayback, convReply,
+    feed, sayOneThing, sayAgain, agentReply, endPlayback, convReply, repush,
     track, sent, stt, tts, reads,
   };
 }
@@ -1224,52 +1302,362 @@ async function main() {
       JSON.stringify(hrefs));
   }
 
+  // ================================================ markdown — the wider syntax
+  /*
+   * "I want to see checklists and itineraries." An itinerary is times, dates and
+   * ordered steps — which in Markdown means TABLES and NESTED LISTS, neither of
+   * which the first renderer understood: it discarded indentation, so every
+   * sub-step flattened to the margin, and a table came out as a wall of pipes.
+   */
+  console.log('\nmarkdown — tables, because an itinerary is a table');
+  {
+    const env = liveEnv();
+    await settle();
+    const body = () => {
+      const rows = env.els.list.children;
+      return rows[rows.length - 1] && rows[rows.length - 1].children[0];
+    };
+
+    env.agentReply([
+      '| Time | Place | Note |',
+      '|------|:-----:|-----:|',
+      '| 09:15 | Gate 42 | boarding |',
+      '| 13:40 | Reykjavik | **bus** to town |',
+    ].join('\n'), 't-1');
+    await settle();
+    const b = body();
+    const tables = findAll(b, byTag('TABLE'));
+    check('a pipe table becomes a real table', tables.length === 1, `${tables.length}`);
+    check('...with a header row of three cells', findAll(b, byTag('TH')).length === 3,
+      `${findAll(b, byTag('TH')).length}`);
+    check('...and two body rows of three cells each', findAll(b, byTag('TD')).length === 6,
+      `${findAll(b, byTag('TD')).length}`);
+    check('...preserving every value', /09:15/.test(textOf(b)) && /Reykjavik/.test(textOf(b)),
+      textOf(b));
+    check('...with inline markup still rendered inside a cell',
+      findAll(b, byTag('STRONG')).length === 1);
+    const ths = findAll(b, byTag('TH'));
+    check('...and the alignment row respected',
+      ths[1].style.textAlign === 'center' && ths[2].style.textAlign === 'right',
+      JSON.stringify(ths.map((t) => t.style.textAlign)));
+    check('*** a table is wrapped in its own scroller, so it cannot push the page sideways ***',
+      findAll(b, byClass('mdtablewrap')).length === 1);
+
+    // A line full of pipes with no delimiter row underneath is just prose.
+    env.agentReply('the pipe | character | is not a table', 't-2');
+    await settle();
+    check('a line of pipes with no delimiter row is left as text',
+      findAll(body(), byTag('TABLE')).length === 0 && /is not a table/.test(textOf(body())),
+      textOf(body()));
+
+    // Ragged rows are the normal case in hand-written markdown.
+    env.agentReply('| a | b |\n|---|---|\n| only one |', 't-3');
+    await settle();
+    check('a short row is padded rather than dropped',
+      findAll(body(), byTag('TD')).length === 2 && /only one/.test(textOf(body())),
+      textOf(body()));
+
+    env.agentReply('| a \\| b | c |\n|---|---|\n| 1 | 2 |', 't-4');
+    await settle();
+    check('an escaped pipe stays inside its cell',
+      findAll(body(), byTag('TH')).length === 2 && /a \| b/.test(textOf(body())),
+      textOf(body()));
+  }
+
+  console.log('\nmarkdown — nested lists, because a step has sub-steps');
+  {
+    const env = liveEnv();
+    await settle();
+    const body = () => {
+      const rows = env.els.list.children;
+      return rows[rows.length - 1] && rows[rows.length - 1].children[0];
+    };
+
+    env.agentReply([
+      '1. Fly to Keflavik',
+      '   - bring the adapter',
+      '   - window seat',
+      '2. Collect the car',
+    ].join('\n'), 'n-1');
+    await settle();
+    const b = body();
+    const ols = findAll(b, byTag('OL'));
+    const uls = findAll(b, byTag('UL'));
+    check('an ordered list becomes an ordered list', ols.length === 1, `${ols.length}`);
+    check('*** an indented sub-list is nested, not flattened to the margin ***',
+      uls.length === 1 && findAll(ols[0], byTag('UL')).length === 1,
+      `${uls.length} sub-lists, ${findAll(ols[0], byTag('UL')).length} inside the ol`);
+    check('...and it hangs off the step it belongs to, not the list',
+      ols[0].children.length === 2 && findAll(ols[0].children[0], byTag('UL')).length === 1,
+      `${ols[0].children.length} top-level steps`);
+    check('...with both steps still present', /Keflavik/.test(textOf(b)) && /Collect the car/.test(textOf(b)));
+
+    // Four-space indentation is just as common as two, and must nest the same.
+    env.agentReply('- outer\n    - inner\n- outer two', 'n-2');
+    await settle();
+    check('four-space indentation nests too',
+      findAll(body(), byTag('UL')).length === 2, `${findAll(body(), byTag('UL')).length}`);
+
+    // Three levels, and back out again.
+    env.agentReply('- a\n  - b\n    - c\n- d', 'n-3');
+    await settle();
+    check('three levels nest, and the list closes back out to the top',
+      findAll(body(), byTag('UL')).length === 3 &&
+      findAll(body(), byTag('UL'))[0].children.length === 2,
+      `${findAll(body(), byTag('UL')).length} lists`);
+
+    // Nested TASK lists are the real target: an itinerary of tickable sub-steps.
+    env.agentReply('- [ ] pack\n  - [ ] passport\n  - [ ] charger\n- [ ] leave', 'n-4');
+    await settle();
+    const boxes = findAll(body(), (n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+    check('*** nested task lists render every box ***', boxes.length === 4, `${boxes.length}`);
+    check('...and the sub-tasks are nested under their parent',
+      findAll(body(), byClass('mdtasks')).length === 2,
+      `${findAll(body(), byClass('mdtasks')).length} task lists`);
+  }
+
+  console.log('\nmarkdown — rules, and degrading without swallowing anything');
+  {
+    const env = liveEnv();
+    await settle();
+    const body = () => {
+      const rows = env.els.list.children;
+      return rows[rows.length - 1] && rows[rows.length - 1].children[0];
+    };
+
+    env.agentReply('before\n\n---\n\nafter', 'r-1');
+    await settle();
+    check('a horizontal rule becomes a rule', findAll(body(), byTag('HR')).length === 1);
+    check('...without eating the text around it',
+      /before/.test(textOf(body())) && /after/.test(textOf(body())), textOf(body()));
+
+    env.agentReply('***\n___', 'r-2');
+    await settle();
+    check('asterisks and underscores rule too', findAll(body(), byTag('HR')).length === 2,
+      `${findAll(body(), byTag('HR')).length}`);
+
+    env.agentReply('- a genuine bullet', 'r-3');
+    await settle();
+    check('a bullet is still a bullet, not a rule',
+      findAll(body(), byTag('HR')).length === 0 && findAll(body(), byTag('LI')).length === 1);
+
+    /*
+     * The degradation rule: anything the renderer does not understand must come
+     * out as its own text. Never blank, never raw markup, never swallowed.
+     */
+    const odd = [
+      '| unterminated table',
+      '~~~ never closed',
+      '#nospace',
+      '> ',
+      '[](  )',
+      '**unclosed bold',
+      '<<<>>>',
+      '\\',
+    ];
+    for (let i = 0; i < odd.length; i++) {
+      env.agentReply(odd[i], 'odd-' + i);
+      await settle();
+      const b = body();
+      const shown = textOf(b).replace(/\s+/g, ' ').trim();
+      // "Never swallow the text" means the message produced SOMETHING — either
+      // words, or a block that visibly stands for them. `> ` on its own is an
+      // empty quote and an unterminated fence is an empty code block; both are
+      // honest renderings of input that genuinely says nothing.
+      check(`odd input ${JSON.stringify(odd[i])} renders something rather than vanishing`,
+        shown.length > 0 || (b && b.children.length > 0), JSON.stringify(shown));
+    }
+    check('and none of it threw', true);
+  }
+
+  // ============================== the injection battery, in and out of the DOM
+  /*
+   * This queue has no authentication and is published on every interface the
+   * machine has, so message text is HOSTILE INPUT — and this is the page that
+   * talks to every agent on the box. A renderer that is XSS-open here is worse
+   * than no renderer at all, so these do not test that escaping happens; they
+   * try to break it, one attack per case, and assert the result is inert.
+   */
+  console.log('\nmarkdown — the injection battery');
+  {
+    const env = liveEnv();
+    await settle();
+    const body = () => {
+      const rows = env.els.list.children;
+      return rows[rows.length - 1] && rows[rows.length - 1].children[0];
+    };
+    // Tags the renderer is allowed to create. Anything else in a message body
+    // means message text became markup.
+    const ALLOWED = ['#TEXT', 'P', 'DIV', 'SPAN', 'STRONG', 'EM', 'DEL', 'CODE', 'PRE',
+      'UL', 'OL', 'LI', 'A', 'BR', 'HR', 'LABEL', 'INPUT', 'TABLE', 'THEAD', 'TBODY',
+      'TR', 'TH', 'TD'];
+    const SAFE_HREF = /^(?:https?:\/\/|mailto:[^\s]|\/(?!\/))/i;
+
+    /** Every way a rendered body could have become dangerous. */
+    function violations(root) {
+      const bad = [];
+      findAll(root, () => true).forEach((n) => {
+        if (ALLOWED.indexOf(n.tagName) === -1) bad.push('tag ' + n.tagName);
+        Object.keys(n.attrs || {}).forEach((k) => {
+          if (/^on/i.test(k)) bad.push('attr ' + k);
+          if (/^(src|href|xlink:href|formaction|action|srcdoc|data)$/i.test(k) &&
+              !SAFE_HREF.test(String(n.attrs[k]))) bad.push('url attr ' + k + '=' + n.attrs[k]);
+        });
+        if (n.tagName === 'A' && !SAFE_HREF.test(String(n.href || ''))) bad.push('href ' + n.href);
+        if (n.href !== undefined && n.tagName !== 'A') bad.push('href on ' + n.tagName);
+        if (n.src !== undefined) bad.push('src on ' + n.tagName);
+        Object.keys(n).forEach((k) => { if (/^on[a-z]+$/i.test(k) && n[k]) bad.push('prop ' + k); });
+      });
+      return bad;
+    }
+
+    const attacks = [
+      ['a bare script tag', '<script>alert(1)</script>'],
+      ['an img with an error handler', '<img src=x onerror=alert(1)>'],
+      ['an svg with a load handler', '<svg/onload=alert(1)>'],
+      ['an iframe', '<iframe src="javascript:alert(1)"></iframe>'],
+      ['a javascript: link', '[tap](javascript:alert(1))'],
+      ['a JavaScript: link with odd case and spaces', '[tap](  JaVaScRiPt:alert(1))'],
+      ['a javascript: link with an embedded tab', '[tap](java\tscript:alert(1))'],
+      ['a data: html link', '[tap](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)'],
+      ['a vbscript: link', '[tap](vbscript:msgbox(1))'],
+      ['a protocol-relative link', '[tap](//evil.example/x)'],
+      ['an image with a javascript source', '![alt](javascript:alert(1))'],
+      ['html smuggled inside a fenced block', '```\n<img src=x onerror=alert(1)>\n```'],
+      ['html smuggled inside inline code', 'try `<img src=x onerror=alert(1)>` here'],
+      ['html smuggled inside a table cell', '| a | b |\n|---|---|\n| <script>alert(1)</script> | <img src=x onerror=alert(1)> |'],
+      ['html smuggled inside a task label', '- [ ] <img src=x onerror=alert(1)>'],
+      ['html smuggled inside a heading', '# <img src=x onerror=alert(1)>'],
+      ['html smuggled inside a blockquote', '> <script>alert(1)</script>'],
+      ['html smuggled inside a link label', '[<img src=x onerror=alert(1)>](https://ok.example)'],
+      ['an onerror written as a bare attribute', 'onerror=alert(1) onload=alert(2)'],
+      ['a closing tag for the page itself', '</div></script><script>alert(1)</script>'],
+      ['an html entity that decodes to a tag', '&lt;script&gt;alert(1)&lt;/script&gt;'],
+      ['a null byte in a scheme', '[tap](java script:alert(1))'],
+      ['a newline inside a url', '[tap](java\nscript:alert(1))'],
+      ['a style tag', '<style>body{display:none}</style>'],
+      ['a form with a formaction', '<form action="javascript:alert(1)"><button formaction="javascript:alert(1)">'],
+      ['a base tag', '<base href="https://evil.example/">'],
+      ['a meta refresh', '<meta http-equiv="refresh" content="0;url=javascript:alert(1)">'],
+      ['an object tag', '<object data="javascript:alert(1)"></object>'],
+    ];
+
+    for (let i = 0; i < attacks.length; i++) {
+      const [name, text] = attacks[i];
+      env.agentReply(text, 'atk-' + i);
+      await settle();
+      const b = body();
+      const bad = violations(b);
+      check(`*** ${name} is inert ***`, bad.length === 0, bad.join(', '));
+      // ...and it is not merely dropped. Swallowing hostile text silently is its
+      // own bug: he would never know the message said anything.
+      check(`...and ${name} is still shown as text`, textOf(b).trim().length > 0,
+        JSON.stringify(textOf(b)));
+    }
+
+    // A last sweep over everything rendered in this env, not just the last one.
+    check('*** nothing dangerous survived anywhere in the thread ***',
+      violations(env.els.list).length === 0, violations(env.els.list).join(', '));
+  }
+
+  console.log('\nmarkdown — the page cannot assign HTML at all');
+  {
+    /*
+     * The stub DOM has no innerHTML, so no DOM test could ever catch someone
+     * reaching for it. This is a structural assertion on the source instead: the
+     * renderer's safety comes from the fact that message text NEVER becomes
+     * markup, and that property is only true while none of these appear.
+     */
+    const src = inlineScript();
+    // Matched as USE, not as a word: both existing mentions are comments saying
+    // the page does not do this, and a test that failed on its own documentation
+    // would be deleted within the week.
+    const banned = [
+      ['innerHTML', /\.innerHTML\s*=/],
+      ['outerHTML', /\.outerHTML\s*=/],
+      ['insertAdjacentHTML', /\.insertAdjacentHTML\s*\(/],
+      ['document.write', /document\s*\.\s*write(?:ln)?\s*\(/],
+      ['createContextualFragment', /createContextualFragment\s*\(/],
+      ['srcdoc', /\.srcdoc\s*=/],
+      ['setHTMLUnsafe', /setHTMLUnsafe\s*\(/],
+    ];
+    banned.forEach(([word, re]) => {
+      check(`*** the page never uses ${word} ***`, !re.test(src));
+    });
+    check('*** and never builds code from a string ***',
+      !/\beval\s*\(/.test(src) && !/new\s+Function\s*\(/.test(src));
+    // The one place a string becomes something the browser acts on.
+    check('the only URL allowlist is a scheme allowlist, anchored at the start',
+      /var SAFE_URL = \/\^/.test(src));
+  }
+
   // ============================================================== checklists
   /*
-   * The user's actual request: "markdown rendering ... specifically so I can
-   * check things off the list." The tick is optimistic and the write-through
-   * happens by asking the conversation's agent to update Vikunja, which is the
-   * single source of truth. So the tick can be wrong, and the tests that matter
-   * are the ones proving it never quietly claims to be right.
+   * The user's actual request: "I want to see checklists and itineraries and to
+   * check them off and have Claude notice."
+   *
+   * A tick is SERVER state now, not this browser's. That is the whole feature:
+   * it has to survive a reload, reach his other device, and be readable by an
+   * agent. The tests that matter are the ones proving the tick goes to the
+   * server, and that a tick which has NOT reached the server never looks like
+   * one that has — offline included, because he is on a plane.
    */
-  console.log('\nchecklists — ticking, and telling the agent');
+  const boxesIn = (env) => findAll(env.els.list, (n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+
+  console.log('\nchecklists — a tick is written to the server, not to this browser');
   {
     const env = liveEnv();
     await settle();
     env.agentReply('Packing:\n- [ ] passport\n- [x] socks', 'list-1');
     await settle();
-    const boxes = () => findAll(env.els.list, (n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+    const boxes = () => boxesIn(env);
     check('a task list renders real checkboxes', boxes().length === 2, `${boxes().length}`);
     check('an item already ticked in the text comes back ticked', boxes()[1].checked === true);
     check('an unticked one does not', boxes()[0].checked === false);
 
-    const before = env.sent().length;
+    const beforeTasks = env.sent().length;
     const box = boxes()[0];
     box.checked = true;
     box.dispatch('change');
     await settle();
-    const posted = env.sent()[env.sent().length - 1];
-    check('ticking posts a message', env.sent().length === before + 1, `${env.sent().length - before}`);
-    check('...naming the item', posted && /passport/.test(posted.body.text), JSON.stringify(posted && posted.body.text));
-    check('...asking for the Vikunja write, which the browser never does itself',
-      posted && /vikunja/i.test(posted.body.text), JSON.stringify(posted && posted.body.text));
-    check('...marked as coming from the checklist', posted && posted.body.from === 'checklist',
-      JSON.stringify(posted && posted.body.from));
-    check('...in the conversation the list is in', posted && posted.body.conversationId === 'main',
-      JSON.stringify(posted && posted.body.conversationId));
-    check('the tick shows immediately, without waiting for the agent',
-      boxes()[0].checked === true);
 
-    // A re-render must not undo it: render() rebuilds every node from scratch.
+    const calls = env.store.checkCalls;
+    check('*** ticking writes to the server ***', calls.length === 1, `${calls.length} calls`);
+    check('...against the entry the list is in', calls[0] && calls[0].entryId === 'list-1',
+      JSON.stringify(calls[0] && calls[0].entryId));
+    check('...naming the item by its index, not its label',
+      calls[0] && calls[0].body.index === 0 && calls[0].body.on === true,
+      JSON.stringify(calls[0] && calls[0].body));
+    check('...recording which device did it', calls[0] && /^web\//.test(String(calls[0].body.by)),
+      JSON.stringify(calls[0] && calls[0].body.by));
+    check('*** and posts NOTHING into his thread — one message per tap was the old bug ***',
+      env.sent().length === beforeTasks, `${env.sent().length - beforeTasks} messages posted`);
+    check('the tick shows immediately, without waiting for the round trip',
+      boxes()[0].checked === true);
+    check('...and settles to no marker once the server has it',
+      findAll(env.els.list, byClass('tmark'))[0].hidden === true,
+      JSON.stringify(findAll(env.els.list, byClass('tmark'))[0].textContent));
+
+    // A re-render rebuilds every node from scratch, and the server is asked again.
     env.agentReply('unrelated chatter', 'noise-1');
     await settle();
     check('*** the tick survives a full re-render ***', boxes()[0].checked === true);
+
+    // The server re-states the entry, as a poll or another device's SSE would.
+    env.repush('list-1');
+    await settle();
+    check('*** and it survives the server restating the message ***', boxes()[0].checked === true,
+      JSON.stringify(boxes().map((b) => b.checked)));
+    check('...because the server is the one saying so now',
+      env.store.checked['list-1#0'] && env.store.checked['list-1#0'].on === true);
   }
 
   console.log('\nchecklists — a tick that has not landed does not look like one that has');
   {
     const env = liveEnv();
     await settle();
+    env.store.checkFail = 'network';
+    env.store.online = false;                 // a phone in a tunnel
     env.agentReply('- [ ] passport', 'list-2');
     await settle();
     const marks = () => findAll(env.els.list, byClass('tmark'));
@@ -1277,65 +1665,135 @@ async function main() {
     check('an untouched item says nothing at all', marks()[0].hidden === true,
       JSON.stringify(marks()[0].textContent));
 
-    const box = findAll(env.els.list, (n) => n.tagName === 'INPUT' && n.type === 'checkbox')[0];
+    const box = boxesIn(env)[0];
     box.checked = true;
     box.dispatch('change');
     await settle();
-    check('*** an unconfirmed tick says so in words ***', /saving/i.test(marks()[0].textContent),
-      JSON.stringify(marks()[0].textContent));
-    check('...and the row is marked, so it is visible while scanning',
+    check('*** an offline tick is not silently lost — it says it is queued ***',
+      /queued/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
+    check('...and does not claim to have failed, because it has not',
+      !/not saved/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
+    check('...the row is flagged, so it is visible while scanning',
       /unsettled/.test(rows()[0].className), rows()[0].className);
+    check('...but the box still shows ticked, because he did tick it',
+      boxesIn(env)[0].checked === true);
+    check('*** and it is on disk, so closing the tab cannot eat it ***',
+      /list-2#0/.test(String(env.sandbox.localStorage.getItem('relay.checks.outbox'))),
+      String(env.sandbox.localStorage.getItem('relay.checks.outbox')));
 
-    // The agent answers: the posted task reaches 'done'. That is the confirmation.
-    const ts = new Date().toISOString();
-    env.store.es.onmessage({
-      data: JSON.stringify({
-        entries: [{ id: 'new-task', role: 'user', status: 'done', text: 'Checked off: passport', ts, rev: ts, conversationId: 'main' }],
-      }),
-    });
+    // Out of the tunnel. The browser fires `online`, and the queue drains.
+    env.store.checkFail = null;
+    env.store.online = true;
+    env.sandbox.dispatchWindow('online');
     await settle();
-    check('*** once the agent has acted, the tick settles ***', marks()[0].hidden === true,
-      JSON.stringify(marks()[0].textContent));
+    check('*** coming back online sends the tick without him touching it ***',
+      env.store.checked['list-2#0'] && env.store.checked['list-2#0'].on === true,
+      JSON.stringify(env.store.checked));
     check('...and the row stops being flagged', !/unsettled/.test(rows()[0].className), rows()[0].className);
+    check('...and the outbox is empty again',
+      String(env.sandbox.localStorage.getItem('relay.checks.outbox')).indexOf('list-2#0') === -1,
+      String(env.sandbox.localStorage.getItem('relay.checks.outbox')));
   }
 
-  console.log('\nchecklists — a write that fails says so, and can be retried');
+  console.log('\nchecklists — a write the server refuses says so, and can be retried');
   {
     const env = liveEnv();
     await settle();
-    const realFetch = env.sandbox.fetch;
-    env.sandbox.fetch = (url, init) => {
-      if (url === '/tasks') {
-        return Promise.resolve({
-          ok: false, status: 503,
-          json: () => Promise.resolve({ error: 'the queue is unreachable' }),
-          headers: { get: () => null },
-        });
-      }
-      return realFetch(url, init);
-    };
+    env.store.checkFail = 'refused';       // a 404: that message is gone
     env.agentReply('- [ ] passport', 'list-3');
     await settle();
     const marks = () => findAll(env.els.list, byClass('tmark'));
     const rows = () => findAll(env.els.list, byClass('mdtask'));
-    const box = findAll(env.els.list, (n) => n.tagName === 'INPUT' && n.type === 'checkbox')[0];
+    const box = boxesIn(env)[0];
     box.checked = true;
     box.dispatch('change');
     await settle();
-    check('*** a failed write never shows a clean tick ***', /not saved/i.test(marks()[0].textContent),
+    check('*** a refused write never shows a clean tick ***', /not saved/i.test(marks()[0].textContent),
       JSON.stringify(marks()[0].textContent));
     check('...the row is marked as broken, not merely unsettled',
       /broken/.test(rows()[0].className), rows()[0].className);
     check('...and it offers the retry rather than being a dead end',
       /tap to retry/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
 
-    env.sandbox.fetch = realFetch; // the queue comes back
-    const before = env.sent().length;
+    // A 4xx is the server saying "never", so it must NOT be retried forever in
+    // the background — that would hammer the queue once per poll, silently.
+    const afterFail = env.store.checkCalls.length;
+    env.sandbox.dispatchWindow('online');
+    await settle();
+    check('*** a refusal is not retried automatically ***',
+      env.store.checkCalls.length === afterFail,
+      `${env.store.checkCalls.length - afterFail} unwanted retries`);
+
+    env.store.checkFail = null;            // whatever it was, it is fixed
+    const before = env.store.checkCalls.length;
     marks()[0].dispatch('click');
     await settle();
-    check('tapping it tries again', env.sent().length === before + 1, `${env.sent().length - before}`);
+    check('but tapping the marker tries again', env.store.checkCalls.length === before + 1,
+      `${env.store.checkCalls.length - before}`);
     check('...and it stops claiming to be broken', !/not saved/i.test(marks()[0].textContent),
       JSON.stringify(marks()[0].textContent));
+  }
+
+  console.log('\nchecklists — the server has the last word');
+  {
+    const env = liveEnv();
+    await settle();
+    // Another device ticked item 1 while this page was closed.
+    env.store.checked['list-4#1'] = { on: true, by: 'web/other', at: new Date().toISOString() };
+    env.agentReply('- [ ] passport\n- [ ] socks\n- [ ] adapters', 'list-4');
+    await settle();
+    const boxes = () => boxesIn(env);
+    check('*** a tick made on another device shows up here ***', boxes()[1].checked === true,
+      JSON.stringify(boxes().map((b) => b.checked)));
+    check('...and the untouched ones are untouched',
+      boxes()[0].checked === false && boxes()[2].checked === false);
+    check('...with who did it recorded, not just that it happened',
+      /web\/other/.test(String(findAll(env.els.list, byClass('mdtask'))[1].children[0].title)),
+      String(findAll(env.els.list, byClass('mdtask'))[1].children[0].title));
+
+    // The server can also disagree with the text: `[x]` in the message, unticked
+    // on the server. The server wins, because it is the later statement.
+    env.store.checked['list-5#0'] = { on: false, by: 'web/other', at: new Date().toISOString() };
+    env.agentReply('- [x] already done in the text', 'list-5');
+    await settle();
+    const l5 = boxesIn(env);
+    check('*** an un-tick beats an [x] in the message text ***',
+      l5[l5.length - 1].checked === false, JSON.stringify(l5.map((b) => b.checked)));
+  }
+
+  console.log('\nchecklists — indexing agrees with the server, or every box is wrong');
+  {
+    const env = liveEnv();
+    await settle();
+    /*
+     * The index is the ONLY thing tying a checkbox to its server record, and the
+     * server counts task lines by parsing the same text. A `- [ ]` inside a
+     * fenced code block is sample text on the server's side; if the page counted
+     * it as a task, every box after the fence would write to the wrong item.
+     */
+    env.agentReply([
+      '- [ ] first',
+      '```',
+      '- [ ] not a task, this is an example',
+      '```',
+      '- [ ] second',
+      '~~~',
+      '- [ ] also not a task',
+      '~~~',
+      '- [ ] third',
+    ].join('\n'), 'list-6');
+    await settle();
+    const boxes = boxesIn(env);
+    check('*** a checkbox inside a fence is not a checkbox ***', boxes.length === 3,
+      `${boxes.length} boxes, expected 3`);
+    boxes[2].checked = true;
+    boxes[2].dispatch('change');
+    await settle();
+    const last = env.store.checkCalls[env.store.checkCalls.length - 1];
+    check('*** the third real item is index 2, not index 4 ***',
+      last && last.body.index === 2, JSON.stringify(last && last.body));
+    check('...and the server agrees that item is "third"',
+      env.store.texts['list-6'] && /third/.test(env.store.texts['list-6'].split('\n')[8]));
   }
 
   console.log('\nconversations — the menu');

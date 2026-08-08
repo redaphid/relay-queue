@@ -356,6 +356,52 @@
   .mdlist, .mdtasks { margin: 0 0 8px; padding-left: 22px; }
   .mdtasks { list-style: none; padding-left: 0; }
   .mdlist li { margin: 2px 0; }
+  /* A nested list is a continuation of the row above it, not a new block, so it
+     loses the trailing gap. A sub-list of tasks keeps a small indent of its own,
+     since it has no bullet to sit under. */
+  .mdlist .mdlist, .mdlist .mdtasks, .mdtasks .mdlist, .mdtasks .mdtasks { margin-bottom: 0; }
+  .mdtasks .mdtasks, .mdlist .mdtasks { padding-left: 16px; }
+  .msg .body hr {
+    border: 0; height: 1px; margin: 11px 0;
+    background: var(--line); opacity: .8;
+  }
+
+  /* ---- tables -----------------------------------------------------------
+     An itinerary is a table, and a phone is 390px wide. A wide table gets its
+     own horizontal scroller so it can never push the thread — or the composer —
+     sideways: `max-width:100%` on the wrapper plus `min-width:0` on the flex
+     parents is what actually contains it. `-webkit-overflow-scrolling` keeps
+     the scroll feeling native under a thumb. */
+  .mdtablewrap {
+    max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    margin: 0 0 9px; border-radius: 10px;
+    border: 1px solid var(--line);
+    /* A faint edge, so it is discoverable that there is more to the right. */
+    background: rgba(127, 127, 127, .06);
+  }
+  .mdtablewrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mdtable { border-collapse: collapse; width: auto; min-width: 100%; font-size: 14px; }
+  .mdtable th, .mdtable td {
+    padding: 7px 10px; text-align: left; vertical-align: top;
+    border-bottom: 1px solid var(--line);
+    white-space: normal; min-width: 44px;
+    /*
+     * The bubble sets `overflow-wrap: anywhere` so a pasted URL cannot burst it.
+     * Inside a table that rule is actively wrong: it rendered "09:15" as "09:1"
+     * then "5" on the next line, and a departure time split across two lines is
+     * worse than a table you have to scroll. Cells wrap BETWEEN words only, and
+     * the wrapper's scroller absorbs whatever that costs in width.
+     */
+    overflow-wrap: normal; word-break: normal; hyphens: none;
+  }
+  /* A cell that is only a time, a date or a number never wraps at all. */
+  .mdtable td:first-child, .mdtable th:first-child { white-space: nowrap; }
+  .mdtable thead th {
+    font-weight: 680; white-space: nowrap;
+    background: rgba(127, 127, 127, .12);
+    position: sticky; top: 0;
+  }
+  .mdtable tbody tr:last-child td { border-bottom: 0; }
   .mdquote {
     margin: 0 0 8px; padding: 2px 0 2px 10px;
     border-left: 3px solid var(--line); opacity: .85;
@@ -378,17 +424,30 @@
      this list is read while walking around a bedroom holding a suitcase. */
   .mdtask {
     display: flex; align-items: flex-start; gap: 10px;
-    margin: 0; padding: 5px 0; min-height: 34px;
+    margin: 0; padding: 2px 0; min-height: 44px;
+    /* A task row is a flex container, so a NESTED list inside it would otherwise
+       become a flex sibling and sit *beside* the label — which squeezed the
+       parent's tap target from 287px to 113px at 390px wide. Wrapping, and
+       forcing a sub-list to a full-width line, puts it underneath where it
+       belongs. Caught by tools/mobile-selftest.js, which is the entire reason
+       that suite exists. */
+    flex-wrap: wrap;
   }
+  .mdtask > .mdtasks, .mdtask > .mdlist { flex: 0 0 100%; width: 100%; }
   .mdtask label {
-    display: flex; align-items: flex-start; gap: 10px;
+    display: flex; align-items: center; gap: 12px;
     flex: 1 1 auto; min-width: 0; cursor: pointer;
-    padding: 4px 0; /* pads the row out to a comfortable target */
+    /* The LABEL is the tap target, not the box: 44px tall and the full width of
+       the row, so a thumb aimed anywhere near the words hits it. This is read
+       while walking around holding a suitcase, one-handed. */
+    min-height: 44px; padding: 4px 0;
+    -webkit-tap-highlight-color: rgba(127, 127, 127, .18);
   }
   .mdtask input[type="checkbox"] {
-    flex: 0 0 auto; width: 22px; height: 22px; margin: 0;
+    flex: 0 0 auto; width: 24px; height: 24px; margin: 0;
     accent-color: var(--accent); cursor: pointer;
   }
+  .mdtask label:active { opacity: .7; }
   .mdtask .tlabel { flex: 1 1 auto; min-width: 0; }
   /* Done, and known to be done. Struck through as well as faded: a colour or an
      opacity on its own is not something everyone can read. */
@@ -813,31 +872,103 @@
     }
   }
 
-  var RE_FENCE = /^\s*```/;
+  /*
+   * `~~~` counts as a fence as well as ``` ``` ``` — the server's checklist
+   * parser skips both, and the two MUST agree about which lines are code, or a
+   * `- [ ]` written as an example inside a fence would be a task on one side and
+   * not the other, and every checkbox after it would be off by one.
+   */
+  var RE_FENCE = /^\s*(?:```|~~~)/;
   var RE_HEAD = /^(#{1,6})\s+(.*)$/;
   var RE_QUOTE = /^\s*>\s?(.*)$/;
-  var RE_TASK = /^\s*[-*+]\s+\[([ xX])\]\s*(.*)$/;
-  var RE_BULLET = /^\s*[-*+]\s+(.*)$/;
-  var RE_ORDER = /^\s*(\d{1,3})[.)]\s+(.*)$/;
+  /* A rule is that character and nothing else. Checked before bullets, because
+     `- - -` is a rule and would otherwise read as a one-item list. */
+  var RE_RULE = /^\s{0,3}([-*_])\s*(?:\1\s*){2,}$/;
+  var RE_TASK = /^(\s*)[-*+]\s+\[([ xX])\]\s*(.*)$/;
+  var RE_BULLET = /^(\s*)[-*+]\s+(.*)$/;
+  var RE_ORDER = /^(\s*)(\d{1,3})[.)]\s+(.*)$/;
+  /* The `|---|:--:|` line under a table's header row is what makes it a table;
+     a line full of pipes on its own is just prose about pipes. */
+  var RE_TSEP = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
 
-  function isBlockStart(line) {
+  function isTableAt(lines, i) {
+    return i + 1 < lines.length &&
+      lines[i].indexOf('|') !== -1 &&
+      RE_TSEP.test(lines[i + 1]) && lines[i + 1].indexOf('-') !== -1;
+  }
+
+  function isBlockStart(line, lines, i) {
     return RE_FENCE.test(line) || RE_HEAD.test(line) || RE_QUOTE.test(line) ||
-      RE_TASK.test(line) || RE_BULLET.test(line) || RE_ORDER.test(line);
+      RE_RULE.test(line) || RE_TASK.test(line) || RE_BULLET.test(line) ||
+      RE_ORDER.test(line) || (lines ? isTableAt(lines, i) : false);
+  }
+
+  /** Cells of one table row. `\|` is an escaped pipe, not a cell boundary. */
+  function splitRow(line) {
+    var s = String(line).trim();
+    if (s.charAt(0) === '|') s = s.slice(1);
+    if (s.charAt(s.length - 1) === '|' && s.charAt(s.length - 2) !== '\\') s = s.slice(0, -1);
+    var cells = [], cur = '';
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (ch === '\\' && s.charAt(i + 1) === '|') { cur += '|'; i++; continue; }
+      if (ch === '|') { cells.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    cells.push(cur);
+    return cells.map(function (c) { return c.trim(); });
+  }
+
+  function alignsOf(sep) {
+    return splitRow(sep).map(function (c) {
+      var l = c.charAt(0) === ':', r = c.charAt(c.length - 1) === ':';
+      return l && r ? 'center' : r ? 'right' : l ? 'left' : '';
+    });
+  }
+
+  /** Leading whitespace as a column count; a tab is four columns. */
+  function indentOf(s) {
+    return /^[ \t]*/.exec(s)[0].replace(/\t/g, '    ').length;
   }
 
   function mdRender(text, entry) {
     var frag = document.createDocumentFragment();
     var lines = String(text == null ? '' : text).split(/\r?\n/);
-    var i = 0, taskIndex = 0, list = null, kind = null;
-    function endList() { list = null; kind = null; }
-    function into(k, cls) {
-      if (kind !== k) {
-        list = document.createElement(k === 'ol' ? 'ol' : 'ul');
-        list.className = cls;
-        frag.appendChild(list);
-        kind = k;
+    var i = 0, taskIndex = 0;
+    /*
+     * Open lists, outermost first. Nesting is decided by indentation rather than
+     * by a fixed step, so a list written with two spaces and one written with
+     * four both nest — which matters because an itinerary is usually pasted from
+     * somewhere else and its indentation is whatever that somewhere used.
+     */
+    var stack = [];
+    function endList() { stack.length = 0; }
+
+    function listAt(indent, kind, cls) {
+      while (stack.length && indent < stack[stack.length - 1].indent) stack.pop();
+      var top = stack[stack.length - 1];
+      if (top && indent === top.indent) {
+        if (top.kind === kind) return top;
+        stack.pop();  // bullets turning into numbers at the same level: a new list
       }
-      return list;
+      var el = document.createElement(kind === 'ol' ? 'ol' : 'ul');
+      el.className = cls;
+      var parent = stack[stack.length - 1];
+      // Hung off the parent's last item, so a sub-list indents under its owner
+      // instead of restarting at the margin.
+      if (parent && parent.lastLi) parent.lastLi.appendChild(el);
+      else if (parent) parent.el.appendChild(el);
+      else frag.appendChild(el);
+      var frame = { indent: indent, el: el, kind: kind, lastLi: null };
+      stack.push(frame);
+      return frame;
+    }
+
+    function addItem(indent, kind, cls, li) {
+      var frame = listAt(indent, kind, cls);
+      frame.el.appendChild(li);
+      frame.lastLi = li;
+      return li;
     }
 
     while (i < lines.length) {
@@ -870,6 +1001,56 @@
         i++; continue;
       }
 
+      if (RE_RULE.test(line)) {
+        endList();
+        frag.appendChild(document.createElement('hr'));
+        i++; continue;
+      }
+
+      if (isTableAt(lines, i)) {
+        endList();
+        var aligns = alignsOf(lines[i + 1]);
+        var heads = splitRow(lines[i]);
+        // A table is the one thing that genuinely cannot always fit 390px, so it
+        // gets its own scroll container rather than pushing the whole thread
+        // sideways. Overflow is contained, never inflicted on the page.
+        var twrap = document.createElement('div');
+        twrap.className = 'mdtablewrap';
+        twrap.setAttribute('role', 'region');
+        twrap.setAttribute('aria-label', 'table');
+        twrap.tabIndex = 0;   // reachable, and scrollable, by keyboard too
+        var table = document.createElement('table');
+        table.className = 'mdtable';
+        var thead = document.createElement('thead');
+        var hrow = document.createElement('tr');
+        for (var c = 0; c < heads.length; c++) {
+          var th = document.createElement('th');
+          if (aligns[c]) th.style.textAlign = aligns[c];
+          inlineInto(th, heads[c]);
+          hrow.appendChild(th);
+        }
+        thead.appendChild(hrow);
+        table.appendChild(thead);
+        var tbody = document.createElement('tbody');
+        i += 2;
+        while (i < lines.length && lines[i].trim() && lines[i].indexOf('|') !== -1) {
+          var cells = splitRow(lines[i]);
+          var tr = document.createElement('tr');
+          for (var c2 = 0; c2 < Math.max(cells.length, heads.length); c2++) {
+            var td = document.createElement('td');
+            if (aligns[c2]) td.style.textAlign = aligns[c2];
+            inlineInto(td, cells[c2] === undefined ? '' : cells[c2]);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+          i++;
+        }
+        table.appendChild(tbody);
+        twrap.appendChild(table);
+        frag.appendChild(twrap);
+        continue;
+      }
+
       if ((m = RE_QUOTE.exec(line))) {
         endList();
         var q = document.createElement('div');
@@ -885,21 +1066,22 @@
       }
 
       if ((m = RE_TASK.exec(line))) {
-        into('task', 'mdtasks').appendChild(taskNode(m[2], /x/i.test(m[1]), entry, taskIndex++));
+        addItem(indentOf(m[1]), 'task', 'mdtasks',
+          taskNode(m[3], /x/i.test(m[2]), entry, taskIndex++));
         i++; continue;
       }
 
       if ((m = RE_BULLET.exec(line))) {
         var li = document.createElement('li');
-        inlineInto(li, m[1]);
-        into('ul', 'mdlist').appendChild(li);
+        inlineInto(li, m[2]);
+        addItem(indentOf(m[1]), 'ul', 'mdlist', li);
         i++; continue;
       }
 
       if ((m = RE_ORDER.exec(line))) {
         var oli = document.createElement('li');
-        inlineInto(oli, m[2]);
-        into('ol', 'mdlist').appendChild(oli);
+        inlineInto(oli, m[3]);
+        addItem(indentOf(m[1]), 'ol', 'mdlist', oli);
         i++; continue;
       }
 
@@ -907,11 +1089,14 @@
       var p = document.createElement('p');
       p.className = 'mdp';
       var first = true;
-      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i], lines, i)) {
         if (!first) p.appendChild(document.createElement('br'));
         inlineInto(p, lines[i]);
         first = false; i++;
       }
+      // A line that is only a block *start* by lookahead must still be consumed
+      // somewhere, or this loop would never advance.
+      if (first) { inlineInto(p, lines[i]); i++; }
       frag.appendChild(p);
     }
     return frag;
@@ -919,95 +1104,161 @@
 
   // ---------------------------------------------------------------- checklists
   /*
-   * A ticked box has to survive a reload, and it has to reach Vikunja, which is
-   * where "what is left to pack" actually lives. Two sources of truth for that
-   * is the failure worth avoiding, so this does not keep its own list: the tick
-   * renders instantly from local state, and posts a message asking the
-   * conversation's agent to make the change in Vikunja. The browser never
-   * touches Vikunja and therefore never holds a Vikunja credential.
+   * A ticked box is SERVER STATE. It has to survive a reload, a second device
+   * and a restart of the server, and — the actual point of the feature — an
+   * agent has to be able to read it: "check things off and have Claude notice."
+   * A tick that only one browser knows about satisfies none of that, so
+   * localStorage is no longer where this lives. `POST /tasks/:entryId/checks`
+   * writes it to the event log, `GET` reads it back, and the state arrives with
+   * every thread poll on `entry.checklist`.
    *
-   * WHICH MEANS THE TICK CAN LIE. The agent may be idle, dead, or holding a
-   * token that Vikunja has expired — and it will expire, they always do. A
-   * checkbox that silently shows "done" when nothing was written is worse than
-   * one that is slow, so a tick that has not been confirmed does not look like
-   * one that has: it carries the word "saving", or "not confirmed", or "not
-   * saved", and the row is striped. Idle and broken must not look the same.
+   * WHICH LEAVES ONE HONEST FAILURE MODE: the write can be in flight, or he can
+   * be on a plane. The tick shows immediately either way, because waiting for a
+   * round trip to move a checkbox feels broken — but a tick that has not landed
+   * MUST NOT look like one that has. It carries a word: "saving" while in
+   * flight, "queued — offline" when there is no network, "not saved — tap to
+   * retry" when the server refused. Idle and broken never look the same.
    *
-   * Confirmation reuses machinery that already exists rather than inventing a
-   * protocol: the posted message is an ordinary queue task, so its lifecycle
-   * (pending -> claimed -> answered) is already tracked and already pushed over
-   * SSE. Answered means an agent acted. If the agent later restates the list
-   * with the box ticked, the message text itself agrees and the local record
-   * stops mattering at all.
+   * Nothing is ever silently dropped. An offline tick goes to the outbox in
+   * localStorage and is retried when the browser comes back, and on every poll
+   * after that; only a write the server actively rejects (a 4xx — a message that
+   * no longer exists, an index off the end) stops being retried, and that one
+   * says so on the row.
    */
-  var CHECKS_KEY = 'relay.checks';
-  var MAX_CHECKS = 400;      // the record is a cache, not a store; keep it bounded
-  var UNSURE_AFTER_MS = 240000; // 4 min unanswered: say so rather than keep spinning
-  var checksMem = null;
+  var OUTBOX_KEY = 'relay.checks.outbox';
+  var MAX_OUTBOX = 200;
+  var outboxMem = null;
+  /* Live checkbox rows, so a status change repaints just those rather than
+     re-rendering the thread under his thumb. Rebuilt by every render(). */
+  var taskRows = [];
 
-  function allChecks() {
-    if (checksMem) return checksMem;
-    try { checksMem = JSON.parse(pref(CHECKS_KEY) || '{}') || {}; } catch (e) { checksMem = {}; }
-    return checksMem;
+  function outbox() {
+    if (outboxMem) return outboxMem;
+    try { outboxMem = JSON.parse(pref(OUTBOX_KEY) || '{}') || {}; } catch (e) { outboxMem = {}; }
+    return outboxMem;
   }
-  function checkState(key) { return allChecks()[key] || null; }
-  function setCheck(key, val) {
-    var all = allChecks();
-    all[key] = val;
-    var keys = Object.keys(all);
-    if (keys.length > MAX_CHECKS) {
-      keys.sort(function (a, b) { return (all[a].at || 0) - (all[b].at || 0); });
-      for (var i = 0; i < keys.length - MAX_CHECKS; i++) delete all[keys[i]];
+  function saveOutbox() {
+    var box = outbox();
+    var keys = Object.keys(box);
+    if (keys.length > MAX_OUTBOX) {
+      keys.sort(function (a, b) { return (box[a].at || 0) - (box[b].at || 0); });
+      for (var i = 0; i < keys.length - MAX_OUTBOX; i++) delete box[keys[i]];
     }
-    try { pref(CHECKS_KEY, JSON.stringify(all)); } catch (e) { /* stays in memory only */ }
+    try { pref(OUTBOX_KEY, JSON.stringify(box)); } catch (e) { /* memory only */ }
+  }
+  function outKey(entryId, index) { return entryId + '#' + index; }
+  function outRec(entryId, index) { return outbox()[outKey(entryId, index)] || null; }
+
+  /* Who ticked it. There is no login here, so the honest answer is which device
+     — which is still the useful one when a list is shared with an agent. */
+  function checkAuthor() {
+    try { return 'web/' + String(deviceId()).slice(0, 8); } catch (e) { return 'web'; }
   }
 
-  /*
-   * What to say about this tick, in words. Returns null when there is nothing
-   * to say — the tick is either untouched by us or known to have landed.
-   */
-  function checkMark(key, st, agreesWithSource) {
-    if (!st) return null;                 // never touched here: the text is the truth
-    if (agreesWithSource) return null;    // the agent has restated it our way
-    if (st.done) return null;             // we watched the task get answered
-    if (st.failed) return { cls: 'failed', text: 'not saved — tap to retry' };
-    if (st.taskId) {
-      var task = entries.get(st.taskId);
-      if (task && task.status === 'done') {
-        st.done = true; setCheck(key, st);  // remember it, so eviction cannot un-confirm it
-        return null;
-      }
-      if (Date.now() - (st.at || 0) > UNSURE_AFTER_MS) {
-        return { cls: 'unsure', text: 'not confirmed' };
-      }
-      return { cls: 'saving', text: 'saving' };
-    }
+  /** The server's word on one item, when the thread has told us. */
+  function serverItem(entry, idx) {
+    var cl = entry && entry.checklist;
+    return (cl && cl.items && cl.items[idx]) || null;
+  }
+
+  /* What to say about this tick, in words. null when there is nothing to say. */
+  function checkMark(rec) {
+    if (!rec) return null;                       // settled: the server agrees
+    if (rec.state === 'queued') return { cls: 'unsure', text: 'queued — offline' };
+    if (rec.state === 'failed') return { cls: 'failed', text: 'not saved — tap to retry' };
     return { cls: 'saving', text: 'saving' };
   }
 
-  function paintTask(li, mark, key, st, agreesWithSource) {
-    var m = checkMark(key, st, agreesWithSource);
-    mark.className = 'tmark' + (m ? ' ' + m.cls : '');
-    mark.textContent = m ? m.text : '';
-    mark.hidden = !m;
-    li.className = 'mdtask' + ((st ? st.on : false) ? ' on' : '') +
+  function paintTask(row) {
+    var rec = outRec(row.entryId, row.index);
+    var srv = serverItem(entries.get(row.entryId), row.index);
+    var on = rec ? !!rec.on : (srv ? !!srv.checked : row.inText);
+    var m = checkMark(rec);
+    row.box.checked = on;
+    row.mark.className = 'tmark' + (m ? ' ' + m.cls : '');
+    row.mark.textContent = m ? m.text : '';
+    row.mark.hidden = !m;
+    row.li.className = 'mdtask' + (on ? ' on' : '') +
       (m && m.cls === 'failed' ? ' broken' : m ? ' unsettled' : '');
+    // Who and when, for a tick the server has recorded. Not shouted on the row —
+    // it is the answer to a question you only sometimes ask.
+    if (srv && srv.source === 'checked' && srv.by) {
+      row.lab.title = (srv.checked ? 'ticked' : 'un-ticked') + ' by ' + srv.by +
+        (srv.at ? ' · ' + absolute(srv.at) : '');
+    } else {
+      row.lab.title = '';
+    }
   }
 
+  function paintAllTasks() { for (var i = 0; i < taskRows.length; i++) paintTask(taskRows[i]); }
+
+  /** Fold a checklist the server just returned into the entry we are showing. */
+  function applyChecklist(entryId, cl) {
+    var e = entries.get(entryId);
+    if (e && cl) e.checklist = { total: cl.total, done: cl.done, items: cl.items };
+  }
+
+  function sendCheck(entryId, index, on) {
+    var k = outKey(entryId, index);
+    var box = outbox();
+    box[k] = { entryId: entryId, index: index, on: !!on, at: Date.now(), state: 'sending' };
+    saveOutbox();
+    paintAllTasks();
+    return fetch('/tasks/' + encodeURIComponent(entryId) + '/checks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ index: index, on: !!on, by: checkAuthor() })
+    }).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok) {
+          var err = new Error((j && j.error) || ('HTTP ' + r.status));
+          // 4xx is the server saying "never, stop asking"; 5xx is "not now".
+          err.permanent = r.status >= 400 && r.status < 500;
+          throw err;
+        }
+        return j;
+      });
+    }).then(function (j) {
+      delete outbox()[k];
+      saveOutbox();
+      if (j && j.checklist) applyChecklist(entryId, j.checklist);
+      paintAllTasks();
+    }).catch(function (err) {
+      var rec = outbox()[k];
+      if (!rec) return;
+      // Offline is not a failure. It is a write that has not happened yet, and
+      // saying "not saved" about it would be a lie in the alarming direction.
+      var offline = (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+        (!err.permanent && /network|fetch|load failed/i.test(String(err && err.message)));
+      rec.state = err.permanent ? 'failed' : (offline ? 'queued' : 'failed');
+      rec.permanent = !!err.permanent;
+      rec.error = (err && err.message) || 'network error';
+      saveOutbox();
+      paintAllTasks();
+    });
+  }
+
+  /** Retry everything the network lost. Called on reconnect and on every poll. */
+  function flushOutbox() {
+    var box = outbox();
+    var keys = Object.keys(box);
+    for (var i = 0; i < keys.length; i++) {
+      var rec = box[keys[i]];
+      if (!rec || rec.state === 'sending' || rec.permanent) continue;
+      sendCheck(rec.entryId, rec.index, rec.on);
+    }
+  }
+  // Coming back from a tunnel is the case this is for: the ticks he made
+  // underground go up the moment there is signal, without him doing anything.
+  try { window.addEventListener('online', flushOutbox); } catch (e) { /* no matter; the poll retries too */ }
+
   function taskNode(label, checkedInSource, entry, idx) {
-    var key = (entry && entry.id ? entry.id : '?') + ':' + idx;
-    var conv = (entry && entry.conversationId) || activeConv;
-    var st = checkState(key);
-    // The message text is the source of truth until this device changes it —
-    // the queue is append-only, so a message can never be rewritten in place.
-    var on = st ? !!st.on : checkedInSource;
-    if (st) st.on = on;
+    var entryId = (entry && entry.id) ? entry.id : '?';
 
     var li = document.createElement('li');
     var lab = document.createElement('label');
     var box = document.createElement('input');
     box.type = 'checkbox';
-    box.checked = on;
 
     var span = document.createElement('span');
     span.className = 'tlabel';
@@ -1021,37 +1272,16 @@
     lab.appendChild(span);
     li.appendChild(lab);
     li.appendChild(mark);
-    paintTask(li, mark, key, st, st ? st.on === checkedInSource : true);
 
-    function send(want) {
-      var rec = { on: want, taskId: null, done: false, failed: false, at: Date.now() };
-      setCheck(key, rec);
-      paintTask(li, mark, key, rec, want === checkedInSource);
-      var plain = String(label).replace(/\s+/g, ' ').trim().slice(0, 200);
-      postTask((want ? 'Checked off: “' : 'Un-checked: “') + plain +
-        (want ? '” — please tick it off in Vikunja.'
-          : '” — please un-tick it in Vikunja.'), 'checklist', conv)
-        .then(function (j) {
-          rec.taskId = (j && j.id) || null;
-          rec.failed = false;
-          setCheck(key, rec);
-          paintTask(li, mark, key, rec, want === checkedInSource);
-          // Show the message we just posted without waiting for the next poll.
-          if (conv === activeConv) poll(false);
-        })
-        .catch(function (err) {
-          rec.failed = true;
-          rec.error = (err && err.message) || 'network error';
-          setCheck(key, rec);
-          paintTask(li, mark, key, rec, want === checkedInSource);
-        });
-    }
+    var row = { entryId: entryId, index: idx, li: li, lab: lab, box: box, mark: mark, inText: !!checkedInSource };
+    taskRows.push(row);
+    paintTask(row);
 
-    box.addEventListener('change', function () { send(!!box.checked); });
+    box.addEventListener('change', function () { sendCheck(entryId, idx, !!box.checked); });
     // A failed write is not a dead end: the marker is the retry button.
     mark.addEventListener('click', function () {
-      var cur = checkState(key);
-      if (cur && cur.failed) send(!!cur.on);
+      var cur = outRec(entryId, idx);
+      if (cur && cur.state === 'failed') sendCheck(entryId, idx, !!cur.on);
     });
     return li;
   }
@@ -1095,6 +1325,7 @@
     var stick = !everRendered || nearBottom();
 
     var frag = document.createDocumentFragment();
+    taskRows = [];   // every row is about to be rebuilt; the old ones are detached
     for (var i = 0; i < all.length; i++) frag.appendChild(nodeFor(all[i]));
     list.textContent = '';
     list.appendChild(frag);
@@ -1432,6 +1663,9 @@
           return false;
         }
         fails = 0; setConn(true);
+        // The network is demonstrably up, so anything a tick lost to it can go
+        // now. Cheap: it does nothing at all unless something is actually stuck.
+        flushOutbox();
         return true;
       })
       .catch(function () { fails++; setConn(false); return false; });

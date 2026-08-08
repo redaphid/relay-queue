@@ -164,6 +164,15 @@ let vapidKeys = null;
 const tasks = new Map();
 /** @type {Map<string, object>} id -> conversation (insertion order == creation order) */
 const conversations = new Map();
+/*
+ * Ticked checkboxes, keyed by THREAD ENTRY id rather than task id — a checklist
+ * usually arrives as an agent's *result*, which projects to the derived entry
+ * `<taskId>:r`, and a single task can therefore carry two independent lists.
+ * Value: { [index]: { on, by, at } }. The message text stays the source of truth
+ * for the items themselves; this only records the ticks made from a page, which
+ * is the one thing the append-only text can never be rewritten to express.
+ */
+const checks = new Map();
 let logFd = null;
 let mutations = 0; // bumped on every applied event; memoisation keys off it
 
@@ -217,6 +226,12 @@ function applyEvent(ev) {
     subscriptions.delete(ev.id);
   } else if (ev.t === 'pushcfg') {
     pushConfig = { ...pushConfig, ...ev.cfg };
+  } else if (ev.t === 'check') {
+    // One tick. Last write wins, and the record keeps who and when, because
+    // "who ticked this" is the first question asked of a shared list.
+    let row = checks.get(ev.entryId);
+    if (!row) { row = {}; checks.set(ev.entryId, row); }
+    row[String(ev.index)] = { on: !!ev.on, by: ev.by || null, at: ev.at };
   }
   // An unknown `t` is ignored, as it always has been: a log written by a newer
   // build replays on an older one without tripping it.
@@ -232,6 +247,7 @@ function appendEvent(ev) {
   // Push to live pages, post-durability.
   if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
   else if (ev.t === 'sub' || ev.t === 'unsub' || ev.t === 'pushcfg') { /* not thread state; nothing to stream */ }
+  else if (ev.t === 'check') broadcast(taskIdOfEntry(ev.entryId));
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
   // An agent acting is what clears the deadman banner, and it must clear at once
   // rather than up to a tick later — recovery has to feel immediate to be trusted.
@@ -433,11 +449,271 @@ function entriesOf(t) {
       conversationId,
     });
   }
+  /*
+   * A tick is a change to the entry, so it has to move `rev` — a client polling
+   * `since=<rev>` would otherwise never be told, and his second device would sit
+   * showing a stale list until something unrelated happened in the thread.
+   */
+  for (const e of out) {
+    const row = checks.get(e.id);
+    if (!row) continue;
+    const cl = checklistOf(e.id);
+    if (!cl) continue;
+    e.checklist = { total: cl.total, done: cl.done, items: cl.items };
+    let latest = msOf(e.rev);
+    for (const k of Object.keys(row)) latest = Math.max(latest, msOf(row[k].at));
+    e.rev = new Date(latest).toISOString();
+  }
   return out;
 }
 
 /** A task's conversation, defaulting for records written before they existed. */
 const convIdOf = (t) => (typeof t.conversationId === 'string' && t.conversationId ? t.conversationId : DEFAULT_CONV);
+
+// ---------------------------------------------------------------- checklists
+/*
+ * A ticked box has to survive a reload, a second device, and a server restart,
+ * so it is stored here rather than in one browser's localStorage — and it has
+ * to be READABLE BY AN AGENT, which is the whole point of the feature: "check
+ * things off and have Claude notice."
+ *
+ * The items themselves are never stored. They are parsed out of the message
+ * text on demand, so there is exactly one source of truth for *what is on the
+ * list* (the message, which is append-only and cannot be rewritten) and exactly
+ * one for *what is ticked* (the `check` events). Those two cannot drift apart,
+ * because neither is a copy of the other. Editing is impossible by
+ * construction; a corrected list is a new message, which correctly starts with
+ * fresh ticks rather than inheriting stale ones.
+ *
+ * The index is the ordinal of the task line within the message, counted exactly
+ * as the browser counts it — the client and the server MUST agree here, so the
+ * fence-skipping below mirrors the page's renderer line for line. A checkbox
+ * inside a fenced code block is sample text, not a task, on both sides.
+ */
+const RE_TASKLINE = /^(\s*)[-*+]\s+\[([ xX])\]\s*(.*)$/;
+const RE_FENCELINE = /^\s*(?:```|~~~)/;
+
+/** Task-list items in a message, in document order. Fenced code is not a list. */
+function parseChecklist(text) {
+  const out = [];
+  const lines = String(text == null ? '' : text).split(/\r?\n/);
+  let fenced = false;
+  for (const line of lines) {
+    if (RE_FENCELINE.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = RE_TASKLINE.exec(line);
+    if (!m) continue;
+    out.push({
+      index: out.length,
+      depth: Math.floor(m[1].replace(/\t/g, '    ').length / 2),
+      label: m[3].trim(),
+      checkedInText: /x/i.test(m[2]),
+    });
+  }
+  return out;
+}
+
+/** `abc-123:r` -> `abc-123`. A derived reply entry belongs to its own task. */
+const taskIdOfEntry = (entryId) => String(entryId || '').replace(/:r$/, '');
+
+/**
+ * The text an entry id names, or null if there is no such entry. `<id>` is the
+ * instruction, `<id>:r` the agent's result — the two halves `entriesOf` builds.
+ */
+function entryTextOf(entryId) {
+  const id = String(entryId || '');
+  const isReply = /:r$/.test(id);
+  const task = tasks.get(taskIdOfEntry(id));
+  if (!task) return null;
+  if (isReply) {
+    if (task.result === null || task.result === undefined) return null;
+    return { task, text: asText(task.result), role: 'agent' };
+  }
+  return { task, text: asText(task.instruction), role: task.role === 'agent' ? 'agent' : 'user' };
+}
+
+/**
+ * The live state of one entry's checklist: the parsed items, with any tick that
+ * a page has made laid over the text's own `[x]`. Returns null when the entry
+ * has no task list at all, so "no checklist here" is distinguishable from "an
+ * empty one".
+ */
+function checklistOf(entryId) {
+  const found = entryTextOf(entryId);
+  if (!found) return null;
+  const items = parseChecklist(found.text);
+  if (!items.length) return null;
+  const row = checks.get(String(entryId)) || {};
+  let done = 0;
+  const out = items.map((it) => {
+    const rec = row[String(it.index)];
+    const checked = rec ? !!rec.on : it.checkedInText;
+    if (checked) done++;
+    return {
+      index: it.index,
+      label: it.label,
+      depth: it.depth,
+      checked,
+      // Where this value came from, so an agent can tell "he ticked it" from
+      // "it was written already ticked" without guessing.
+      source: rec ? 'checked' : 'text',
+      by: rec ? rec.by || null : null,
+      at: rec ? rec.at || null : null,
+    };
+  });
+  return {
+    entryId: String(entryId),
+    taskId: found.task.id,
+    conversationId: convIdOf(found.task),
+    role: found.role,
+    total: out.length,
+    done,
+    remaining: out.length - done,
+    items: out,
+  };
+}
+
+/** Every checklist in the queue, newest task last. Optionally one conversation. */
+function allChecklists(conversationId) {
+  const out = [];
+  for (const t of tasks.values()) {
+    if (isInternal(t)) continue;
+    if (conversationId && convIdOf(t) !== conversationId) continue;
+    for (const entryId of [t.id, `${t.id}:r`]) {
+      const cl = checklistOf(entryId);
+      if (cl) out.push(cl);
+    }
+  }
+  return out;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * HOW AN AGENT FINDS OUT — and why this is debounced rather than immediate.
+ *
+ * Ticking a box has to reach an agent, because "check it off and have Claude
+ * notice" is the feature; a checkbox that only a browser knows about is a
+ * to-do app, and he already has one of those. But a coordinator only wakes on
+ * *pending work in its own conversation*, and the human's thread is for things
+ * he needs to read — so one message per tap would be both the only thing that
+ * works and completely unusable. Six items ticked while packing is six
+ * interruptions in the thread he reads on his phone.
+ *
+ * So a burst of taps settles into ONE notification. The timer restarts on every
+ * tick, so it fires after he stops, not on a fixed schedule, and a list worked
+ * through steadily produces a single line at the end of it.
+ *
+ * Two things are written, deliberately:
+ *   - a `checklist` CHANNEL message, always. Internal, excluded from his thread
+ *     and from SSE, so it costs him nothing and gives an agent a durable, `since`
+ *     -pollable record of exactly what changed.
+ *   - a PENDING task in the conversation, which is the only construct that
+ *     actually wakes that conversation's coordinator. Terse and worth reading:
+ *     what he ticked, and what is left.
+ *
+ * It never pushes and never speaks. He performed this action himself, seconds
+ * ago, with his own thumb — notifying him of it would be pure noise, and the
+ * push budget is spent on things he does not already know.
+ * ---------------------------------------------------------------------------
+ */
+const CHECK_SETTLE_MS = Number(process.env.CHECK_SETTLE_MS || 20000);
+const CHECK_CHANNEL = 'checklist';
+/** conversationId -> { timer, changes: Map<string, {label, on, by, entryId}> } */
+const checkNotices = new Map();
+
+/** One line of a summary, flattened so a label can never become markup itself. */
+function safeLabel(s) {
+  return String(s || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^[\s>#*+-]+/, '')   // cannot open a list, heading or quote
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || '(untitled item)';
+}
+
+function noticeText(conversationId, changes) {
+  const on = changes.filter((c) => c.on);
+  const off = changes.filter((c) => !c.on);
+  const lines = [];
+  if (on.length) lines.push(`Ticked off: ${on.map((c) => safeLabel(c.label)).join('; ')}`);
+  if (off.length) lines.push(`Un-ticked: ${off.map((c) => safeLabel(c.label)).join('; ')}`);
+  // Where each touched list now stands, so the agent does not have to go and ask.
+  const seen = new Set(changes.map((c) => c.entryId));
+  for (const entryId of seen) {
+    const cl = checklistOf(entryId);
+    if (!cl) continue;
+    const left = cl.items.filter((i) => !i.checked).map((i) => safeLabel(i.label));
+    lines.push(`List ${entryId}: ${cl.done}/${cl.total} done` +
+      (left.length ? `, still open: ${left.slice(0, 12).join('; ')}${left.length > 12 ? ` (+${left.length - 12} more)` : ''}` : ', all done'));
+  }
+  return lines.join('\n').slice(0, MAX_TEXT);
+}
+
+function flushCheckNotice(conversationId) {
+  const rec = checkNotices.get(conversationId);
+  if (!rec) return;
+  checkNotices.delete(conversationId);
+  if (rec.timer) clearTimeout(rec.timer);
+  const changes = [...rec.changes.values()];
+  if (!changes.length) return;
+  const body = noticeText(conversationId, changes);
+  const ts = nowIso();
+
+  // 1. The durable, thread-free record. An agent polls
+  //    /messages?channel=checklist&since=… and sees every change with no noise.
+  appendEvent({
+    t: 'create',
+    task: {
+      id: newId(),
+      role: 'agent',
+      instruction: body,
+      from: 'checklist',
+      author: 'checklist',
+      ts,
+      status: 'done',
+      claimedBy: null, claimedAt: null, result: null, resultTs: null,
+      relayed: true, relayedAt: ts,
+      visibility: 'internal',
+      channel: CHECK_CHANNEL,
+      conversationId: `#${CHECK_CHANNEL}`,
+      // Kept so a channel reader can tell which real conversation this came from.
+      about: conversationId,
+    },
+  });
+
+  // 2. The wake-up. Only a pending task in the conversation rouses its
+  //    coordinator, so this is the half that makes "Claude notices" true.
+  if (conversations.has(conversationId)) {
+    const ts2 = nowIso();
+    appendEvent({
+      t: 'create',
+      task: {
+        id: newId(),
+        role: DEFAULT_ROLE, // he did this; it is his action, not an agent's
+        conversationId,
+        instruction: body,
+        from: 'checklist',
+        ts: ts2,
+        status: 'pending',
+        claimedBy: null, claimedAt: null, result: null, resultTs: null,
+        relayed: false, relayedAt: null,
+      },
+    });
+    // Deliberately no notify(): see the comment above. He just did this.
+  }
+}
+
+/** Record one tick for the batch, and (re)arm the settle timer. */
+function queueCheckNotice(conversationId, entryId, index, label, on) {
+  let rec = checkNotices.get(conversationId);
+  if (!rec) { rec = { timer: null, changes: new Map() }; checkNotices.set(conversationId, rec); }
+  // Keyed by item: ticking and un-ticking the same box before it settles is one
+  // net change, and settles to whatever it ended up as — usually nothing at all.
+  rec.changes.set(`${entryId}#${index}`, { entryId, index, label, on });
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => flushCheckNotice(conversationId), CHECK_SETTLE_MS);
+  if (rec.timer.unref) rec.timer.unref(); // never hold the process open for this
+}
 
 function threadEntries(conversationId) {
   const out = [];
@@ -2246,6 +2522,48 @@ function createTask(res, body) {
   send(res, 201, task);
 }
 
+/*
+ * POST /tasks/:entryId/checks — one checkbox changed.
+ *
+ * Idempotent by value: sending `on: true` twice is one state, not two events,
+ * and the second is a no-op that still answers 200 with the current list. That
+ * matters because the page retries this call after being offline, and a retry
+ * must never be able to double-toggle a box he only touched once.
+ */
+function setCheckRoute(res, entryId, body) {
+  const cl = checklistOf(entryId);
+  if (!cl) {
+    return fail(res, 404, `no checklist on entry "${entryId}"`, {
+      hint: 'the entry must exist and its text must contain at least one "- [ ]" line',
+    });
+  }
+  const index = Number(body.index);
+  if (!Number.isInteger(index) || index < 0 || index >= cl.total) {
+    return fail(res, 400, `index must be an integer 0..${cl.total - 1}`, { total: cl.total });
+  }
+  if (typeof body.on !== 'boolean') return fail(res, 400, 'on is required and must be true or false');
+  const by = readString(body.by !== undefined ? body.by : body.who, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  const before = cl.items[index];
+  if (before.checked === body.on && before.source === 'checked') {
+    // Already exactly this, and already recorded. Nothing to log, nothing to
+    // tell an agent — but the caller still gets the truth back.
+    return send(res, 200, { changed: false, checklist: checklistOf(entryId) });
+  }
+
+  appendEvent({
+    t: 'check',
+    entryId: String(entryId),
+    index,
+    on: body.on,
+    by: by || 'web',
+    at: nowIso(),
+  });
+  queueCheckNotice(cl.conversationId, String(entryId), index, before.label, body.on);
+  return send(res, 200, { changed: true, checklist: checklistOf(entryId) });
+}
+
 /** Is this claim old enough that another agent may take it? See CLAIM_LEASE_MS. */
 function leaseOf(task) {
   if (task.status !== 'claimed') return null;
@@ -2751,9 +3069,30 @@ async function route(req, res) {
     return send(res, 200, { count: list.length, now: nowIso(), entries: list });
   }
 
-  // /tasks/:id/(claim|result|relayed)
+  // /checklists — every task list in the queue, or in one conversation.
+  // This is the "what is on his list right now" question, answerable by an agent
+  // in one call without parsing the thread itself.
+  if (seg.length === 1 && seg[0] === 'checklists') {
+    if (!need('GET')) return;
+    const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+    let list = allChecklists(conv || null);
+    const open = q.get('open');
+    if (open !== null && open !== 'false' && open !== '0') list = list.filter((c) => c.remaining > 0);
+    return send(res, 200, { count: list.length, checklists: list });
+  }
+
+  // /tasks/:id/(claim|result|relayed|checks)
   if (seg.length === 3 && seg[0] === 'tasks') {
     const [, id, action] = seg;
+    if (action === 'checks') {
+      if (m === 'GET') {
+        const cl = checklistOf(id);
+        if (!cl) return fail(res, 404, `no checklist on entry "${id}"`);
+        return send(res, 200, cl);
+      }
+      if (m === 'POST') return setCheckRoute(res, id, await readBody(req));
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
     if (action === 'claim' || action === 'result' || action === 'relayed') {
       if (!need('POST')) return;
       const body = await readBody(req);

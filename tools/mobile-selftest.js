@@ -69,17 +69,97 @@ const CONVS = {
   conversations: [conv('main', 'Main', 'Zora', 'watching'), conv('iceland', 'Iceland', 'Iceland', 'idle')],
 };
 
+/*
+ * An itinerary, which is the other half of what he asked for: times, dates and
+ * ordered steps. It is here because a TABLE is the one construct that genuinely
+ * cannot fit 390px, and a table that pushes the page sideways takes the
+ * composer with it — the exact failure this suite exists to catch.
+ */
+{
+  const ts = new Date(now - 60000).toISOString();
+  ENTRIES.push({
+    id: 'itinerary', role: 'agent', status: 'done', ts, rev: ts, conversationId: 'main',
+    text: [
+      '## Saturday',
+      '',
+      '| Time | Place | Getting there | Notes |',
+      '|------|-------|--------------:|-------|',
+      '| 09:15 | Keflavik airport | Flybus, 45 min | boarding pass on phone |',
+      '| 11:00 | Reykjavik, Laugavegur 22 | walk, 10 min | check-in is not until 14:00 |',
+      '| 19:30 | Dinner, Grandi Matholl | bus 14 | book ahead on a Saturday |',
+      '',
+      '---',
+      '',
+      '1. Land and clear customs',
+      '   - keep the passport out',
+      '   - the SIM kiosk is past baggage',
+      '2. Flybus to the city',
+      '',
+      '> The forecast is 4C and horizontal rain.',
+    ].join('\n'),
+  });
+}
+
 // The checklist the user actually asked for, at the end so it is on screen.
 {
   const ts = new Date(now - 30000).toISOString();
   ENTRIES.push({
     id: 'packing', role: 'agent', status: 'done', ts, rev: ts, conversationId: 'main',
-    text: '## Iceland packing\n\n- [ ] passport and boarding pass\n- [ ] travel adapters\n- [x] wool socks\n- [ ] waterproof shell\n\nSee [the forecast](https://example.com/wx). Injection attempt: <img src=x onerror=alert(1)> and [tap](javascript:alert(2)).',
+    text: '## Iceland packing\n\n- [ ] passport and boarding pass\n- [ ] travel adapters\n  - [ ] USB-C to USB-C\n  - [ ] the UK three-pin one\n- [x] wool socks\n- [ ] waterproof shell\n\nSee [the forecast](https://example.com/wx). Injection attempt: <img src=x onerror=alert(1)> and [tap](javascript:alert(2)).',
   });
+}
+
+/*
+ * The server's checklist store, modelled exactly as server.js keeps it: items
+ * are parsed out of the message text, ticks are held separately, and the two are
+ * merged on read. Fence-skipping is mirrored deliberately — if this drifts from
+ * the page's parser, the indices stop lining up and every box writes to the
+ * wrong item.
+ */
+const CHECKS = {};
+function checklistOf(entryId) {
+  const e = ENTRIES.find((x) => x.id === entryId);
+  if (!e) return null;
+  const items = [];
+  let fenced = false;
+  for (const line of String(e.text).split(/\r?\n/)) {
+    if (/^\s*(?:```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = /^(\s*)[-*+]\s+\[([ xX])\]\s*(.*)$/.exec(line);
+    if (!m) continue;
+    const idx = items.length;
+    const rec = CHECKS[entryId + '#' + idx];
+    items.push({
+      index: idx,
+      label: m[3].trim(),
+      depth: Math.floor(m[1].replace(/\t/g, '    ').length / 2),
+      checked: rec ? !!rec.on : /x/i.test(m[2]),
+      source: rec ? 'checked' : 'text',
+      by: rec ? rec.by : null,
+      at: rec ? rec.at : null,
+    });
+  }
+  if (!items.length) return null;
+  return {
+    entryId, taskId: entryId, conversationId: 'main', role: 'agent',
+    total: items.length,
+    done: items.filter((i) => i.checked).length,
+    remaining: items.filter((i) => !i.checked).length,
+    items,
+  };
+}
+/** An entry as the wire carries it: `checklist` only once something is ticked. */
+function wire(e) {
+  const hasTick = Object.keys(CHECKS).some((k) => k.slice(0, k.lastIndexOf('#')) === e.id);
+  if (!hasTick) return e;
+  const cl = checklistOf(e.id);
+  if (!cl) return e;
+  return { ...e, checklist: { total: cl.total, done: cl.done, items: cl.items } };
 }
 
 let sse = [];
 const posted = [];
+const checkPosts = [];
 const clientLogs = [];
 const pushPosts = [];
 // What /push/config answers: a browser that is NOT yet armed, and quiet hours
@@ -148,7 +228,27 @@ const server = http.createServer((req, res) => {
     let e = ENTRIES;
     if (since) e = e.filter((x) => Date.parse(x.rev) > since);
     else if (lim) e = e.slice(-lim);
-    return json({ entries: e });
+    return json({ entries: e.map(wire) });
+  }
+  // POST /tasks/:entryId/checks — a checkbox, written server-side.
+  const mChk = /^\/tasks\/([^/]+)\/checks$/.exec(u.pathname);
+  if (mChk) {
+    const entryId = decodeURIComponent(mChk[1]);
+    if (req.method === 'GET') {
+      const cl = checklistOf(entryId);
+      if (!cl) { res.writeHead(404); return res.end('{}'); }
+      return json(cl);
+    }
+    let b = '';
+    req.on('data', (d) => { b += d; });
+    req.on('end', () => {
+      let body = {};
+      try { body = JSON.parse(b); } catch (e) { /* ignore */ }
+      checkPosts.push({ entryId, body });
+      CHECKS[entryId + '#' + body.index] = { on: !!body.on, by: body.by, at: new Date().toISOString() };
+      json({ changed: true, checklist: checklistOf(entryId) });
+    });
+    return;
   }
   if (u.pathname === '/conversations') return json(CONVS);
   if (u.pathname === '/status') return json({ headline: { text: 'ok' }, counts: {} });
@@ -344,23 +444,103 @@ function REACHABLE(sel) {
   const closed = await page.evaluate(() => document.querySelector('#drawer').hidden);
   check('Escape closes it again', closed === true, String(closed));
 
+  console.log('\nthe itinerary fits a 390px phone');
+  {
+    // Scroll the itinerary into view; it sits just above the packing list.
+    await page.evaluate(() => {
+      const t = document.querySelector('#list .mdtablewrap');
+      if (t) t.scrollIntoView({ block: 'center' });
+    });
+    await page.waitForTimeout(200);
+
+    const table = await page.evaluate(() => {
+      const wrap = document.querySelector('#list .mdtablewrap');
+      if (!wrap) return null;
+      const tbl = wrap.querySelector('table');
+      const w = wrap.getBoundingClientRect();
+      return {
+        wrapLeft: Math.round(w.left), wrapRight: Math.round(w.right),
+        vw: window.innerWidth,
+        wrapScrollW: wrap.scrollWidth, wrapClientW: wrap.clientWidth,
+        tableW: Math.round(tbl.getBoundingClientRect().width),
+        rows: tbl.querySelectorAll('tbody tr').length,
+        cols: tbl.querySelectorAll('thead th').length,
+        overflowX: getComputedStyle(wrap).overflowX,
+      };
+    });
+    check('the itinerary rendered as a real table', !!table && table.rows === 3 && table.cols === 4,
+      JSON.stringify(table));
+    check('*** the table stays inside the viewport ***',
+      table && table.wrapLeft >= -0.5 && table.wrapRight <= table.vw + 0.5, JSON.stringify(table));
+    check('*** a wide table scrolls itself rather than the page ***',
+      table && table.overflowX === 'auto', JSON.stringify(table && table.overflowX));
+
+    // The real assertion: nothing anywhere made the document scroll sideways.
+    const hscroll = await page.evaluate(() => ({
+      docW: document.documentElement.scrollWidth,
+      vw: window.innerWidth,
+      threadW: document.getElementById('thread').scrollWidth,
+      threadC: document.getElementById('thread').clientWidth,
+    }));
+    check('*** the page itself never scrolls sideways ***',
+      hscroll.docW <= hscroll.vw + 0.5, JSON.stringify(hscroll));
+    check('...and neither does the thread', hscroll.threadW <= hscroll.threadC + 0.5,
+      JSON.stringify(hscroll));
+
+    const nested = await page.evaluate(() => {
+      const ol = document.querySelector('#list ol.mdlist');
+      if (!ol) return null;
+      const sub = ol.querySelector('ul');
+      if (!sub) return { nested: false };
+      const o = ol.getBoundingClientRect(), s = sub.getBoundingClientRect();
+      return { nested: true, indented: s.left > o.left, subRight: Math.round(s.right), vw: window.innerWidth };
+    });
+    check('*** a sub-step is nested under its step, not flattened ***',
+      nested && nested.nested === true, JSON.stringify(nested));
+    check('...and is visibly indented', nested && nested.indented === true, JSON.stringify(nested));
+    check('...without running off the right edge', nested && nested.subRight <= nested.vw + 0.5,
+      JSON.stringify(nested));
+    check('a horizontal rule rendered', (await page.$$('#list hr')).length >= 1);
+  }
+
   console.log('\nthe checklist is usable with a thumb');
   {
-    const boxes = await page.$$('#list .mdtask input[type="checkbox"]');
-    check('the task list renders checkboxes', boxes.length === 4, `${boxes.length}`);
+    await page.evaluate(() => { const l = document.getElementById('list'); l.scrollTop = l.scrollHeight; });
+    await page.evaluate(() => document.getElementById('thread').scrollTo(0, 1e6));
+    await page.waitForTimeout(200);
 
-    // A checkbox you cannot hit is a checkbox you do not have. 24px is about the
-    // floor for a thumb; the row's label is what actually gets tapped.
+    const boxes = await page.$$('#list .mdtask input[type="checkbox"]');
+    check('the task list renders checkboxes, nested ones included', boxes.length === 6, `${boxes.length}`);
+    check('the nested sub-tasks are in a list of their own',
+      (await page.$$('#list .mdtasks .mdtasks')).length === 1,
+      `${(await page.$$('#list .mdtasks .mdtasks')).length}`);
+
+    /*
+     * A checkbox you cannot hit is a checkbox you do not have, and 44px is the
+     * floor that reliably works with a thumb — the LABEL is the target, not the
+     * 24px box, so the whole row is tappable.
+     */
     const sizes = await page.evaluate(() => Array.from(document.querySelectorAll('#list .mdtask'))
       .map((li) => {
         const b = li.getBoundingClientRect();
         const box = li.querySelector('input');
+        const lab = li.querySelector('label');
         const cb = box.getBoundingClientRect();
+        const lb = lab.getBoundingClientRect();
         const hit = document.elementFromPoint(cb.left + cb.width / 2, cb.top + cb.height / 2);
-        return { rowH: Math.round(b.height), boxW: Math.round(cb.width), reachable: !!(hit && (hit === box || box.contains(hit) || li.contains(hit))) };
+        return {
+          rowH: Math.round(b.height), labH: Math.round(lb.height), labW: Math.round(lb.width),
+          boxW: Math.round(cb.width), right: Math.round(b.right), vw: window.innerWidth,
+          reachable: !!(hit && (hit === box || box.contains(hit) || li.contains(hit))),
+        };
       }));
-    check('every row is big enough to hit', sizes.every((s) => s.rowH >= 30 && s.boxW >= 20), JSON.stringify(sizes));
+    check('*** every row is a 44px tap target ***',
+      sizes.every((s) => s.rowH >= 44 && s.labH >= 44), JSON.stringify(sizes));
+    check('...with a box big enough to see', sizes.every((s) => s.boxW >= 22), JSON.stringify(sizes));
+    check('...and a label wide enough to aim at', sizes.every((s) => s.labW >= 120), JSON.stringify(sizes));
     check('every checkbox is actually reachable', sizes.every((s) => s.reachable), JSON.stringify(sizes));
+    check('no row overflows the viewport, nesting included',
+      sizes.every((s) => s.right <= s.vw + 0.5), JSON.stringify(sizes));
     check('the list does not overflow the bubble width',
       await page.evaluate(() => {
         const l = document.querySelector('#list .mdtasks').getBoundingClientRect();
@@ -371,17 +551,23 @@ function REACHABLE(sel) {
     const injected = await page.evaluate(() => ({
       imgs: document.querySelectorAll('#list img').length,
       scripts: document.querySelectorAll('#list script').length,
+      iframes: document.querySelectorAll('#list iframe').length,
+      handlers: Array.from(document.querySelectorAll('#list *'))
+        .filter((n) => Array.from(n.attributes || []).some((a) => /^on/i.test(a.name))).length,
       hrefs: Array.from(document.querySelectorAll('#list a')).map((a) => a.getAttribute('href')),
       shown: document.querySelector('#list .msg:last-child .body').textContent.indexOf('onerror') >= 0,
     }));
     check('*** no element is created from message markup ***',
-      injected.imgs === 0 && injected.scripts === 0, JSON.stringify(injected));
+      injected.imgs === 0 && injected.scripts === 0 && injected.iframes === 0, JSON.stringify(injected));
+    check('*** and no event handler attribute survives anywhere in the thread ***',
+      injected.handlers === 0, JSON.stringify(injected));
     check('*** only allowlisted schemes become links ***',
       injected.hrefs.length === 1 && injected.hrefs[0] === 'https://example.com/wx', JSON.stringify(injected.hrefs));
     check('...and the rejected markup is still visible as text', injected.shown, JSON.stringify(injected));
 
     // Tick one, as a finger would.
     posted.length = 0;
+    checkPosts.length = 0;
     await page.click('#list .mdtask:first-child label');
     await page.waitForTimeout(1200);
     const ticked = await page.evaluate(() => {
@@ -393,22 +579,27 @@ function REACHABLE(sel) {
       };
     });
     check('tapping the row ticks the box straight away', ticked.checked === true, JSON.stringify(ticked));
-    check('the agent is told, with the item and the Vikunja request',
-      posted.length === 1 && /passport/.test(posted[0].text) && /vikunja/i.test(posted[0].text),
+    check('*** the tick is written to the server ***',
+      checkPosts.length === 1 && checkPosts[0].entryId === 'packing' && checkPosts[0].body.index === 0,
+      JSON.stringify(checkPosts));
+    check('...recording which device did it', checkPosts[0] && /^web\//.test(String(checkPosts[0].body.by)),
+      JSON.stringify(checkPosts[0] && checkPosts[0].body.by));
+    check('*** and NOTHING is posted into his thread ***', posted.length === 0,
       JSON.stringify(posted));
-    check('*** an unconfirmed tick says so rather than looking done ***',
-      /saving/i.test(ticked.mark) && /unsettled/.test(ticked.cls), JSON.stringify(ticked));
+    check('...and once it has landed the row stops flagging itself',
+      !/unsettled|broken/.test(ticked.cls) && ticked.mark.trim() === '', JSON.stringify(ticked));
 
     // And it must come back ticked after a reload, since that is the whole point.
     await page.reload({ waitUntil: 'load' });
     await page.waitForTimeout(1800);
+    await page.evaluate(() => document.getElementById('thread').scrollTo(0, 1e6));
     const afterReload = await page.evaluate(() => {
       const li = document.querySelector('#list .mdtask:first-child');
       return li ? { checked: li.querySelector('input').checked, mark: li.querySelector('.tmark').textContent } : null;
     });
     check('*** the tick survives a reload ***', afterReload && afterReload.checked === true, JSON.stringify(afterReload));
-    check('...and is still honest about not being confirmed',
-      afterReload && /saving|not confirmed/i.test(afterReload.mark), JSON.stringify(afterReload));
+    check('...cleanly, because the server is the one saying so',
+      afterReload && afterReload.mark.trim() === '', JSON.stringify(afterReload));
 
     for (const [name, sel] of [['the message box', '#input'], ['the hamburger menu', '#menu'], ['Send', '#send']]) {
       const r = await page.evaluate(REACHABLE, sel);
@@ -931,6 +1122,8 @@ function REACHABLE(sel) {
     !clientLogs.some((l) => l.event === 'page-vanished'),
     JSON.stringify(clientLogs.map((l) => l.event)));
 
+  await plain.close();
+
   /*
    * ================================================================ offline
    *
@@ -1127,6 +1320,54 @@ function REACHABLE(sel) {
   }
 
   await octx.close();
+
+  /*
+   * A SECOND AND THIRD WIDTH. Everything above drives 390x844, so a break at any
+   * other phone width passed silently — which is the exact failure mode this
+   * suite was built to catch, reintroduced one viewport over. 360px is the
+   * commonest Android width by a distance, and 320px is the narrowest screen
+   * still in use; a table and an indented checklist are the two things most
+   * likely to burst at either.
+   */
+  for (const vp of [{ width: 360, height: 740, name: '360x740 (a common Android)' },
+    { width: 320, height: 568, name: '320x568 (the narrowest still in use)' }]) {
+    console.log(`\nthe same page at ${vp.name}`);
+    const ctx2 = await browser.newContext({ viewport: { width: vp.width, height: vp.height }, userAgent: UA });
+    const p2 = await ctx2.newPage();
+    await p2.goto(base, { waitUntil: 'load' });
+    await p2.waitForTimeout(1500);
+    await p2.evaluate(() => document.getElementById('thread').scrollTo(0, 1e6));
+    await p2.waitForTimeout(300);
+
+    for (const [name, sel] of [['the message box', '#input'], ['the hamburger menu', '#menu'], ['Send', '#send']]) {
+      const r = await p2.evaluate(REACHABLE, sel);
+      check(`${name} is reachable`, r.ok, r.why);
+    }
+    const geo = await p2.evaluate(() => {
+      const rows = Array.from(document.querySelectorAll('#list .mdtask'));
+      const wrap = document.querySelector('#list .mdtablewrap');
+      return {
+        docW: document.documentElement.scrollWidth,
+        vw: window.innerWidth,
+        threadW: document.getElementById('thread').scrollWidth,
+        threadC: document.getElementById('thread').clientWidth,
+        rows: rows.length,
+        minRowH: rows.length ? Math.min(...rows.map((r) => Math.round(r.getBoundingClientRect().height))) : 0,
+        minLabH: rows.length ? Math.min(...rows.map((r) => Math.round(r.querySelector('label').getBoundingClientRect().height))) : 0,
+        maxRight: rows.length ? Math.max(...rows.map((r) => Math.round(r.getBoundingClientRect().right))) : 0,
+        tableIn: wrap ? (wrap.getBoundingClientRect().right <= window.innerWidth + 0.5) : null,
+      };
+    });
+    check('*** the page never scrolls sideways ***', geo.docW <= geo.vw + 0.5, JSON.stringify(geo));
+    check('...and neither does the thread', geo.threadW <= geo.threadC + 0.5, JSON.stringify(geo));
+    check('the checklist is still there', geo.rows === 6, JSON.stringify(geo.rows));
+    check('*** every row is still a 44px tap target ***',
+      geo.minRowH >= 44 && geo.minLabH >= 44, JSON.stringify(geo));
+    check('no checklist row runs off the right edge', geo.maxRight <= geo.vw + 0.5, JSON.stringify(geo));
+    check('the itinerary table stays contained', geo.tableIn === true, JSON.stringify(geo));
+    await ctx2.close();
+  }
+
   await browser.close();
   server.close();
   console.log(failed ? `\n${failed} check(s) FAILED` : '\nall checks passed');
