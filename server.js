@@ -148,9 +148,24 @@ const PUSH_DEBOUNCE_MS = { 'needs-you': 15000, done: 15000, broken: 3000 };
 const PUSH_DEBOUNCE_OVERRIDE = Number(process.env.PUSH_DEBOUNCE_MS || 0) || null;
 const PUSH_TTL_SEC = { 'needs-you': 6 * 3600, done: 6 * 3600, broken: 3600 };
 const PUSH_URGENCY = { 'needs-you': 'high', done: 'normal', broken: 'high' };
-// The page labels its own posts, so this is how "he typed it" is told apart
-// from "an agent handed him something". Never buzz the phone that sent it.
-const PAGE_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
+/*
+ * The page labels its own posts, so this is how "he typed it" is told apart
+ * from "an agent handed him something". Never buzz the phone that sent it.
+ *
+ * ADDING A UI ACTION? ADD ITS ORIGIN HERE, IN THE SAME COMMIT.
+ *
+ * This is an allowlist whose default is *notify*, which makes forgetting it
+ * silent and self-inflicted rather than merely wrong. `checklist` was missing:
+ * ticking a box on his own phone posts a task with from:'checklist', fell
+ * through to `return 'needs-you'`, and pushed a notification back at the very
+ * phone that had just sent it. He ticked a box and got buzzed about it, by
+ * himself. Every future UI origin will do exactly the same until it is listed.
+ *
+ * The safer shape is the inverse — treat everything as his unless it is a known
+ * agent — but `from` is a free-text field that agents also set, so there is no
+ * reliable way to invert it today. Hence the shouting comment.
+ */
+const PAGE_ORIGINS = new Set(['web', 'voice', 'voice-conversation', 'checklist']);
 
 /** @type {Map<string, object>} id -> { id, endpoint, p256dh, auth, ua, label, createdAt } */
 const subscriptions = new Map();
@@ -2201,6 +2216,13 @@ function pushConfigRoute(res, body) {
  * An explicit `notify` hint still wins over all of it (that is the opt-in), and
  * notify:"none" still silences everything, including rule zero's own categories.
  * If you are about to widen a default here: don't. Add a hint at the caller.
+ *
+ * The hazard that survives all of the above is PAGE_ORIGINS, which the `task`
+ * branch consults. It is an allowlist whose default is "notify", so any new UI
+ * action that posts from an origin nobody remembered to add will buzz the very
+ * phone that sent it. That is not hypothetical: `checklist` was missing, and
+ * his own tick paged him. Read the comment on PAGE_ORIGINS before you add a
+ * posting surface — the wrong rule was never written, it was merely omitted.
  */
 function classify(kind, task, hint) {
   if (!task || isInternal(task)) return null; // rule zero, before anything else

@@ -278,11 +278,23 @@ console.log('\nagent-to-agent channel traffic NEVER reaches his phone');
 
 console.log('\nthe page never buzzes the phone that just sent the message');
 {
-  for (const from of ['web', 'voice', 'voice-conversation']) {
+  /*
+   * `checklist` is in this list for a reason. It was missing: ticking a box on
+   * his own phone posts a task with from:'checklist', which fell through to
+   * 'needs-you' and pushed a notification back at the phone that had just sent
+   * it — he ticked a box and got buzzed about it, by himself. PAGE_ORIGINS is
+   * an allowlist that defaults to NOTIFY, so every posting surface the UI grows
+   * must be added here or it will do this again. Any new origin belongs in this
+   * loop on the same day it is invented.
+   */
+  for (const from of ['web', 'voice', 'voice-conversation', 'checklist']) {
     check(`a task he typed from "${from}" does not notify`, classify('task', { from, conversationId: 'main' }, null) === null);
   }
   check('a task from an agent does notify', classify('task', { from: 'vega', conversationId: 'main' }, null) === 'needs-you');
   check('a task from nobody notifies', classify('task', { from: null, conversationId: 'main' }, null) === 'needs-you');
+  // The result side reads the same list, so a tick he is waiting on still lands.
+  check('...and the answer to a checklist tick is still "done"',
+    classify('result', { role: 'user', from: 'checklist', conversationId: 'main' }, null) === 'done');
 }
 
 console.log('\npushing is OPT-IN: an agent that says nothing wakes nobody');
@@ -473,6 +485,16 @@ async function overHttp() {
       }) === 0);
     check('...and the result answering it DOES queue one',
       await queuedBy(() => post(`/tasks/${hisTaskId}/result`, { result: 'here you go' })) === 1);
+
+    /*
+     * The tick-buzzes-himself bug, over the wire. from:'checklist' was not in
+     * PAGE_ORIGINS, so his own tick fell through to 'needs-you' and pushed
+     * straight back at the phone that had just sent it.
+     */
+    check('ticking a checklist box on his own phone queues nothing',
+      await queuedBy(() => post('/tasks', {
+        text: 'Checked off: “buy milk” — please tick it off in Vikunja.', from: 'checklist',
+      })) === 0);
 
     console.log('\nover HTTP: and that one is specifically the "done" category');
     {
