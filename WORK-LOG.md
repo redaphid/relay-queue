@@ -134,9 +134,36 @@ work. Prune this section when you finish something, not later.)*
    coverage. Ten checks were written and passed against a throwaway copy of the
    harness outside the repo, so the work is mostly done — it just needs merging
    once the config agent is out of that file. Serialize; do not open it early.
-2. Second viewport in the selftest. It only drives 390×844, so a break at any
-   other phone width passes silently — which is the exact failure mode the
-   suite was built to catch.
+2. ~~Second viewport in the selftest.~~ **Done 2026-08-08** on `markdown-rich`:
+   `tools/mobile-selftest.js` now also drives **360×744** and **320×568** after
+   the main 390×844 pass, asserting reachability of the composer, menu and Send,
+   no horizontal scroll on the document or the thread, 44px checklist rows, and
+   a contained itinerary table at each width.
+
+## Checklists are server state now (2026-08-08, branch `markdown-rich`)
+
+Markdown rendering shipped in `82a7f29` that morning; this finishes it. The
+renderer gained **tables, horizontal rules and nested lists** — the three things
+"itineraries" actually needs, and the reason a pasted sub-list used to flatten
+to the margin. The checkbox stopped being a localStorage flag: a tick is now a
+`check` event in `events.jsonl`, keyed by thread-entry id, carrying who and when.
+
+- Read it: `GET /tasks/<entryId>/checks`, `GET /checklists[?conversation=&open=1]`.
+- Write it: `POST /tasks/<entryId>/checks {index,on,by}` — idempotent by value.
+- **The full contract is in `COORDINATOR.md`**; read that rather than this.
+
+Two traps worth carrying forward. **The page and the server each parse the
+message text to number the items**, so a `- [ ]` inside a fence must be sample
+text on both sides or every box after it writes to the wrong item — asserted
+from both ends, in `checklist-selftest.js` and `ui-selftest.js`. And **a tick
+must move the entry's `rev`**, or a client polling `since=` is never told and his
+second device sits stale until something unrelated happens in the thread.
+
+The geometry suite earned its keep again: at 390px a nested sub-list became a
+*flex sibling* of its parent label and squeezed that tap target from 287px to
+113px. Nothing in the stub suite could see it. Also caught by eye and not by any
+test, then fixed: the bubble's `overflow-wrap: anywhere` was splitting `09:15`
+across two lines inside a table, so cells now wrap between words only.
 
 ## Reusable capabilities worth knowing
 
