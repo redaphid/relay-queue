@@ -28,6 +28,8 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
+const ICONS = require('../icons.js');
+
 const PAGE = path.join(__dirname, '..', 'public', 'index.html');
 const PORT = Number(process.env.PORT || 3995);
 // A phone, not a small desktop window. iPhone/Pixel-class portrait.
@@ -97,12 +99,48 @@ const PUSHCFG = {
   budgetLeft: 20,
   stats: { queued: 0, flushed: 0, suppressedQuiet: 0, suppressedBudget: 0, delivered: 0 },
 };
+/*
+ * Which build the stand-in server is currently serving. The offline suite at
+ * the bottom changes it mid-run and then insists the browser notices, which is
+ * the only way to prove that a cached page cannot outlive a deploy.
+ */
+let BUILD = 'one';
+
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
-  const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+  // `no-store` because the real server sends it on every JSON route. Without it
+  // Firefox's own HTTP cache can answer a read while offline, which would make
+  // the offline suite pass on evidence that does not exist in production.
+  const json = (o) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify(o));
+  };
   if (u.pathname === '/') {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    return res.end(fs.readFileSync(PAGE));
+    const html = fs.readFileSync(PAGE, 'utf8')
+      .replace('<title>relay</title>', '<title>relay</title>\n<meta name="build" content="' + BUILD + '">');
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      // The real server sends this, and the worker refuses to cache a shell
+      // without it. Omitting it here would make the offline suite test nothing.
+      'x-relay-app': '1',
+      'cache-control': 'no-store',
+    });
+    return res.end(html);
+  }
+  if (u.pathname === '/manifest.webmanifest') {
+    res.writeHead(200, { 'content-type': 'application/manifest+json; charset=utf-8' });
+    return res.end(JSON.stringify({
+      name: 'relay', short_name: 'relay', start_url: '/', scope: '/', display: 'standalone',
+      background_color: '#0e1116', theme_color: '#0e1116',
+      icons: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' }],
+    }));
+  }
+  {
+    const png = ICONS.icon(u.pathname.slice(1));
+    if (png) {
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': png.length });
+      return res.end(png);
+    }
   }
   if (u.pathname === '/thread') {
     const since = Number(u.searchParams.get('since') || 0);
@@ -152,6 +190,38 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(404); res.end();
 });
+
+/*
+ * Really unplugging it.
+ *
+ * context.setOffline(true) is not enough, and believing it was would have made
+ * the whole offline suite worthless: in Firefox it stops the PAGE reaching the
+ * network but leaves the SERVICE WORKER able to fetch normally. The worker
+ * would quietly serve live data, every assertion about reading from cache would
+ * pass for the wrong reason, and none of it would hold on a plane.
+ *
+ * So the server is actually stopped, connections and all. Nothing in the
+ * browser can reach it, by any thread, which is what "offline" means here.
+ * setOffline is still used alongside it, because navigator.onLine and the
+ * `offline` event are part of what the page reacts to.
+ */
+async function netDown(ctx) {
+  await ctx.setOffline(true);
+  await new Promise((resolve) => {
+    server.close(resolve);
+    // Keep-alive sockets and the open SSE stream would otherwise hold the
+    // server up long past the point the test needs it gone.
+    if (server.closeAllConnections) server.closeAllConnections();
+  });
+}
+
+async function netUp(ctx) {
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(PORT, '127.0.0.1', resolve);
+  });
+  await ctx.setOffline(false);
+}
 
 let failed = 0;
 function check(name, pass, detail) {
@@ -574,6 +644,202 @@ function REACHABLE(sel) {
     !clientLogs.some((l) => l.event === 'page-vanished'),
     JSON.stringify(clientLogs.map((l) => l.event)));
 
+  /*
+   * ================================================================ offline
+   *
+   * The part that cannot be taken on trust. A manifest and a registered worker
+   * prove nothing about whether he can read his messages on a plane, so this
+   * installs the app for real, pulls the network out, reloads, and looks at
+   * what is on the screen.
+   *
+   * It runs in its own context so that the service worker, its caches and the
+   * offline switch cannot leak into the suites above or be polluted by them.
+   */
+  console.log('\noffline — the thread is readable with the network gone');
+  const octx = await browser.newContext({ viewport: VIEWPORT, userAgent: UA });
+  {
+    const op = await octx.newPage();
+    await op.goto(base, { waitUntil: 'load' });
+
+    // Installed and in charge of the page, which is when it starts saving.
+    const controlled = await op.evaluate(() => navigator.serviceWorker.ready
+      .then(() => new Promise((r) => {
+        if (navigator.serviceWorker.controller) return r(true);
+        navigator.serviceWorker.addEventListener('controllerchange', () => r(true));
+        setTimeout(() => r(!!navigator.serviceWorker.controller), 4000);
+      })).catch(() => false));
+    check('the worker installs and takes control of the page', controlled === true, String(controlled));
+
+    // Give the cache-warming read that initOffline() fires time to land.
+    await op.waitForTimeout(1500);
+
+    const cached = await op.evaluate(() => caches.keys().then((names) => Promise.all(
+      names.map((n) => caches.open(n).then((c) => c.keys().then((k) => [n, k.map((r) => r.url)])))
+    )).catch(() => []));
+    const flat = JSON.stringify(cached);
+    check('the shell is saved', /relay-shell/.test(flat) && /"[^"]*\/"/.test(flat), flat.slice(0, 300));
+    check('...and so is the thread, which is the point of all this',
+      /relay-data/.test(flat) && /__relay-offline\/thread/.test(flat), flat.slice(0, 400));
+    check('...under one key per conversation, not one per request',
+      (flat.match(/__relay-offline\/thread/g) || []).length === 1, flat.slice(0, 400));
+    check('the live stream is never cached', flat.indexOf('/events') === -1, flat.slice(0, 400));
+
+    const onlineCount = await op.evaluate(() => document.querySelectorAll('#list .msg').length);
+    check('the thread rendered while online', onlineCount > 100, String(onlineCount));
+
+    // ---- and now the network goes away, for real ----
+    await netDown(octx);
+    await op.reload({ waitUntil: 'load' });
+    /*
+     * Long enough to clear the worker's DATA_TIMEOUT_MS, and that is the point.
+     *
+     * Playwright's offline emulation in Firefox reaches the page but not the
+     * service worker: the worker's own fetch to a stopped server does not fail,
+     * it hangs. That is annoying for the harness and lucky for the product,
+     * because it means what gets tested here is the HARDER case — a connection
+     * that never answers, the hotel-wifi and train-tunnel case — rather than a
+     * clean refusal. A real phone in airplane mode never reaches this path at
+     * all: navigator.onLine is false in the worker and the saved copy comes
+     * back instantly. If the slow path works, the instant one does too.
+     */
+    await op.waitForTimeout(8000);
+
+    const off = await op.evaluate(() => ({
+      msgs: document.querySelectorAll('#list .msg').length,
+      bar: document.getElementById('offbar').className,
+      barText: document.getElementById('offbar').textContent,
+      conn: document.getElementById('conn').textContent,
+      connShown: document.getElementById('conn').className,
+      sendOff: document.getElementById('send').disabled,
+      placeholder: document.getElementById('input').placeholder,
+      title: document.title,
+    }));
+
+    /*
+     * On failure, say what was in the store and which conversation was on
+     * screen. A bare "0" sends the next person hunting blind, and the two
+     * things that have actually gone wrong here — nothing saved, or saved under
+     * a key nobody asks for — are told apart by exactly this.
+     */
+    const why = off.msgs > 100 ? '' : JSON.stringify(await op.evaluate(() => caches.open('relay-data-v1')
+      .then((c) => c.keys()).then((k) => k.map((r) => r.url)).catch((e) => String(e))));
+    check('*** the history is on screen with no network at all ***', off.msgs > 100,
+      String(off.msgs) + ' saved=' + why + ' hash=' + (await op.evaluate(() => location.hash)));
+    check('...and it is the real page, not an error page', off.title === 'relay', off.title);
+    check('the page says it is offline', /show/.test(off.connShown), off.connShown);
+    check('...and says the messages are saved ones, not current',
+      /saved/.test(off.conn), JSON.stringify(off.conn));
+    check('the offline bar is up', /show/.test(off.bar), off.bar);
+    check('...saying plainly that nothing can be sent',
+      /nothing can be sent/i.test(off.barText), JSON.stringify(off.barText));
+    check('...and that what he types is not lost',
+      /stays in the box/i.test(off.barText), JSON.stringify(off.barText));
+    check('the Send button is disabled', off.sendOff === true);
+    check('...and the composer says why', /Offline/.test(off.placeholder), off.placeholder);
+
+    /*
+     * The worst outcome this feature could produce: a message that looks sent
+     * and never arrives. Enter bypasses the disabled button, so it is the path
+     * that has to be proven.
+     */
+    const before = posted.length;
+    await op.fill('#input', 'this must not vanish');
+    await op.press('#input', 'Enter');
+    await op.waitForTimeout(600);
+    const after = await op.evaluate(() => ({
+      text: document.getElementById('input').value,
+      err: document.getElementById('err').textContent,
+      shown: document.getElementById('err').className,
+    }));
+    check('pressing Enter offline does not pretend to send', posted.length === before, String(posted.length - before));
+    check('...the words are still in the box', after.text === 'this must not vanish', after.text);
+    check('...and it says so, and stays said', /show/.test(after.shown) && /sticky/.test(after.shown), after.shown);
+    check('...in words about being offline', /Offline/i.test(after.err), JSON.stringify(after.err));
+
+    // ---- and comes back ----
+    await netUp(octx);
+    await op.evaluate(() => { document.getElementById('input').value = ''; });
+    await op.reload({ waitUntil: 'load' });
+    await op.waitForTimeout(2000);
+    const back = await op.evaluate(() => ({
+      bar: document.getElementById('offbar').className,
+      sendOff: document.getElementById('send').disabled,
+      conn: document.getElementById('conn').className,
+    }));
+    check('coming back online clears the offline bar', !/show/.test(back.bar), back.bar);
+    check('...re-enables Send', back.sendOff === false);
+    check('...and stops claiming to be offline', !/show/.test(back.conn), back.conn);
+
+    await op.close();
+  }
+
+  /*
+   * The failure mode that would strand him: a saved page outliving the deploy
+   * that replaced it. The checkout is the deployment here, so this is the check
+   * that earns the right to cache anything at all.
+   */
+  console.log('\noffline — a saved page can never outlive a deploy');
+  {
+    const up = await octx.newPage();
+    await up.goto(base, { waitUntil: 'load' });
+    await up.evaluate(() => navigator.serviceWorker.ready).catch(() => {});
+    await up.waitForTimeout(1200);
+    const first = await up.evaluate(() => document.querySelector('meta[name=build]').content);
+    check('the installed app is on the first build', first === 'one', first);
+
+    // Offline, it is allowed — expected, even — to show what it saved.
+    await netDown(octx);
+    await up.reload({ waitUntil: 'load' });
+    await up.waitForTimeout(800);
+    check('...which is what it shows when offline',
+      (await up.evaluate(() => document.querySelector('meta[name=build]').content)) === 'one');
+
+    // Now ship. This is exactly `git merge` on the live box.
+    BUILD = 'two';
+    await netUp(octx);
+    await up.reload({ waitUntil: 'load' });
+    await up.waitForTimeout(800);
+    const second = await up.evaluate(() => document.querySelector('meta[name=build]').content);
+    check('*** the moment the network is back, the new build wins ***', second === 'two', second);
+
+    // And the saved copy must have been replaced too, or the next flight shows
+    // a build he has already been shown is out of date.
+    await netDown(octx);
+    await up.reload({ waitUntil: 'load' });
+    await up.waitForTimeout(800);
+    const third = await up.evaluate(() => document.querySelector('meta[name=build]').content);
+    check('...and what is saved for next time is the new one', third === 'two', third);
+
+    await netUp(octx);
+    await up.close();
+  }
+
+  /*
+   * A cold install: a phone that has never seen the app, offline from the
+   * start. It must not be a browser error page — he should be told there is
+   * nothing saved yet, which is a different problem with a different fix.
+   */
+  console.log('\noffline — a phone with nothing saved says so');
+  {
+    const cold = await browser.newContext({ viewport: VIEWPORT, userAgent: UA });
+    const cp = await cold.newPage();
+    await cp.goto(base, { waitUntil: 'load' });
+    await cp.evaluate(() => navigator.serviceWorker.ready).catch(() => {});
+    await cp.waitForTimeout(1000);
+    // Throw away everything the worker saved, then pull the plug: the same
+    // state as an install that never completed.
+    await cp.evaluate(() => caches.keys().then((n) => Promise.all(n.map((x) => caches.delete(x)))));
+    await netDown(cold);
+    await cp.reload({ waitUntil: 'load' }).catch(() => {});
+    await cp.waitForTimeout(600);
+    const body = await cp.evaluate(() => document.body.textContent).catch(() => '');
+    check('it explains itself rather than showing a browser error',
+      /Offline/i.test(body) && /saved/i.test(body), JSON.stringify(String(body).slice(0, 200)));
+    await netUp(cold);
+    await cold.close();
+  }
+
+  await octx.close();
   await browser.close();
   server.close();
   console.log(failed ? `\n${failed} check(s) FAILED` : '\nall checks passed');

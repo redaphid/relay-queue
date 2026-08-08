@@ -183,7 +183,10 @@ function workingMic(store) {
 function makeEnv(opts) {
   const ids = ['thread', 'list', 'empty', 'input', 'send', 'err', 'conn', 'mic', 'voice', 'vtext',
     'convo', 'spk', 'vstop', 'menu', 'menudot', 'title', 'drawer', 'scrim', 'drawerclose',
-    'newtitle', 'newconv', 'converr', 'convlist'];
+    'newtitle', 'newconv', 'converr', 'convlist',
+    // The offline banner and the composer it sits above. Both are core chrome:
+    // the page is entitled to assume they exist, so the stub must have them.
+    'offbar', 'composer'];
   const els = {};
   ids.forEach((id) => { els[id] = makeEl(id === 'input' || id === 'newtitle' ? 'textarea' : 'div'); });
   els.drawer.hidden = true;

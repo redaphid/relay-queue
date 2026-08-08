@@ -536,13 +536,89 @@ async function pushChecks() {
         String(sw.headers.get('cache-control')).indexOf('no-store') >= 0);
       const body = await sw.text();
       check('...and it handles push events', body.indexOf("addEventListener('push'") >= 0);
-      check('...and caches nothing at all', body.indexOf('caches.open') === -1);
+      check('...and it still handles the tap on one', body.indexOf("addEventListener('notificationclick'") >= 0);
+
+      /*
+       * This block used to assert that the worker cached NOTHING — no
+       * `caches.open` anywhere — because the checkout is the deployment and a
+       * cached shell is how you ship a page nobody can update.
+       *
+       * It now caches, deliberately, so the thread can be read with no signal.
+       * The old assertion is replaced rather than dropped, because the fear
+       * behind it was right and has not gone away. What follows pins the
+       * properties that make caching survivable, which is a stronger claim than
+       * "does not cache" ever was.
+       */
+      check('the worker never serves the shell from cache ahead of the network',
+        /Promise\.race\(\[net, patience\]\)/.test(body) && body.indexOf('caches.match') === -1, 'network-first missing');
+      check('...it only saves a shell the server vouched for',
+        body.indexOf('x-relay-app') >= 0, 'the Access login page could be cached as the app');
+      check('...its caches are versioned', /const VERSION = /.test(body));
+      check('...and every older one of ours is deleted on activate',
+        body.indexOf('caches.delete(n)') >= 0 && body.indexOf("n.indexOf('relay-')") >= 0);
+      check('...a new worker takes over immediately', body.indexOf('skipWaiting') >= 0 && body.indexOf('clients.claim') >= 0);
+      check('...it refuses to touch anything but a GET',
+        /req\.method !== 'GET'/.test(body), 'a cached or replayed POST would be a duplicate message');
+      check('...it marks what it served from cache, so the page can say so',
+        body.indexOf('x-relay-from-cache') >= 0 && body.indexOf('x-relay-cached-at') >= 0);
+      check('...the saved thread is bounded', /MAX_THREADS/.test(body) && body.indexOf('prune') >= 0);
+      check('...and there is a way to throw it all away from the page',
+        body.indexOf('forget-offline') >= 0);
 
       const page = await fetch(`${base}/`);
       const csp = String(page.headers.get('content-security-policy'));
       check('the CSP allows a same-origin worker', csp.indexOf("worker-src 'self'") >= 0, csp);
       check('...while still allowing the audio worklet blob', csp.indexOf('blob:') >= 0);
       check('...and default-src is still none', csp.indexOf("default-src 'none'") >= 0);
+      check('...and the manifest is not blocked', csp.indexOf("manifest-src 'self'") >= 0, csp);
+      check('...nor the icon files', csp.indexOf("img-src 'self'") >= 0, csp);
+      check('the shell is stamped so the worker can recognise it',
+        page.headers.get('x-relay-app') === '1', String(page.headers.get('x-relay-app')));
+    }
+
+    console.log('\ninstallable — the manifest and the icons Android insists on');
+    {
+      const mf = await fetch(`${base}/manifest.webmanifest`);
+      check('the manifest is served', mf.status === 200, String(mf.status));
+      check('...with the type that makes it a manifest',
+        String(mf.headers.get('content-type')).indexOf('application/manifest+json') >= 0,
+        String(mf.headers.get('content-type')));
+      const m = JSON.parse(await mf.text());
+      check('...it is standalone, or it is just a bookmark', m.display === 'standalone', m.display);
+      check('...scoped to the whole app', m.scope === '/' && m.start_url === '/');
+      check('...with a short name that fits under an icon',
+        typeof m.short_name === 'string' && m.short_name.length <= 12, m.short_name);
+      /*
+       * Chrome refuses to offer installation without a 192 and a 512, and a
+       * launcher that crops will mangle anything not marked maskable. Both
+       * failures are silent — no prompt, or an icon with its edges cut off —
+       * which is exactly the kind that survives to the phone.
+       */
+      const sizes = (m.icons || []).map((i) => i.sizes);
+      check('...a 192 and a 512, which is what Chrome requires to offer install',
+        sizes.indexOf('192x192') >= 0 && sizes.indexOf('512x512') >= 0, JSON.stringify(sizes));
+      check('...and one marked maskable, so a round launcher does not crop it',
+        (m.icons || []).some((i) => String(i.purpose).indexOf('maskable') >= 0), JSON.stringify(m.icons));
+
+      for (const icon of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png']) {
+        const r = await fetch(`${base}/${icon}`);
+        const buf = Buffer.from(await r.arrayBuffer());
+        check(`/${icon} is a real PNG`,
+          r.status === 200 && buf.subarray(0, 8).toString('hex') === '89504e470d0a1a0a',
+          `${r.status} ${buf.subarray(0, 8).toString('hex')}`);
+      }
+      // The declared size and the actual pixels must agree, or Android quietly
+      // ignores the icon and installs a letter in a grey circle instead.
+      const big = Buffer.from(await (await fetch(`${base}/icon-512.png`)).arrayBuffer());
+      check('...and 512 means 512', big.readUInt32BE(16) === 512 && big.readUInt32BE(20) === 512,
+        `${big.readUInt32BE(16)}x${big.readUInt32BE(20)}`);
+
+      check('an icon that does not exist is a 404, not a file off disk',
+        (await fetch(`${base}/icon-999.png`)).status === 404);
+      // There is no path join anywhere near this route, and this is the check
+      // that says so out loud.
+      const trav = await fetch(`${base}/${encodeURIComponent('../server.js')}`);
+      check('...and the icon route cannot be walked out of', trav.status === 404, String(trav.status));
     }
 
     console.log('\npush — what he armed survives a restart');
