@@ -326,6 +326,18 @@ overturned the theory two agents were working from. **His throwaway line is
 usually the root cause.** Never plan off the status board either — it truncates
 hard and silently, and one message that previewed as four asks contained six.
 
+**When two causes produce the same symptom, ship both and stop relitigating.**
+His composer kept vanishing. "They hide when I scroll" points squarely at the
+address bar collapsing a `100dvh` layout; "the keyboard covers my chat input"
+points at the visual viewport. Both are real, both were reported by him, and a
+coordinator burned three revisions swinging between them as each new sentence
+arrived — treating them as competing theories to be resolved rather than two
+defects to be fixed. The cost was not the wrong fix, it was the churn. **Ask "is
+this an alternative or an addition?" before you overwrite a diagnosis.** And
+when the user contradicts your analysis, he wins immediately and without
+argument: he is holding the phone. Your evidence was about the code; his is
+about what happened to him.
+
 **Check whether it already shipped before you build it.** Two agents spent a
 night on Markdown rendering and tickable checklists that had shipped that
 morning in `82a7f29`, on `main`, live on his phone. One `git log --oneline` and
