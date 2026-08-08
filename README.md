@@ -888,6 +888,49 @@ Dictation, conversation mode and spoken replies all operate on the **active** co
 
 ---
 
+## Checklists
+
+Post a tick list and he can work it from his phone — and **you are told when he
+ticks an item**. This shipped in `82a7f29` and then went unused for a day
+because it was documented nowhere, so it is documented here first.
+
+A line becomes a real checkbox when it matches
+`RE_TASK = /^\s*[-*+]\s+\[([ xX])\]\s*(.*)$/` (`public/index.html:819`):
+
+```
+- [ ] pack the passport
+- [x] hotel confirmed
+```
+
+Marker may be `-`, `*` or `+`. The brackets take a space, `x` or `X` — exactly
+one character. `[]` with nothing between them does **not** match, and it fails
+by rendering as ordinary prose rather than erroring, which is how you conclude
+the feature is broken when it is your syntax. Task lines are tested before plain
+bullets, so a task line never degrades into a bullet.
+
+When he ticks, a message arrives in that conversation — `Checked off: "<item
+text>"`, or `Un-checked: "..."`. It is an ordinary pending task, so it reaches
+an idle agent through SSE and the work poll like anything else. Four things
+follow:
+
+- **Items are matched by TEXT, not an id.** Rewording an item breaks the link.
+- **Ticks live in per-device `localStorage`, not on the server.** They are
+  absent from the event log; only the message replays. So a tick does not follow
+  him to another device, and **re-posting a list wipes its ticks**. Post once,
+  keep the wording fixed, and treat the tick messages as the source of truth.
+- **A check and an uncheck ~0.5 s apart is him testing the button.** Debounce
+  before acting.
+- **POST a `result` to clear the amber "saving" badge.** Claiming alone does not
+  clear it, so his screen stays looking stuck while you think you have replied.
+
+There is **no Vikunja integration** — no `vikunja` anywhere in `server.js`. The
+notification contains an English sentence asking an agent to mirror the item by
+hand; don't, because two hand-kept lists drift apart. Wiring them together
+properly is separate work.
+
+Anything with steps — a packing list, a flight day, a deploy sequence — belongs
+in a tick list rather than prose.
+
 ## The thread model
 
 There is **one** record type and **one** write path. A message from the human *is* the task; the

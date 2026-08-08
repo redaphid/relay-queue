@@ -460,9 +460,26 @@ follow from how it works:
 - **A check and an uncheck ~0.5 s apart is him testing the button**, not
   changing his mind. Debounce; an agent that acts on the first message acts
   wrongly.
-- **Do not hand-mirror items into Vikunja**, even though the message invites it.
-  Two hand-maintained lists drift apart and then neither is trustworthy. Offer
-  to wire them together properly instead — that is separate, real work.
+- **Do not hand-mirror items into Vikunja**, even though the message invites
+  it. Note what that invitation actually is: **there is no Vikunja integration
+  in this codebase at all** — no `vikunja` anywhere in `server.js`, nothing in
+  the browser calling it. The invitation is a plain English sentence inside the
+  notification asking an agent to do it by hand. Two hand-kept lists drift
+  apart and then neither is trustworthy, so decline and offer to wire them
+  together properly.
+
+**Durability — ticks are per-device and fragile.** They live in the browser's
+`localStorage`, not on the server; they are absent from the event log, so only
+the *message* replays. Therefore: a tick survives a reload on that device, does
+**not** follow him to another device, and **re-posting a list wipes its ticks**.
+Post a list once, keep the item text fixed, and treat the incoming tick messages
+as the source of truth rather than the rendered list. Do not repost a refreshed
+copy and expect his progress to survive.
+
+**A tick is an ordinary pending task**, so it reaches an idle agent through SSE
+and the work poll like any other message. **To clear the amber "saving" badge on
+his screen you must POST a `result`** — claiming alone does not do it, which is
+an easy way to leave his UI looking stuck while you believe you have responded.
 
 Anything with steps — a packing list, a flight day, a deploy sequence, a review
 — should be a tick list rather than prose. He can then work it from a phone, and
