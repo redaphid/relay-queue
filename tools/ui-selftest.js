@@ -789,6 +789,48 @@ async function main() {
       JSON.stringify(env.sent()[0] && env.sent()[0].body.text));
   }
 
+  // ======================================= the wedge (messages that never send)
+  /*
+   * Reported as "the page crashes". It does not crash here — it goes silent,
+   * which from a phone is the same thing, and the reload it provokes is what
+   * misroutes the next message into the wrong conversation.
+   *
+   * The mechanism: the debounce re-arms for as long as `stillTalking()` is
+   * true, and that is true for as long as the endpointer sits in its 'speak'
+   * phase. Background noise — a fan, a television, someone packing a suitcase —
+   * refreshes the last-loud timestamp on every frame, so the phase never ends,
+   * so the re-arm never stops, so the message is never posted. The composer
+   * goes on saying "Still listening — sending: …" for ever.
+   */
+  console.log('\nthe wedge — a noisy room cannot defer a message for ever');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.store.sttText = 'this message must not be lost';
+    env.sayOneThing();
+    await settle();
+    check('the transcript is pending, not yet posted', env.sent().length === 0,
+      `${env.sent().length}`);
+
+    // Hold the endpointer in 'speak' the way a noisy room does: never silent
+    // long enough to end the utterance, and never quiet enough to drop out.
+    const noise = setInterval(() => { try { env.feed(200, true); } catch (e) {} }, 100);
+
+    await wait(6000);
+    check('it is still deferred while that looks like speech', env.sent().length === 0,
+      `${env.sent().length} posted too early`);
+
+    await wait(9000); // now past MAX_DEFER_MS since the last real transcript
+    clearInterval(noise);
+    check('*** a wedged endpointer still posts the message ***', env.sent().length === 1,
+      `${env.sent().length} messages — 0 means it is deferring for ever again`);
+    check('...and the words are intact',
+      env.sent()[0] && env.sent()[0].body.text === 'this message must not be lost',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body.text));
+    check('the composer is left clean', env.els.input.value === '',
+      JSON.stringify(env.els.input.value));
+  }
+
   console.log('\nfragmentation — Send cuts it short, and stopping never loses words');
   {
     const env = liveEnv();

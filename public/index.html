@@ -37,7 +37,6 @@
     --user-bg: var(--accent); --user-fg:#ffffff;
     --agent-bg:#ffffff; --agent-fg:#14161a;
     --err-fg:#8a2018; --err-bg:#fdeceb; --off:#c2410c; --rec:#c0271d;
-    --warn-bg:#a5540a; --warn-fg:#ffffff; --alarm-bg:#a81c14; --alarm-fg:#ffffff;
     /* Lifecycle pills: dark text on a light fill in both themes, so contrast
        never depends on which one is active. */
     --pend-bg:#fde68a; --pend-fg:#5c3d00;
@@ -53,7 +52,6 @@
       --user-bg: var(--accent); --user-fg:#08111f;
       --agent-bg:#1a202b; --agent-fg:#e6e8ec;
       --err-fg:#ffb4ab; --err-bg:#3a1714; --off:#fdba74; --rec:#e5484d;
-      --warn-bg:#6f3f04; --warn-fg:#ffe6c4; --alarm-bg:#8c1d18; --alarm-fg:#ffdad6;
       --pend-bg:#facc15; --pend-fg:#3a2800;
       --claim-bg:#c4b5fd; --claim-fg:#2a1157;
       --done-bg:#6ee7b7; --done-fg:#04301f;
@@ -242,10 +240,6 @@
   }
   .scard h2 { margin: 0 0 8px; font-size: 13px; font-weight: 650; color: var(--muted);
     text-transform: uppercase; letter-spacing: .04em; }
-  /* Abandoned claims: the one card that must not blend in with the reassuring ones. */
-  .scard.bad { border-color: var(--alarm-bg); border-left-width: 4px; }
-  .scard.bad h2 { color: var(--alarm-bg); }
-  @media (prefers-color-scheme: dark) { .scard.bad h2 { color: var(--alarm-fg); } }
   .srow { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 15px; }
   .srow .k { flex: 1 1 auto; min-width: 0; color: var(--muted); }
   .srow .v { flex: 0 0 auto; text-align: right; }
@@ -312,42 +306,6 @@
   .msg.user.st-claimed { box-shadow: inset -4px 0 0 var(--claim-bg); }
   .msg.user.st-done    { box-shadow: inset -4px 0 0 var(--done-bg); }
   .msg.agent { margin-right: auto; background: var(--agent-bg); color: var(--agent-fg); border: 1px solid var(--line); border-bottom-left-radius: 6px; }
-
-  /*
-   * THE DEADMAN BANNER. Sits directly under the header and above the thread,
-   * because the thread is exactly what looks normal while this is true. It is
-   * the one element on the page allowed to shout, and it is not dismissible —
-   * it goes away when an agent acts, and only then.
-   */
-  #watch {
-    flex: 0 0 auto; margin: 0; padding: 11px 14px;
-    font-size: 15px; font-weight: 640; line-height: 1.35;
-    color: var(--alarm-fg); background: var(--alarm-bg);
-  }
-  #watch[hidden] { display: none; }
-  #watch.warn { color: var(--warn-fg); background: var(--warn-bg); }
-  #watch .wsub { display: block; margin-top: 3px; font-size: 13px; font-weight: 450; opacity: .88; }
-
-  /*
-   * Transcript repair, shown rather than done behind your back. Anything that
-   * edits the user's own words has to be visible and reversible, because this
-   * text becomes instructions an agent acts on.
-   */
-  #fix {
-    flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
-    margin: 0; padding: 8px 10px 8px 14px; font-size: 14px;
-    color: var(--fg); background: var(--panel); border-top: 1px solid var(--line);
-  }
-  #fix[hidden] { display: none; }
-  #fixtext { flex: 1 1 auto; min-width: 0; }
-  #fixundo {
-    flex: 0 0 auto; font: inherit; font-weight: 650;
-    min-height: 36px; padding: 0 14px;
-    color: var(--user-fg); background: var(--user-bg);
-    border: 0; border-radius: 11px; cursor: pointer;
-    -webkit-appearance: none; appearance: none;
-  }
-  #fixundo[hidden] { display: none; }
 
   #err {
     display: none; flex: 0 0 auto;
@@ -453,16 +411,12 @@
     </button>
   </header>
 
-  <div id="watch" hidden role="status" aria-live="polite"></div>
-
   <main id="thread">
     <div id="list"></div>
     <p id="empty">No messages yet. Type below to send one.</p>
   </main>
 
   <p id="err"></p>
-
-  <div id="fix" hidden><span id="fixtext"></span><button id="fixundo" type="button">Undo</button></div>
 
   <div id="voice" aria-live="polite">
     <span id="meter" aria-hidden="true"><i></i></span><span id="vtext"></span>
@@ -516,7 +470,15 @@
   var MAX_BACKOFF = 20000;   // slowest retry when the server is unreachable
   var MAX_CHARS = 8000;      // must match the server-side cap
   var FULL_EVERY = 20;       // every Nth poll re-reads the whole thread as a repair pass
-  var WINDOW = 500;          // entries fetched by a full read
+  var WINDOW = 250;          // entries fetched by a full read
+  /*
+   * A hard ceiling on what the thread may hold in memory and on screen. Without
+   * it the page's cost grows with the history for ever, and this page is left
+   * open for days on a phone — the one device with a memory budget small enough
+   * to care. Older messages are not lost, they are simply not resident: the
+   * server still has them, and a full read brings the most recent WINDOW back.
+   */
+  var KEEP = 300;            // most recent entries kept resident
 
   var thread = document.getElementById('thread');
   var list = document.getElementById('list');
@@ -661,7 +623,23 @@
       var r = ms(e.rev || e.ts);
       if (r > cursorMs) cursorMs = r;
     }
+    if (changed && entries.size > KEEP) trimEntries();
     return changed;
+  }
+
+  /*
+   * Drop the oldest entries once the thread outgrows KEEP. Insertion order is
+   * not send order — a repair pass can merge an old message after a new one —
+   * so the cut is made by timestamp, not by Map order, or a slow-arriving old
+   * entry would evict a message that is still on screen.
+   */
+  function trimEntries() {
+    var all = Array.from(entries.values());
+    all.sort(function (a, b) { return ms(a.ts) - ms(b.ts); });
+    for (var i = 0; i < all.length - KEEP; i++) {
+      entries.delete(all[i].id);
+      sigs.delete(all[i].id);
+    }
   }
 
   function setConn(ok) { conn.className = ok ? '' : 'show'; }
@@ -691,6 +669,102 @@
         body: JSON.stringify({ event: event, detail: detail, ua: navigator.userAgent, url: location.href })
       }).catch(function () {});
     } catch (e) { /* logging must never be able to break the page */ }
+  }
+
+  /*
+   * WHY THE CRASH WAS INVISIBLE, AND HOW THIS SEES IT.
+   *
+   * A tab killed by the phone — Android's low-memory killer, or a content
+   * process crash — runs no code on the way out. Every report it might have
+   * sent dies with it, which is why hours of `docker logs` showed nothing but
+   * the symptoms of the *reload* that followed. So this does not try to catch
+   * the crash. It marks the session open on arrival and clears the mark on a
+   * clean exit; a mark still standing at the next load means the previous
+   * session vanished. The crash is then reported by its successor, with how
+   * long it lived and what it was holding when it went.
+   *
+   * `localStorage` on purpose, not `sessionStorage`: the latter is scoped to a
+   * tab that no longer exists by the time anyone can read it.
+   */
+  var SESSION_KEY = 'relay.session';
+  var sessionStartedAt = Date.now();
+  var sessionTimer = null;
+
+  function sessionState() {
+    return {
+      open: true,
+      startedAt: sessionStartedAt,
+      aliveMs: Date.now() - sessionStartedAt,
+      entries: entries ? entries.size : 0,
+      conv: !!convOn,
+      speak: !!speakOn,
+      hidden: !!document.hidden,
+      // Firefox does not expose this; Chromium does. Recorded when offered.
+      heapMB: (window.performance && performance.memory)
+        ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null
+    };
+  }
+
+  function sessionMark(open) {
+    try {
+      var s = sessionState();
+      s.open = open;
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+    } catch (e) { /* private mode: we simply lose the ability to see a crash */ }
+  }
+
+  function reportLastSession() {
+    var prev = null;
+    try {
+      var raw = window.localStorage.getItem(SESSION_KEY);
+      if (raw) prev = JSON.parse(raw);
+    } catch (e) { return; }
+    // A clean exit cleared the flag. Anything still open was killed.
+    if (prev && prev.open) {
+      logClient('page-vanished', {
+        aliveSec: Math.round((prev.aliveMs || 0) / 1000),
+        entries: prev.entries,
+        conv: prev.conv,
+        speak: prev.speak,
+        hidden: prev.hidden,
+        heapMB: prev.heapMB
+      });
+    }
+  }
+
+  function initCrashWatch() {
+    reportLastSession();
+    sessionMark(true);
+    // Cheap and periodic, so the marker's numbers describe the moment it died
+    // rather than the moment it loaded.
+    sessionTimer = setInterval(function () { sessionMark(true); }, 15000);
+
+    // A clean exit. `pagehide` fires where `unload` is unreliable on mobile.
+    window.addEventListener('pagehide', function () {
+      clearInterval(sessionTimer);
+      sessionMark(false);
+    });
+
+    /*
+     * Errors that reach the top level. These were being swallowed entirely: the
+     * page has no console anyone can read, because its home is a phone.
+     */
+    window.addEventListener('error', function (e) {
+      logClient('js-error', {
+        message: (e && e.message) || 'unknown',
+        source: (e && e.filename) || '',
+        line: (e && e.lineno) || 0,
+        col: (e && e.colno) || 0,
+        aliveSec: Math.round((Date.now() - sessionStartedAt) / 1000)
+      });
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var r = e && e.reason;
+      logClient('js-rejection', {
+        message: (r && r.message) || String(r || 'unknown').slice(0, 200),
+        aliveSec: Math.round((Date.now() - sessionStartedAt) / 1000)
+      });
+    });
   }
 
   // All requests are root-relative so the page works unchanged behind a reverse proxy.
@@ -737,81 +811,6 @@
    * takes over whenever the stream is not running — EventSource reconnects on
    * its own, and if it never succeeds the page is simply the poller it used to be.
    */
-  // ------------------------------------------------------------------ deadman banner
-  /*
-   * The server decides whether work is stranded — it is the only part of this
-   * system that is always running. This half just makes sure the verdict cannot
-   * be missed.
-   *
-   * It states what is actually wrong ("2 messages waiting, and nothing has
-   * happened for 7 min") rather than showing a warning colour, because a colour
-   * asks the user to go and work out the difference themselves, and that manual
-   * diff is the exact failure this exists to fix: twice, the information already
-   * existed and nothing put it in front of them.
-   *
-   * There is no dismiss button on purpose. It clears when an agent acts.
-   */
-  var watchBar = document.getElementById('watch');
-  var watchBad = false; // currently showing trouble — gates the one-shot announcement
-  var WATCH_POLL_MS = 20000;
-  var watchPolls = 0;
-
-  function renderWatch(w) {
-    if (!watchBar || !w) return;
-    if (!w.bad) {
-      // Recovered — or never broken. Idle must look exactly like this.
-      watchBar.hidden = true;
-      watchBar.textContent = '';
-      watchBad = false; // re-arm: the next transition into trouble announces again
-      return;
-    }
-    watchBar.hidden = false;
-    watchBar.className = w.level === 'warn' ? 'warn' : '';
-    watchBar.textContent = w.text;
-    var sub = document.createElement('span');
-    sub.className = 'wsub';
-    sub.textContent = 'Nothing is watching this but you. It clears itself as soon as an agent acts.';
-    watchBar.appendChild(sub);
-
-    if (!watchBad) {
-      watchBad = true;
-      announceWatch(w.text);
-    }
-  }
-
-  /*
-   * Optional and quiet by default. Gated behind the same mute control as spoken
-   * replies, silent until a tap has unlocked audio, skipped while dictating so it
-   * cannot cut into an utterance — and fired once per transition into trouble,
-   * never once per poll. An alarm that repeats is an alarm that gets muted.
-   */
-  function announceWatch(text) {
-    if (!speakOn || !audioUnlocked || vox) return;
-    var say = speakable(text);
-    if (!say) return;
-    speakQueue.push(say);
-    speakPump();
-  }
-
-  /*
-   * Fallback for when the stream is down, in the same shape as the thread poll:
-   * fast when there is no stream, a slow repair pass when there is. /watch is a
-   * deliberately cheap endpoint — it does no engine probing, unlike /status.
-   */
-  function pollWatch() {
-    return fetch('/watch', { headers: { accept: 'application/json' }, cache: 'no-store' })
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function (w) { renderWatch(w); })
-      .catch(function () { /* the offline indicator already says the server is gone */ });
-  }
-
-  setInterval(function () {
-    if (document.hidden) return;
-    watchPolls++;
-    if (streamOk && watchPolls % 3) return; // stream carries it; this is just repair
-    pollWatch();
-  }, WATCH_POLL_MS);
-
   function openStream() {
     if (!window.EventSource || stream) return;
     try { stream = new EventSource('/events'); } catch (e) { return; }
@@ -824,9 +823,6 @@
       var j;
       try { j = JSON.parse(e.data); } catch (err) { return; }
       fails = 0; setConn(true);
-      // The deadman verdict. Carried on the same stream so it arrives whether or
-      // not anything in the queue changed — which is the entire point of it.
-      if (j && j.watch) { renderWatch(j.watch); return; }
       // A conversation was created, renamed, reassigned or archived.
       if (j && j.conversation) { loadConvs(); return; }
       /*
@@ -1266,31 +1262,6 @@
       (c.pending || 0) + ' / ' + (c.claimed || 0) + ' / ' + (c.done || 0));
     frag.appendChild(wait);
 
-    /*
-     * --- abandoned ---
-     * Its own card, above everything else that could reassure you, because this
-     * failure hides from every other panel: a claimed task is not "waiting", so
-     * the counts above look fine, and any other agent working recently makes the
-     * activity panel look fine too. Nothing will ever retry these on its own.
-     */
-    var stuck = (s.stuck && s.stuck.length) ? s.stuck : null;
-    if (stuck) {
-      var ab = scard('Abandoned — claimed but never answered');
-      ab.className = 'scard bad';
-      for (var si = 0; si < stuck.length; si++) {
-        var st = stuck[si];
-        var sl = el('div', 'sline');
-        sl.appendChild(el('div', 't', st.text || '(no text)'));
-        sl.appendChild(el('div', 'w',
-          (st.claimedBy || 'an agent') + ' took this ' + ago(st.stuckForSec) + ' and never came back'));
-        ab.appendChild(sl);
-      }
-      ab.appendChild(el('p', 'snote',
-        'Nothing will pick these up again by itself — a claimed task is invisible to an agent polling for pending work. '
-        + 'Post a result to close one, or have an agent claim the conversation afresh.'));
-      frag.appendChild(ab);
-    }
-
     // --- responsiveness ---
     var r = s.responsiveness || {};
     var speed = scard('How fast, recently');
@@ -1594,7 +1565,29 @@
      * message. The wait re-arms while speech is in progress or a transcription is
      * still in flight, so it only ever fires once the user has genuinely stopped.
      */
-    STITCH_MS: 1800
+    STITCH_MS: 1800,
+    /*
+     * A ceiling on that debounce, and it is load-bearing.
+     *
+     * `stillTalking()` reports speech whenever the endpointer sits in its
+     * 'speak' phase — and a room with background noise (a fan, a television,
+     * someone packing a suitcase) holds it there indefinitely, because every
+     * rustle refreshes the last-loud timestamp. The re-arm then never fires and
+     * the message is NEVER posted, while the status bar says it is about to be.
+     * A page that has silently stopped sending is indistinguishable from a dead
+     * one, and the reload it provokes is what misroutes the next message.
+     *
+     * Measured from the last transcript that actually arrived, not from the
+     * start of the pending message, and only consulted when nothing is in
+     * flight — see wedged(). That distinction is what keeps this from
+     * reintroducing the fragmentation bug: a genuine train of thought keeps
+     * producing transcripts and keeps its deferral, whereas a wedged endpointer
+     * produces nothing and gets cut loose.
+     */
+    MAX_DEFER_MS: 12000,
+    // ...and a ceiling on the buffer itself, well under the server's 8000-char
+    // limit, so a long noisy stretch cannot grow one unsendable message.
+    MAX_PENDING: 4000
   };
 
   var convOn = false;        // conversation mode engaged
@@ -1742,77 +1735,6 @@
     transcribeAndSend(s);
   }
 
-  /*
-   * The speech engine mangles this system's own vocabulary constantly — "Claude"
-   * comes back as "cloud" or "quad", "mindmeld" as "mind about". The server
-   * repairs those before handing the text back (see stt-terms.json), and this is
-   * the part that keeps the repair honest: it says what it changed, and gives you
-   * one tap to put your own words back.
-   *
-   * The delay only exists when something was actually changed, which is rare. A
-   * clean transcript still sends the instant it arrives.
-   */
-  var FIX_REVIEW_MS = 4000;
-  var fixBar = document.getElementById('fix');
-  var fixText = document.getElementById('fixtext');
-  var fixUndo = document.getElementById('fixundo');
-  var fixTimer = null;
-  var fixOnUndo = null;
-
-  function fixSummary(list) {
-    var parts = [];
-    for (var i = 0; i < list.length && i < 3; i++) parts.push('“' + list[i].from + '” → ' + list[i].to);
-    if (list.length > 3) parts.push('and ' + (list.length - 3) + ' more');
-    return parts.join(', ');
-  }
-
-  function hideFix() {
-    clearTimeout(fixTimer);
-    fixTimer = null;
-    fixOnUndo = null;
-    fixBar.hidden = true;
-    fixText.textContent = '';
-  }
-
-  /** `undo` omitted = purely informational, and it clears itself. */
-  function showFix(list, undo) {
-    if (!fixBar || !list || !list.length) return;
-    clearTimeout(fixTimer);
-    fixText.textContent = 'Corrected ' + fixSummary(list);
-    fixOnUndo = undo || null;
-    fixUndo.hidden = !undo;
-    fixBar.hidden = false;
-    if (!undo) fixTimer = setTimeout(hideFix, 6000);
-  }
-
-  if (fixUndo) fixUndo.addEventListener('click', function () { if (fixOnUndo) fixOnUndo(); });
-
-  /** Holds a corrected transcript briefly so it can be taken back before it sends. */
-  function reviewThenSend(fixes, draft, raw) {
-    return new Promise(function (resolve) {
-      var done = false;
-      showFix(fixes, function () {
-        if (done) return;
-        done = true;
-        // Put back exactly what was heard and stop the send. It stays in the
-        // composer, so nothing is lost and it can be fixed by hand.
-        input.value = draft ? draft + ' ' + raw : raw;
-        autosize();
-        hideFix();
-        input.focus();
-        showErr('Put your own words back — nothing was sent. Edit it and press Send.', true);
-        logClient('stt-correction-undone', { fixes: fixes.length });
-        resolve();
-      });
-      fixTimer = setTimeout(function () {
-        if (done) return;
-        done = true;
-        hideFix();
-        doSend('voice').then(function (ok) { if (ok) scrollBottom(); resolve(); });
-      }, FIX_REVIEW_MS);
-    });
-  }
-
   function transcribeAndSend(s) {
     if (s.lastLoudMs - s.speechStartMs < V.MIN_SPEECH_MS) {
       vHide(); showErr('That was too short to make out — try again.'); return;
@@ -1840,10 +1762,6 @@
         input.value = draft ? draft + ' ' + text : text;
         autosize();
         vHide();
-        var fixes = (j && j.corrections) || [];
-        // Only pause when the server actually rewrote something. A clean
-        // transcript is not made slower by a feature that had nothing to do.
-        if (fixes.length) return reviewThenSend(fixes, draft, ((j && j.raw) || text).trim());
         return doSend('voice').then(function (ok) { if (ok) scrollBottom(); });
       })
       .catch(function (err) {
@@ -2262,6 +2180,8 @@
   var pendingConv = null;  // ...and the conversation it was spoken into
   var stitchTimer = null;
   var pendingInBox = false; // the composer is showing it, so Send can pre-empt us
+  var pendingSince = 0;     // when the pending message started
+  var lastStitchAt = 0;     // when a transcript last actually arrived; bounds the debounce
 
   /** True while the user is evidently not finished. The debounce waits this out. */
   function stillTalking() {
@@ -2269,11 +2189,23 @@
     return !!(vox && vox.mode === 'conv' && vox.phase === 'speak');
   }
 
+  /*
+   * The endpointer claims someone is speaking, but nothing has come back from
+   * transcription for a long time and nothing is in flight. That combination is
+   * not speech — it is a microphone stuck on room noise. Cut the pending
+   * message loose rather than defer it for ever. See C.MAX_DEFER_MS.
+   */
+  function wedged() {
+    if (micGated || convBusy || convQueue.length) return false; // genuinely in flight
+    if (!pendingText) return false;
+    return Date.now() - lastStitchAt >= C.MAX_DEFER_MS;
+  }
+
   function armStitch() {
     clearTimeout(stitchTimer);
     stitchTimer = setTimeout(function () {
       // Re-arm rather than post: they are mid-sentence or mid-transcription.
-      if (stillTalking()) { armStitch(); return; }
+      if (stillTalking() && !wedged()) { armStitch(); return; }
       flushPending();
     }, C.STITCH_MS);
   }
@@ -2298,6 +2230,8 @@
     stitchTimer = null;
     pendingText = '';
     pendingConv = null;
+    pendingSince = 0;
+    lastStitchAt = 0;
     if (pendingInBox && !keepBox) { input.value = ''; autosize(); }
     pendingInBox = false;
   }
@@ -2305,9 +2239,13 @@
   function stitchIn(text, conv) {
     // Switching conversation mid-thought posts what was said in the old one.
     if (pendingText && pendingConv !== conv) flushPending();
+    if (!pendingText) pendingSince = Date.now();
+    lastStitchAt = Date.now();
     pendingText = pendingText ? pendingText + ' ' + text : text;
     pendingConv = conv;
     showPending();
+    // Post now rather than keep growing a message that will be refused.
+    if (pendingText.length >= C.MAX_PENDING) { flushPending(); return; }
     armStitch();
     idleStatus();
   }
@@ -2360,10 +2298,6 @@
           convNote(why === 'echo' ? 'Ignored my own voice.' : 'Didn’t catch that.');
           return;
         }
-        // Hands-free: no undo button, because the debounce below is already the
-        // pause and a second one would defeat the point. Still shown, so a wrong
-        // correction is visible while the text is still sitting unsent.
-        if (j && j.corrections && j.corrections.length) showFix(j.corrections);
         // Not posted here: handed to the debounce, which decides when the user
         // has actually finished talking. See stitchIn().
         stitchIn(text, job.conv);
@@ -2656,6 +2590,28 @@
     // speaker still works on the plain-http LAN page where the mic cannot.
     if (spkBtn) {
       setSpeak(pref('relay.speak') === '1', false);
+      /*
+       * `speakOn` is remembered across reloads; `audioUnlocked` cannot be,
+       * because every browser demands a fresh gesture per page load. So a
+       * remembered "speaker on" produced a sticky "spoken replies need one tap
+       * first" banner on every single load — it appears twenty times in one
+       * evening of logs, which is also how we know how often this page is
+       * being reloaded. Spend the first real gesture, whatever it is, rather
+       * than insisting on one particular button. Only wired when the speaker
+       * is already on: nobody who has not asked for audio should have an
+       * AudioContext created behind their back.
+       */
+      if (speakOn) {
+        var unlockOnce = function () {
+          ['pointerdown', 'touchstart', 'keydown'].forEach(function (t) {
+            document.removeEventListener(t, unlockOnce, true);
+          });
+          try { unlockAudio(); } catch (e) { /* the speaker button still works */ }
+        };
+        ['pointerdown', 'touchstart', 'keydown'].forEach(function (t) {
+          document.addEventListener(t, unlockOnce, true);
+        });
+      }
       spkBtn.addEventListener('click', function () {
         var on = !speakOn;
         if (on) unlockAudio(); // must happen inside the gesture to count
@@ -2672,6 +2628,10 @@
     }
     if (stopBtn) stopBtn.addEventListener('click', function () { stopConversation('user'); });
   }
+
+  // First, before anything that could itself fail: report the previous session
+  // if it never came back, and start listening for errors in this one.
+  try { initCrashWatch(); } catch (e) { /* never let telemetry take the page down */ }
 
   // The queue UI boots first and does not depend on any of the audio code above.
   setInterval(refreshTimes, 30000);
