@@ -982,10 +982,13 @@ JSON
 | POST   | `/tasks`              | create (`400` if `instruction`/`text` missing, over 8000 chars, or the conversation is unknown) |
 | GET    | `/tasks`              | list; `conversation` `status` `unread` `since` `limit` (first N) |
 | GET    | `/tasks/:id`          | one task                                                        |
-| POST   | `/tasks/:id/claim`    | pending -> claimed (`404`/`409`)                                |
-| POST   | `/tasks/:id/result`   | -> done, **and posts the agent's reply into the thread** (`404`/`409`) |
-| GET    | `/results`            | done tasks only; `conversation` `unread` `since` `limit`         |
-| POST   | `/tasks/:id/relayed`  | mark shown to human (idempotent)                                |
+| POST   | `/tasks/:id/claim`    | pending -> claimed (`404`/`409`); **new** — renews if you already hold it, takes over if the lease expired |
+| POST   | `/tasks/:id/result`   | -> done, **and posts the agent's reply into the thread** (`404`/`409`; **new** `400` on `result: null`) |
+| GET    | `/results`            | answered tasks only; `conversation` `unread` `since` `limit`     |
+| POST   | `/tasks/:id/relayed`  | mark shown to human (idempotent); **new** — `409` if the task has no result |
+| POST   | `/messages`           | **new** — an agent speaking for itself; `channel` makes it agent-only |
+| GET    | `/messages`           | **new** — read an internal channel; `channel` `since` `limit`     |
+| GET    | `/channels`           | **new** — which internal channels exist                          |
 | GET    | `/thread`             | chronological human+agent view; `conversation` `since` (on `rev`) `limit` (last N) |
 | GET    | `/conversations`      | **new** — list with counts and a snippet; `pending` `unread` `archived` |
 | POST   | `/conversations`      | **new** — create one (`title`, optional `agent`)                 |
@@ -1001,6 +1004,26 @@ JSON
 `POST /client-log` stores nothing and touches no queue state; it only writes a rate-limited,
 control-character-stripped line to stdout. It exists because the UI's real home is a phone, where
 there is no console to read and "the mic did nothing" is otherwise undebuggable.
+
+Changed in 1.6.0, all backward compatible — three protocol guarantees, each from a logged failure:
+
+- **`relayed` now requires a `result`.** Marking a task delivered while it carries no answer closed
+  the user's question with silence four times in one night; the transition is refused with `409`.
+  Re-flagging an already-relayed task stays idempotent. `POST /tasks/:id/result` also refuses a
+  literal `null`, which would otherwise leave a `done` task that nothing could ever close.
+- **A claim is now a lease** (`CLAIM_LEASE_MS`, default 15 min, matching `STUCK_CLAIM_MS`). Nothing
+  is force-cleared and no task ever returns to `pending` — an expiry only stops the queue *refusing*
+  a second agent, so an agent that is genuinely still working is never interrupted, and one result
+  per task still decides the winner. Re-claiming your own task renews it; a heartbeat does not.
+  A `409` now carries `claimedBy` and `leaseExpiresInSec`, and
+  `GET /tasks?status=claimed&expired=1` finds abandoned ones.
+- **`POST /messages`** lets an agent speak without posting a task as the human and answering itself.
+  The record is `role: "agent"`, `status: "done"` — a statement, not a request, so it never sits
+  pending. Adding a `channel` makes it internal: agent-to-agent traffic that is excluded by default
+  from the thread, the task list, `/results`, the conversation summaries, the counts, `/status` and
+  the live stream, and readable only via `GET /messages?channel=…`.
+
+No existing endpoint, record or call changed, and the web UI needs no change.
 
 Changed in 1.5.0, all backward compatible: `GET /status` and `POST /heartbeat` answer "is anything
 listening"; `/conversations` entries gained `spark` (recent activity buckets) and `agentState`
