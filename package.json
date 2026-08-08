@@ -10,6 +10,9 @@
   },
   "scripts": {
     "start": "node server.js",
+    "test": "node tools/ui-selftest.js && node tools/mobile-selftest.js",
+    "test:fast": "node tools/ui-selftest.js",
+    "test:mobile": "node tools/mobile-selftest.js",
     "up": "docker compose up -d",
     "down": "docker compose down",
     "logs": "docker compose logs -f"

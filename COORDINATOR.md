@@ -118,7 +118,9 @@ a container.
 **Serialize agents that share files.** Two agents editing one file will lose
 each other's work. Route follow-ups to the agent already in that code.
 
-**Before merging any UI change, run `node tools/mobile-selftest.js`.** It drives
+**Before merging any UI change, run `npm test`** (as of 2026-08-08 that runs
+`ui-selftest` then `mobile-selftest`; it used to be a bare
+`node tools/mobile-selftest.js`, which is still what the geometry half is). It drives
 a real browser at 390×844 and asserts *geometry* — on screen, not clipped, not
 covered — because the stub suite asserts elements *exist*, and 173 of them
 passed while the user's chat input and menu were off the bottom of his phone.
@@ -361,6 +363,27 @@ markup — a security property on an unauthenticated queue that anything on the
 LAN can post to. **Before writing a feature, grep `main` for it, read the commit
 that added it, and assume any odd-looking implementation is load-bearing until
 the commit message says otherwise.**
+
+**A working tree is not a branch.** Grepping a worktree while another agent is
+live in it yields a confident, wrong, alarming answer. On 2026-08-08 a
+coordinator grepped `mobile-zoom-back` moments before merging and found *zero*
+markers — no `user-scalable`, no `interactive-widget`, the viewport meta back to
+its bare original — which read exactly like a rebase having silently eaten the
+fix. Nothing had been lost: the agent had moved `HEAD` onto `main` mid-run, so
+the tree was transient while the commit was intact. **Ask the branch, not the
+directory** — `git show <branch>:<path>` and `git merge-base --is-ancestor` are
+authoritative; `grep` on a working tree is not. Verify the ref before you report
+a disaster, because this one was thirty seconds from becoming a false alarm to
+the human.
+
+**Run `npm test` before you merge a UI change.** As of 2026-08-08 that is
+`ui-selftest` (existence) *then* `mobile-selftest` (geometry), so the suite that
+actually catches his composer bug now runs by default instead of by memory.
+`npm run test:fast` skips the browser; `npm run test:mobile` is geometry alone.
+If Playwright is absent, `mobile-selftest` exits 2 with a clear message rather
+than passing — a loud failure telling you to run
+`npm i --no-save playwright && npx playwright install firefox` is correct, and
+must never be "fixed" into a silent skip.
 
 **A test that nothing runs is not coverage, it is a story about coverage.**
 Correcting an earlier version of this very paragraph, which said CI enforces

@@ -1,7 +1,12 @@
 # Publishing relay-queue on GitHub
 
-Copy-pasteable steps to put this repo on GitHub **publicly** and file the drafts in this folder as
-issues. Nothing here has been done for you — no remote is configured and nothing has been pushed.
+Copy-pasteable steps to file the drafts in this folder as issues.
+
+**Corrected 2026-08-08 — the old version of this line said "no remote is configured and nothing has
+been pushed". That is stale.** The repo is on GitHub, `origin` is
+`git@github.com:redaphid/relay-queue.git`, and pushes from an agent succeed (branch `push-recipe-doc`
+was pushed this way). So the publishing half below is largely done. What is still genuinely blocked is
+**filing the issues**: that needs `gh`, which the agent sandbox refuses, so it needs his hands.
 
 Run these from `D:\projects\relay-queue` in Git Bash. Requires the [`gh` CLI](https://cli.github.com/)
 (`winget install GitHub.cli`), authenticated once with `gh auth login`.
