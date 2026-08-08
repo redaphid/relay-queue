@@ -12,8 +12,13 @@ nothing is lost while long background work is running. The agent side is driven 
   The UI is one self-contained HTML file — inline CSS and JS, no frameworks, no CDN, no external requests.
 - **Durable.** Every mutation is appended to `data/events.jsonl` and fsynced *before* the HTTP
   response is sent, then replayed into memory on boot. A crash right after a `200` cannot lose a write.
-- **Local only.** Binds `127.0.0.1` by default; the Docker port mapping is pinned to `127.0.0.1` too.
+- **Local.** Bare Node binds `127.0.0.1`. The container currently publishes `3901` on **all**
+  interfaces, so it is reachable from the LAN — see the warning below.
 - **No auth**, no priorities, no TLS. Put it behind an authenticating proxy before exposing it.
+
+> **Right now anyone on this LAN can read and post to the queue.** The plan is to reach it over an
+> HTTPS hostname fronted by Cloudflare Access; that also happens to be what the microphone needs, as
+> browsers only grant it to secure pages. See `.github-drafts/https-for-mic-access.md`.
 
 Web UI: **http://127.0.0.1:3901/** &nbsp;&nbsp; API base: **http://127.0.0.1:3901**
 
@@ -24,7 +29,8 @@ Web UI: **http://127.0.0.1:3901/** &nbsp;&nbsp; API base: **http://127.0.0.1:390
 Open **http://127.0.0.1:3901/** — one page, no build step, no login.
 
 What you see, top to bottom: a `relay` header (which grows an `offline — retrying` note if the
-server goes away), the message thread, then a textarea and a **Send** button pinned to the bottom.
+server goes away), the message thread, then a **mic** button, a textarea and a **Send** button
+pinned to the bottom.
 
 - **The thread** runs oldest at the top, newest at the bottom, and auto-scrolls to the bottom on
   load and whenever something new arrives. If you have scrolled up to read history it leaves you
@@ -33,16 +39,32 @@ server goes away), the message thread, then a textarea and a **Send** button pin
   status marker: `pending` (nobody has picked it up), `claimed` (an agent is working on it), or
   `answered` (the reply is below it). Tap-and-hold the time to see the exact timestamp.
 - **Agent replies** are left-aligned in a bordered bubble, directly under the message they answer.
-- **Sending**: tap **Send**, or press **Ctrl+Enter** / **Cmd+Enter**. The box only clears once the
-  server has accepted the message; if the send fails your text stays put and a one-line reason
-  appears above the composer. Messages are capped at 8000 characters.
+- **Sending**: tap **Send**, or press **Enter**. **Shift+Enter** inserts a newline instead, and
+  **Ctrl+Enter** / **Cmd+Enter** still sends. The box only clears once the server has accepted the
+  message; if the send fails your text stays put and a one-line reason appears above the composer.
+  Messages are capped at 8000 characters.
+- **Dictation**: tap the **mic** and talk. It measures the room for a moment, listens, and when you
+  stop talking for about 1.2 s it stops by itself, transcribes what you said, and sends it — no
+  second tap. Tap the mic again to cut it short (or to cancel before you have said anything). The
+  transcript is appended to whatever is already in the box, so a half-typed draft is never lost, and
+  it is sent through the ordinary send path with `from:"voice"`, which means a failed send leaves the
+  words sitting in the composer exactly like a typed one. Audio never leaves the machine: it goes to
+  [`POST /stt`](#speech-to-text), which relays it to a local Whisper engine.
+  **The microphone only works on a secure page** — an `https://` origin, or `http://localhost:3901`
+  on the machine itself. Over plain http to a LAN or tunnel IP the browser refuses, and the page
+  says so instead of failing silently.
 - **Newlines and whitespace are preserved** exactly. Message text is written with `textContent`,
   never `innerHTML`, so a message containing HTML or `<script>` is displayed literally as text and
   cannot execute.
-- **Updates** arrive by polling `GET /thread?since=…` every ~3 s, fetching only what changed. Polling
-  pauses while the tab is hidden, backs off up to 20 s if the server is unreachable, and recovers on
-  its own — the page survives the service restarting under it without a reload. Nothing you have
-  typed is ever overwritten by a refresh.
+- **Updates are pushed live.** The page holds a `GET /events` stream open and the server sends every
+  change down it the moment that change is durable, so a message typed on your phone appears on the
+  laptop instantly, and an agent's reply lands without waiting for a poll.
+  Polling did not go away — it is the fallback. While the stream is healthy the page still re-reads
+  `GET /thread?since=…` every ~30 s as a repair pass; if the stream drops (or a proxy eats it) that
+  drops back to ~3 s automatically and the page behaves exactly as it did before. Polling pauses
+  while the tab is hidden, backs off up to 20 s if the server is unreachable, and recovers on its
+  own — the page survives the service restarting under it without a reload. Nothing you have typed
+  is ever overwritten by a refresh.
 - **Mobile-first**: 16 px minimum text (so iOS does not zoom on focus), 48 px tap targets, no
   horizontal scroll, safe-area padding, and it follows your system light/dark setting.
 
@@ -52,14 +74,16 @@ served with `content-security-policy: default-src 'none'; … connect-src 'self'
 page from making any external request at all.
 
 The page lives at **`public/index.html`** and is read from disk on request (re-read when its mtime
-changes, so editing it needs no restart). The server looks for it at `$UI_FILE`, then
-`public/index.html`, then `<DATA_DIR>/ui/index.html`, and logs which one it picked at boot.
+changes, so editing it needs no restart — just reload the page, in the container too). The server
+looks for it at `$UI_FILE`, then `public/index.html`, then `<DATA_DIR>/ui/index.html`, and logs which
+one it picked at boot. `GET /` answers `503` with the list of paths it searched if it finds none.
 
-> **Docker note:** the compose file bind-mounts `server.js`, `package.json` and `data/` individually,
-> **not** the repo root — so `public/` is not visible inside the container. Until compose gains
-> `- ./public:/app/public:ro`, the container falls back to `<DATA_DIR>/ui/index.html`; after editing
-> `public/index.html` re-copy it (`cp public/index.html data/ui/index.html`) and restart. `GET /`
-> answers `503` with the list of paths it searched if it finds no page at all.
+> **Docker note:** compose bind-mounts the **whole repo** read-only at `/app` (with `data/` remounted
+> writable on top), so the container serves the working-tree `public/index.html` directly. The old
+> `cp public/index.html data/ui/index.html` copy step is **gone** — `data/ui/` is no longer used or
+> needed. Mounting the directory rather than individual files is deliberate: git replaces a file by
+> renaming a new one over it, and a single-file bind mount stays pinned to the original inode, so a
+> pulled change would never be visible inside the container.
 
 ---
 
@@ -71,12 +95,14 @@ changes, so editing it needs no restart). The server looks for it at `$UI_FILE`,
 cd /d/projects/relay-queue && docker compose up -d
 ```
 
-Uses the stock `node:22-alpine` image with the source bind-mounted read-only — there is no image
-to build. Container name is `relay-queue`, `restart: unless-stopped`, so it comes back with Docker
-Desktop. `data/` is bind-mounted to `D:/projects/relay-queue/data`, the same directory bare Node uses.
-Because the mounts are per-file (`server.js`, `package.json`) plus `data/`, adding `public/` to the
-container needs a `- ./public:/app/public:ro` line in compose — see the note under
-[The web UI](#the-web-ui) for the fallback used until then.
+Uses the stock `node:22-alpine` image with the repo bind-mounted read-only at `/app` — there is no
+image to build. Container name is `relay-queue`, `restart: unless-stopped`, so it comes back with
+Docker Desktop. `data/` is remounted writable on top, pointing at `D:/projects/relay-queue/data`, the
+same directory bare Node uses.
+
+This also brings up **`relay-queue-sync`**, a tiny `alpine/git` sidecar that fast-forwards the
+checkout from `origin/main` every 60 s — see [Staying up to date](#staying-up-to-date). It idles
+harmlessly while there is no `origin`.
 
 ```bash
 docker compose logs -f relay-queue    # follow logs
@@ -96,11 +122,79 @@ interleave and each process only sees its own in-memory state.
 
 ### Configuration
 
-| Env var    | Default             | Notes                                              |
-| ---------- | ------------------- | -------------------------------------------------- |
-| `PORT`     | `3901`              |                                                     |
-| `HOST`     | `127.0.0.1`         | The container sets `0.0.0.0`; the published port is still `127.0.0.1`-only. |
-| `DATA_DIR` | `<repo>/data`       | Where `events.jsonl` lives.                         |
+| Env var         | Default        | Notes                                               |
+| --------------- | -------------- | --------------------------------------------------- |
+| `PORT`          | `3901`         |                                                      |
+| `HOST`          | `127.0.0.1`    | The container sets `0.0.0.0`.                        |
+| `DATA_DIR`      | `<repo>/data`  | Where `events.jsonl` lives.                          |
+| `UI_FILE`       | —              | Overrides where the page is read from.               |
+| `STT_HOST`      | `127.0.0.1`    | Wyoming ASR engine. The container sets `host.docker.internal`, since from inside it loopback is not the host. |
+| `STT_PORT`      | `10300`        | wyoming-whisper's default port.                      |
+| `STT_LANGUAGE`  | —              | Forces a language; unset uses whatever the engine is configured for. |
+| `WATCH_SOURCE`  | `1`            | Exit when `server.js` changes so the supervisor restarts it. `0` disables. |
+| `WATCH_POLL_MS` | `2000`         | mtime poll interval for that watcher.                |
+
+---
+
+## Speech to text
+
+`POST /stt` takes raw audio and returns text. It is what the mic button uses, and it exists so the
+browser never has to talk to anything but this server — the page's CSP is `connect-src 'self'`, and
+every request it makes is root-relative, so the whole feature works unchanged behind a reverse proxy.
+
+The body is **raw 16 kHz mono signed-16-bit little-endian PCM** — no WAV header, no container. The
+format can be declared with `?rate=`, `?width=` and `?channels=`, though only 16-bit mono is accepted
+today; the default is `rate=16000&width=2&channels=1`. Audio is capped at 8 MiB (~4 minutes). The
+response is `{ text, audioMs, tookMs }`.
+
+```bash
+# transcribe a 16 kHz mono WAV by skipping its 44-byte header
+tail -c +45 sample.wav | curl -s -X POST --data-binary @- \
+  -H 'content-type: application/octet-stream' http://127.0.0.1:3901/stt
+```
+
+Under the hood the server speaks the [Wyoming protocol](https://github.com/rhasspy/wyoming) to a
+local **wyoming-whisper** container on port 10300, over a plain TCP socket via `node:net` — so the
+zero-dependency rule survives. Audio is sent as `transcribe` → `audio-start` → `audio-chunk`… →
+`audio-stop`, and the engine answers with one `transcript` event and closes the connection.
+
+> **Why Whisper and not Ollama?** Ollama serves text and vision models only — it has no
+> speech-to-text models, so it cannot do this job at all. Whisper is the local engine for it.
+
+**Testing it without a microphone** — `tools/stt-selftest.js` asks the local **wyoming-piper** TTS
+container to speak a sentence, saves it as a WAV, pipes it through `/stt`, and checks the transcript
+came back as the same sentence. Zero dependencies, no mic, no browser:
+
+```bash
+node tools/stt-selftest.js                                   # round-trip a default sentence
+node tools/stt-selftest.js --text "check the widget report"  # say something specific
+node tools/stt-selftest.js recording.wav                     # transcribe an existing 16-bit WAV
+```
+
+---
+
+## Staying up to date
+
+The copy of the page this machine serves is meant to always be the latest merged code, with nobody
+driving. Two pieces, no Docker socket and no webhooks:
+
+- **`relay-queue-sync`** — an `alpine/git` sidecar in the same compose file. Every 60 s it runs
+  `git fetch origin` and `git merge --ff-only origin/main` in the checkout.
+  **It is fast-forward only and never resets**, so local commits that are not on `origin/main` are
+  kept and the tree is left untouched rather than clobbered. With no `origin` configured (as now,
+  until the repo is published) it idles quietly instead of erroring.
+- **self-restart** — `server.js` watches its own file and exits cleanly when it changes;
+  `restart: unless-stopped` brings it back a moment later on the new code, and replaying
+  `events.jsonl` makes that lossless. So a merge to `main` deploys itself within about a minute.
+  The UI needs none of this: `public/index.html` is re-read whenever its mtime changes.
+
+  It watches with **both** `fs.watch` and an `fs.watchFile` mtime poll on purpose. Across a Windows
+  bind mount inotify does not fire — verified here, the mtime poll is what actually catches it — so
+  the poll is the backstop that makes this work at all on this machine.
+
+Because a sync loop is writing to the checkout, **agents should not commit straight into it** once
+the repo is published — work on a branch or a worktree and merge on GitHub. See
+`.github-drafts/PUBLISH.md`.
 
 ---
 
@@ -338,11 +432,15 @@ JSON
 | POST   | `/tasks/:id/result`   | -> done, **and posts the agent's reply into the thread** (`404`/`409`) |
 | GET    | `/results`            | done tasks only; `unread` `since` `limit`                       |
 | POST   | `/tasks/:id/relayed`  | mark shown to human (idempotent)                                |
-| GET    | `/thread`             | **new** — chronological human+agent view; `since` (on `rev`) `limit` (last N) |
+| GET    | `/thread`             | chronological human+agent view; `since` (on `rev`) `limit` (last N) |
+| GET    | `/events`             | **new** — Server-Sent Events; every change pushed as it happens  |
+| POST   | `/stt`                | **new** — raw PCM in, `{text}` out, via the local Whisper engine |
 
-Changed in 1.1.0, all backward compatible: task records gained a server-set `role`; `POST /tasks`
-accepts `text` as an alias for `instruction` and caps it at 8000 chars. Every pre-1.1.0 record and
-every pre-1.1.0 curl call keeps working exactly as before.
+Changed in 1.2.0, all backward compatible: `GET /events` pushes changes live (polling still works
+and is still the fallback), and `POST /stt` transcribes audio. `/health` gained a `streams` count.
+Changed in 1.1.0: task records gained a server-set `role`; `POST /tasks` accepts `text` as an alias
+for `instruction` and caps it at 8000 chars. Every pre-1.1.0 record and every pre-1.1.0 curl call
+keeps working exactly as before.
 
 Unknown routes return `404` JSON, wrong methods `405`, malformed JSON bodies `400`. The server
 never crashes on bad input.
@@ -361,9 +459,11 @@ Queue contents live in **`data/events.jsonl`** — one JSON event per line, appe
 `data/` is **gitignored** and must stay that way — it holds real message text. Only code and docs are
 committed. To wipe the queue, stop the service, delete `data/events.jsonl`, start it again.
 
-`data/ui/index.html` is a disposable copy of `public/index.html`, there only so the container can
-find the UI until compose mounts `./public` (see the note under [The web UI](#the-web-ui)). It is
-not queue state; deleting it is harmless as long as the real `public/index.html` is reachable.
+`data/ui/` is **no longer used** — compose now mounts the repo, so the container reads
+`public/index.html` directly. If an old copy is still lying around, delete it.
+
+`data/tmp/` holds throwaway artefacts from `tools/stt-selftest.js` (the WAV it synthesises). Also
+not queue state, also safe to delete.
 
 On boot the log is replayed and a torn final line (from a hard kill mid-write) is skipped rather
 than fatal; the startup log reports `N events replayed, M skipped`.
