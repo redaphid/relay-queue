@@ -51,8 +51,18 @@ pinned to the bottom.
   words sitting in the composer exactly like a typed one. Audio never leaves the machine: it goes to
   [`POST /stt`](#speech-to-text), which relays it to a local Whisper engine.
   **The microphone only works on a secure page** — an `https://` origin, or `http://localhost:3901`
-  on the machine itself. Over plain http to a LAN or tunnel IP the browser refuses, and the page
-  says so instead of failing silently.
+  on the machine itself. Browsers withhold the microphone from plain-http pages entirely, so over a
+  LAN address the mic **cannot** work. When that is the case the mic button is drawn struck through
+  and dashed, and tapping it puts up a message — which stays until you dismiss it — naming the
+  reason, saying the mic itself is fine, and giving the URL that does work today. Permission denied,
+  no microphone, a mic held by another app, and a transcription failure each say something different,
+  because "try again" means a different thing in each case. All of them are also reported to
+  `POST /client-log`, so a failure on a phone is diagnosable from `docker logs relay-queue` without
+  anyone reading a console.
+- **Focus follows the window** on desktop: switching to the tab puts the cursor in the composer so
+  you can just type. It is deliberately **not** done on touch devices — focusing a textarea there
+  raises the on-screen keyboard, and having that happen on every app switch is intolerable. It also
+  never steals focus from another field, from selected text you are copying, or mid-dictation.
 - **Newlines and whitespace are preserved** exactly. Message text is written with `textContent`,
   never `innerHTML`, so a message containing HTML or `<script>` is displayed literally as text and
   cannot execute.
@@ -169,6 +179,16 @@ came back as the same sentence. Zero dependencies, no mic, no browser:
 node tools/stt-selftest.js                                   # round-trip a default sentence
 node tools/stt-selftest.js --text "check the widget report"  # say something specific
 node tools/stt-selftest.js recording.wav                     # transcribe an existing 16-bit WAV
+```
+
+**Testing the page without a browser** — `tools/ui-selftest.js` runs the page's inline JS against a
+stub DOM and asserts the things you cannot see by looking: that a blocked microphone explains itself
+loudly and stickily, that permission-denied and no-device and transcription failures each say
+something different, that auto-focus happens on desktop and never on touch, and that a browser with
+no audio APIs cannot take the messaging half of the page down with it.
+
+```bash
+node tools/ui-selftest.js
 ```
 
 ---
@@ -435,6 +455,11 @@ JSON
 | GET    | `/thread`             | chronological human+agent view; `since` (on `rev`) `limit` (last N) |
 | GET    | `/events`             | **new** — Server-Sent Events; every change pushed as it happens  |
 | POST   | `/stt`                | **new** — raw PCM in, `{text}` out, via the local Whisper engine |
+| POST   | `/client-log`         | **new** — one diagnostic line from the browser into the container log |
+
+`POST /client-log` stores nothing and touches no queue state; it only writes a rate-limited,
+control-character-stripped line to stdout. It exists because the UI's real home is a phone, where
+there is no console to read and "the mic did nothing" is otherwise undebuggable.
 
 Changed in 1.2.0, all backward compatible: `GET /events` pushes changes live (polling still works
 and is still the fallback), and `POST /stt` transcribes audio. `/health` gained a `streams` count.

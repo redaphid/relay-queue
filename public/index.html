@@ -62,6 +62,9 @@
     color: var(--err-fg); background: var(--err-bg); border-top: 1px solid var(--line);
   }
   #err.show { display: block; }
+  /* Sticky errors explain something the user has to act on, so they wait to be read. */
+  #err.sticky { cursor: pointer; }
+  #err.sticky::after { content: ' — tap to dismiss'; opacity: .65; }
 
   /* Voice dictation: status line + live input level, shown only while listening. */
   #voice {
@@ -84,6 +87,7 @@
     background: var(--panel); border-top: 1px solid var(--line);
   }
   #mic {
+    position: relative;
     flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
     width: 48px; height: 48px; padding: 0;
     color: var(--fg); background: var(--bg);
@@ -92,6 +96,14 @@
   }
   #mic svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
   #mic:disabled { opacity: .5; }
+  /* Unusable here (almost always: not an https page). Struck through so it reads as
+     blocked rather than broken — but still tappable, because the tap is what explains. */
+  #mic.off { color: var(--muted); border-style: dashed; }
+  #mic.off::after {
+    content: ''; position: absolute; left: 11px; top: 22px;
+    width: 24px; height: 2px; border-radius: 2px;
+    background: currentColor; transform: rotate(-45deg);
+  }
   #mic.on { color: #fff; background: var(--rec); border-color: var(--rec); animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .62; } }
   @media (prefers-reduced-motion: reduce) { #mic.on { animation: none; } }
@@ -244,13 +256,32 @@
 
   function setConn(ok) { conn.className = ok ? '' : 'show'; }
 
-  function showErr(msg) {
+  // `sticky` keeps the message up until it is tapped away. Used when the reason
+  // matters and the user has to go do something about it — a nine-second flash is
+  // how you end up with "it just didn't work".
+  function showErr(msg, sticky) {
     errBar.textContent = msg;
-    errBar.className = 'show';
+    errBar.className = sticky ? 'show sticky' : 'show';
     clearTimeout(errTimer);
-    errTimer = setTimeout(clearErr, 9000);
+    if (!sticky) errTimer = setTimeout(clearErr, 9000);
   }
   function clearErr() { clearTimeout(errTimer); errBar.className = ''; errBar.textContent = ''; }
+
+  /*
+   * Report a client-side failure to the server so it lands in `docker logs
+   * relay-queue`. The UI's real home is a phone, where there is no console to
+   * read, and "the mic did nothing" is not a diagnosable bug report. Entirely
+   * best-effort: it never throws, never blocks, and never surfaces its own errors.
+   */
+  function logClient(event, detail) {
+    try {
+      fetch('/client-log', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ event: event, detail: detail, ua: navigator.userAgent, url: location.href })
+      }).catch(function () {});
+    } catch (e) { /* logging must never be able to break the page */ }
+  }
 
   // All requests are root-relative so the page works unchanged behind a reverse proxy.
   function poll(fullRead) {
@@ -362,8 +393,36 @@
     e.preventDefault();
     doSend('web');
   });
+  errBar.addEventListener('click', clearErr);
+
+  /*
+   * Coming back to the window puts the cursor in the composer, so you can switch
+   * to this tab and just start typing.
+   *
+   * Gated on a fine pointer on purpose. On a phone, focusing a textarea throws up
+   * the on-screen keyboard — having that happen every single time you switch apps
+   * would be unusable, and there is no way to focus without it. So desktop gets
+   * real auto-focus and touch devices are left alone.
+   */
+  var AUTOFOCUS = !!(window.matchMedia && window.matchMedia('(pointer: fine)').matches);
+
+  function focusComposer() {
+    if (!AUTOFOCUS || document.hidden) return;
+    if (vox) return; // never yank focus mid-dictation
+    var el = document.activeElement;
+    // Someone typing in another field keeps it.
+    if (el && el !== input && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+    // Don't destroy a selection the user is in the middle of copying.
+    var sel = window.getSelection && window.getSelection();
+    if (sel && String(sel).trim()) return;
+    try { input.focus({ preventScroll: true }); } catch (e) {
+      try { input.focus(); } catch (e2) { /* focus is a nicety, never fatal */ }
+    }
+  }
+
+  window.addEventListener('focus', focusComposer);
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { clearTimeout(timer); fails = 0; tick(); }
+    if (!document.hidden) { clearTimeout(timer); fails = 0; tick(); focusComposer(); }
   });
   window.addEventListener('resize', function () { if (nearBottom()) scrollBottom(); });
 
@@ -492,7 +551,12 @@
       })
       .then(function (j) {
         var text = ((j && j.text) || '').trim();
-        if (!text) { vHide(); showErr('No words in that — try again.'); return; }
+        if (!text) {
+          vHide();
+          showErr('Heard you, but no words came back — the speech engine returned an empty transcript. Try speaking a little louder.');
+          logClient('stt-empty', { audioMs: j && j.audioMs });
+          return;
+        }
         // Appended, never overwriting: a half-typed draft survives a dictation.
         var draft = input.value.replace(/\s+$/, '');
         input.value = draft ? draft + ' ' + text : text;
@@ -501,8 +565,12 @@
         return doSend('voice').then(function (ok) { if (ok) scrollBottom(); });
       })
       .catch(function (err) {
+        // Recording worked; the transcription leg is what failed. Say so, because
+        // "try again" means something different here than a mic problem.
         vHide();
-        showErr('Dictation failed — ' + ((err && err.message) || 'network error') + '.');
+        showErr('Recorded fine, but transcription failed — ' + ((err && err.message) || 'the server could not be reached') +
+          '. The speech engine may be down.', true);
+        logClient('stt-failed', { message: (err && err.message) || 'network error' });
       })
       .then(function () { micBtn.disabled = false; });
   }
@@ -577,57 +645,153 @@
     }).catch(function () { URL.revokeObjectURL(url); return legacy(); });
   }
 
+  /*
+   * Why the microphone cannot be used here at all, or null if it can.
+   *
+   * On a phone this is essentially always 'insecure': browsers only expose
+   * getUserMedia to a secure context, and this page is normally reached over
+   * plain http on a LAN address. `navigator.mediaDevices` is simply absent
+   * there — which is exactly how you get a mic button that appears to do
+   * nothing, so it is checked up front and reported in as many words.
+   */
+  function micBlockedReason() {
+    if (!window.isSecureContext) return 'insecure';
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return 'unsupported';
+    if (!(window.AudioContext || window.webkitAudioContext)) return 'unsupported';
+    return null;
+  }
+
+  function micBlockedMessage(reason) {
+    if (reason === 'insecure') {
+      return 'Microphone blocked — this page is open at ' + location.protocol + '//' + location.host +
+        ', and browsers only allow the microphone on https:// pages. Nothing is wrong with the mic. ' +
+        'It works today at http://localhost:3901 on the PC itself; an https address that phones can ' +
+        'use is still being set up.';
+    }
+    return 'Microphone unsupported — this browser does not provide getUserMedia or AudioContext, ' +
+      'so the page cannot record at all. Try Chrome, Safari or Firefox.';
+  }
+
+  function markMicBlocked(reason) {
+    var msg = micBlockedMessage(reason);
+    micBtn.className = 'off';           // struck-through, but deliberately NOT disabled:
+    micBtn.title = msg;                 // a disabled button swallows the tap that explains it
+    micBtn.setAttribute('aria-label', msg);
+  }
+
   function startVoice() {
     if (vox) { stopVoice(vox.phase === 'speak' ? 'done' : 'cancel'); return; } // tap again to stop
+
+    var blocked = micBlockedReason();
+    if (blocked) {
+      markMicBlocked(blocked);
+      showErr(micBlockedMessage(blocked), true); // sticky: they need time to read and act
+      logClient('mic-blocked', { reason: blocked, origin: location.origin, secure: !!window.isSecureContext });
+      return;
+    }
+    micBtn.className = ''; // usable after all (e.g. reopened over https)
+
     var AC = window.AudioContext || window.webkitAudioContext;
-    if (!window.isSecureContext) {
-      showErr('The microphone needs a secure page — open this over https, or as http://localhost:3901 on this computer.');
-      return;
-    }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
-      showErr('This browser will not give the page a microphone.');
-      return;
-    }
     micBtn.disabled = true;
     clearErr();
     vStatus('Starting…', false);
     navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     }).then(function (stream) {
-      var ctx;
-      // Ask for 16 kHz outright — the browser resamples better than we can. If it
-      // refuses, we get its native rate and resample in resample() instead.
-      try { ctx = new AC({ sampleRate: V.RATE }); } catch (e) { ctx = new AC(); }
-      var s = {
-        stream: stream, ctx: ctx, rate: ctx.sampleRate, source: null, node: null, sink: null,
-        blocks: [], length: 0, elapsedMs: 0, loudRunMs: 0, lastLoudMs: 0, speechStartMs: 0,
-        noiseSum: 0, noiseN: 0, threshold: V.RMS_FLOOR, phase: 'calib'
-      };
-      s.source = ctx.createMediaStreamSource(stream);
+      var s = null;
+      try {
+        var ctx;
+        // Ask for 16 kHz outright — the browser resamples better than we can. If it
+        // refuses, we get its native rate and resample in resample() instead.
+        try { ctx = new AC({ sampleRate: V.RATE }); } catch (e) { ctx = new AC(); }
+        s = {
+          stream: stream, ctx: ctx, rate: ctx.sampleRate, source: null, node: null, sink: null,
+          blocks: [], length: 0, elapsedMs: 0, loudRunMs: 0, lastLoudMs: 0, speechStartMs: 0,
+          noiseSum: 0, noiseN: 0, threshold: V.RMS_FLOOR, phase: 'calib'
+        };
+        s.source = ctx.createMediaStreamSource(stream);
+      } catch (err) {
+        // The mic is already live by now — hand it back before bailing out, or the
+        // recording indicator stays lit with nothing listening.
+        if (s) teardown(s);
+        else try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        throw captureErr(err, 'could not open an audio context');
+      }
       return attach(s).then(function () {
         vox = s;
         micBtn.className = 'on';
         micBtn.disabled = false;
         vStatus('Getting the room level…', false);
         if (ctx.state === 'suspended') ctx.resume();
-      }).catch(function (err) { teardown(s); throw err; });
+      }).catch(function (err) {
+        teardown(s);
+        throw captureErr(err, 'could not start audio capture');
+      });
     }).catch(function (err) {
       micBtn.disabled = false;
       vHide();
-      var name = err && err.name;
-      showErr(name === 'NotAllowedError' ? 'Microphone permission denied — allow it in your browser settings, then tap the mic again.'
-        : name === 'NotFoundError' ? 'No microphone found on this device.'
-        : 'Microphone unavailable — ' + ((err && err.message) || name || 'unknown error') + '.');
+      var name = (err && err.name) || '';
+      var msg, sticky = false;
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
+        // Distinct from 'insecure': the browser *can* record, you said no.
+        msg = 'Microphone permission denied — this site is blocked from using the mic. ' +
+          'Allow it in the browser\'s site settings (the icon by the address bar), then tap the mic again.';
+        sticky = true;
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        msg = 'No microphone found — this device has no input the browser can see.';
+        sticky = true;
+      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+        msg = 'The microphone is busy — another app is holding it. Close that and tap the mic again.';
+        sticky = true;
+      } else if (err && err.capture) {
+        msg = 'Could not start recording — ' + ((err && err.message) || 'audio capture failed') + '.';
+      } else {
+        msg = 'Microphone unavailable — ' + ((err && err.message) || name || 'unknown error') + '.';
+      }
+      showErr(msg, sticky);
+      logClient('mic-error', { name: name, message: (err && err.message) || '', capture: !!(err && err.capture) });
     });
   }
 
-  micBtn.addEventListener('click', startVoice);
+  /** Wraps a capture-stage failure so it is not mistaken for a permission problem. */
+  function captureErr(err, fallback) {
+    var e = new Error((err && err.message) || fallback);
+    e.capture = true;
+    return e;
+  }
 
+  function initVoice() {
+    if (!micBtn) return;
+    var blocked = micBlockedReason();
+    if (blocked) {
+      markMicBlocked(blocked);
+      // Reported without waiting for a tap, so "the mic didn't work" is already
+      // in the server log by the time anyone asks about it.
+      logClient('mic-blocked-on-load', { reason: blocked, origin: location.origin });
+    }
+    micBtn.addEventListener('click', startVoice);
+  }
+
+  // The queue UI boots first and does not depend on any of the audio code above.
   setInterval(refreshTimes, 30000);
   render();
   autosize();
+  focusComposer();
   poll(true).then(schedule);
   openStream();
+
+  // Voice is wired last and defensively: this is a messaging app with dictation
+  // bolted on, and no audio API a browser lacks may be allowed to take the
+  // messaging half down with it.
+  try {
+    initVoice();
+  } catch (err) {
+    if (micBtn) {
+      micBtn.className = 'off';
+      micBtn.title = 'Dictation could not start up in this browser.';
+    }
+    logClient('voice-init-failed', { message: (err && err.message) || String(err) });
+  }
 })();
 </script>
 </body>

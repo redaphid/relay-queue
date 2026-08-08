@@ -459,6 +459,32 @@ async function sttRoute(req, res, q) {
   });
 }
 
+// ---------------------------------------------------------------- client log
+/*
+ * POST /client-log — write one line to stdout, visible in `docker logs relay-queue`.
+ *
+ * The UI's real home is a phone, where nobody can open a devtools console, so a
+ * failure there is otherwise invisible: "the mic did nothing" is not something
+ * anyone can debug. This is diagnostics only — nothing is stored, nothing enters
+ * the event log, and it cannot affect the queue in any way.
+ */
+const CLIENT_LOG_FIELD = 300; // chars kept per field
+const CLIENT_LOG_PER_MIN = 60;
+let clientLogBudget = CLIENT_LOG_PER_MIN;
+setInterval(() => { clientLogBudget = CLIENT_LOG_PER_MIN; }, 60000).unref();
+
+function clientLogRoute(res, body) {
+  if (clientLogBudget <= 0) return send(res, 429, { ok: false, error: 'rate limited' });
+  clientLogBudget--;
+  // Untrusted text goes to a terminal: flatten newlines and control characters so
+  // it cannot forge extra log lines or smuggle escape sequences.
+  const clean = (v) => String(v === undefined || v === null ? '' : typeof v === 'string' ? v : JSON.stringify(v))
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .slice(0, CLIENT_LOG_FIELD);
+  console.log(`[client] ${clean(body.event) || 'log'} — ${clean(body.detail)} — url=${clean(body.url)} ua=${clean(body.ua)}`);
+  send(res, 200, { ok: true });
+}
+
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
   // `text` is the UI's field name and an alias for `instruction`; both are accepted.
@@ -562,6 +588,12 @@ async function route(req, res) {
     }
     if (m === 'POST') return createTask(res, await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /client-log — one diagnostic line from the browser into the container log
+  if (seg.length === 1 && seg[0] === 'client-log') {
+    if (!need('POST')) return;
+    return clientLogRoute(res, await readBody(req));
   }
 
   // /events — Server-Sent Events push of every change
