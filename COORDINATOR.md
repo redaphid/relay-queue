@@ -248,6 +248,47 @@ applies to `instruction`, not to what you write back.
 you do. What you wrote down is what survives. If you find a note that turned out
 to be wrong, correct the note — a stale memory caused a repeat outage.
 
+**Read `/thread`, not just `/tasks?status=pending`.** They are not the same
+view, and the difference has already cost him an answer. On 2026-08-08 he sent a
+third message four seconds after a coordinator claimed his first two; the
+coordinator had a watcher armed and still did not see it for eight minutes,
+because Monitor events are delivered only when a turn *starts* — a watcher
+cannot rouse you, it can only tell you once something else has. So open
+`GET /thread?conversation=<id>` at the top of every turn. That message
+("they hide when I scroll") turned out to contain the entire diagnosis: it
+overturned the theory two agents were working from. **His throwaway line is
+usually the root cause.** Never plan off the status board either — it truncates
+hard and silently, and one message that previewed as four asks contained six.
+
+**Check whether it already shipped before you build it.** Two agents spent a
+night on Markdown rendering and tickable checklists that had shipped that
+morning in `82a7f29`, on `main`, live on his phone. One `git log --oneline` and
+one `grep` of the file would have caught it. Worse than the wasted work: a
+from-scratch rewrite was about to replace a hand-written renderer that builds
+DOM nodes through `textContent` specifically so message text can never become
+markup — a security property on an unauthenticated queue that anything on the
+LAN can post to. **Before writing a feature, grep `main` for it, read the commit
+that added it, and assume any odd-looking implementation is load-bearing until
+the commit message says otherwise.**
+
+**A test that CI does not run is not coverage, it is a story about coverage.**
+`tools/ui-selftest.js` asserts elements *exist* and is what CI enforces;
+`tools/mobile-selftest.js` asserts *geometry* and is not. That gap has let the
+same bug — his composer off the bottom of his phone — reach him three separate
+times, twice after being "fixed". It also drives only 390×844, so a break at any
+other width passes silently. When you add a UI assertion, put it in the geometry
+suite *and* confirm the enforced entry point actually reaches it. Ask "what runs
+in CI?", never "what tests exist?"
+
+**Assume the notification default is wrong until you have read `classify()`.**
+`server.js:1877` returned `'done'` for every `result` *and* every `message`, so
+each agent post into one of his conversations buzzed a handset that had followed
+him abroad: 17 pushes in one hour, 16 of them pure status. Nobody chose that; it
+was the default, and prose in this file asking agents to be considerate did not
+and cannot stop it. **When a rule about restraint keeps getting broken, stop
+rewriting the rule and go make the mechanism default to silence.** Until that
+lands, pass `notify: "none"` on anything he does not need in his pocket.
+
 ## What a coordinator can and cannot do
 
 Established empirically, so nobody re-derives it:
