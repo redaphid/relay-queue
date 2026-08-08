@@ -218,6 +218,8 @@ function parseSince(raw) {
   return Number.isNaN(ms) ? null : ms;
 }
 
+const truthyParam = (v) => v !== null && v !== 'false' && v !== '0';
+
 /** Applies status / unread / since / limit query filters. Throws {code,message}. */
 function applyFilters(list, q) {
   // `conversation` is the canonical name; `conversationId` is accepted too, since
@@ -233,6 +235,12 @@ function applyFilters(list, q) {
 
   const unread = q.get('unread');
   if (unread !== null && unread !== 'false') list = list.filter((t) => t.relayed === false);
+
+  // `expired=1` is how an abandoned claim gets found at all. Nothing sweeps them
+  // up, so without a way to ask, a lease that has run out changes nothing.
+  if (truthyParam(q.get('expired'))) {
+    list = list.filter((t) => { const l = leaseOf(t); return l !== null && l.expired; });
+  }
 
   const since = q.get('since');
   if (since !== null) {
@@ -859,6 +867,27 @@ const WAITING_ALARM_MS = Number(process.env.WAITING_ALARM_MS || 5 * 60 * 1000); 
  */
 const STUCK_CLAIM_MS = Number(process.env.STUCK_CLAIM_MS || 15 * 60 * 1000);
 const STUCK_ALARM_MS = Number(process.env.STUCK_ALARM_MS || 60 * 60 * 1000);
+/*
+ * THE CLAIM LEASE. A claim used to last forever, so an agent that died still
+ * held its message: one sat 3h14m and another 32m, and nothing but luck found
+ * either. The lease is deliberately PERMISSIVE rather than pre-emptive:
+ *
+ *   - No timer ever touches a task. Nothing is force-cleared, nothing reverts to
+ *     `pending`, and an agent that is legitimately still working is never
+ *     interrupted — an expiry merely stops the queue *refusing* a second agent.
+ *   - The one-result-per-task rule is untouched, so the worst case of an expiry
+ *     that fired too early is a duplicate worker, and the loser gets a 409
+ *     instead of overwriting the answer.
+ *   - The holder can renew by re-claiming its own task, which is an act from
+ *     inside a turn. Heartbeats deliberately do NOT renew: a heartbeat comes
+ *     from a poll loop and proves nothing about whether the agent is awake,
+ *     which is the exact lie this file already refuses to tell elsewhere.
+ *
+ * Same 15 minutes as STUCK_CLAIM_MS above, on purpose: the moment /status starts
+ * calling a claim stuck is the moment another agent is allowed to take it, so
+ * the page and the protocol can never disagree about what "stuck" means.
+ */
+const CLAIM_LEASE_MS = Number(process.env.CLAIM_LEASE_MS || STUCK_CLAIM_MS);
 /*
  * Heartbeats live in memory only, so a restart wipes the whole roster — and this
  * server restarts itself whenever server.js changes, which during development is
@@ -1580,17 +1609,53 @@ function createTask(res, body) {
   send(res, 201, task);
 }
 
+/** Is this claim old enough that another agent may take it? See CLAIM_LEASE_MS. */
+function leaseOf(task) {
+  if (task.status !== 'claimed') return null;
+  if (task.result !== null && task.result !== undefined) return null; // answered: nothing to rescue
+  const since = msOf(task.claimedAt || task.ts);
+  const leftMs = since + CLAIM_LEASE_MS - Date.now();
+  return { expired: leftMs <= 0, leftSec: Math.max(0, Math.round(leftMs / 1000)) };
+}
+
 function claimTask(res, id, body) {
   const task = tasks.get(id);
   if (!task) return fail(res, 404, `no task with id "${id}"`);
+  const by = typeof body.by === 'string' && body.by ? body.by : null;
+
+  if (task.status === 'claimed') {
+    const lease = leaseOf(task);
+    if (lease) {
+      // The holder re-claiming its own task is a renewal: proof it is still on
+      // the job, given from inside a turn, which is the only evidence we trust.
+      if (by !== null && by === task.claimedBy) {
+        appendEvent({ t: 'patch', id, patch: { claimedAt: nowIso() } });
+        return send(res, 200, task);
+      }
+      if (lease.expired) {
+        const from = task.claimedBy || null;
+        appendEvent({ t: 'patch', id, patch: {
+          claimedBy: by, claimedAt: nowIso(), takenOverFrom: from, takenOverAt: nowIso(),
+        } });
+        return send(res, 200, task);
+      }
+    }
+    return fail(res, 409, `task is already ${task.status}`, {
+      status: task.status,
+      id: task.id,
+      claimedBy: task.claimedBy || null,
+      claimedAt: task.claimedAt || null,
+      // Not an invitation to poll — it is the difference between "come back in a
+      // moment" and "this one is never coming back", which the caller could not
+      // previously tell apart.
+      leaseExpiresInSec: lease ? lease.leftSec : null,
+    });
+  }
+
   if (task.status !== 'pending') {
     return fail(res, 409, `task is already ${task.status}`, { status: task.status, id: task.id });
   }
-  const patch = {
-    status: 'claimed',
-    claimedBy: typeof body.by === 'string' && body.by ? body.by : null,
-    claimedAt: nowIso(),
-  };
+  const patch = { status: 'claimed', claimedBy: by, claimedAt: nowIso() };
   appendEvent({ t: 'patch', id, patch });
   send(res, 200, task);
 }

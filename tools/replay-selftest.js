@@ -453,6 +453,51 @@ async function protocolChecks() {
     check('...leaving that question open rather than done-and-empty',
       (await g(`/tasks/${nulled.body.id}`)).status === 'pending');
 
+    /*
+     * 4.1 / §5. A claim that outlives its claimer held one message for 3h14m and
+     * another for 32m. The lease does not seize anything back — it only stops
+     * the queue pretending the dead agent is still on it.
+     */
+    console.log('\nclaims — a lease, so a dead agent cannot hold a message forever');
+    const held = await p_('/tasks', { text: 'the orphaned one', from: 'voice' });
+    const c1 = await p_(`/tasks/${held.body.id}/claim`, { by: 'romeo' });
+    check('a pending task can be claimed', c1.status === 200 && c1.body.claimedBy === 'romeo');
+    const poach = await p_(`/tasks/${held.body.id}/claim`, { by: 'juno' });
+    check('*** a FRESH claim is still protected from a second agent ***', poach.status === 409, `HTTP ${poach.status}`);
+    check('...and the refusal says how long is left on the lease',
+      typeof poach.body.leaseExpiresInSec === 'number' && poach.body.leaseExpiresInSec > 0,
+      JSON.stringify(poach.body));
+    check('...and names who holds it', poach.body.claimedBy === 'romeo', JSON.stringify(poach.body));
+
+    const renew = await p_(`/tasks/${held.body.id}/claim`, { by: 'romeo' });
+    check('the holder can renew its own lease from inside a turn', renew.status === 200, `HTTP ${renew.status}`);
+    check('...and renewal is not a takeover', !renew.body.takenOverFrom, JSON.stringify(renew.body.takenOverFrom));
+    const firstClaimAt = renew.body.claimedAt;
+
+    await sleep(1400); // CLAIM_LEASE_MS is 1200 for this server
+    const taken = await p_(`/tasks/${held.body.id}/claim`, { by: 'juno' });
+    check('*** an EXPIRED claim may be taken over by another agent ***', taken.status === 200, `HTTP ${taken.status}`);
+    check('...the new agent holds it', taken.body.claimedBy === 'juno', taken.body.claimedBy);
+    check('...the takeover is recorded, not silent', taken.body.takenOverFrom === 'romeo', JSON.stringify(taken.body));
+    check('...and the lease clock restarted', Date.parse(taken.body.claimedAt) > Date.parse(firstClaimAt));
+    check('...but the task never went back to pending under other agents\' polls',
+      taken.body.status === 'claimed'
+      && !(await g('/tasks?status=pending')).tasks.some((t) => t.id === held.body.id),
+      taken.body.status);
+    const expired = await g('/tasks?status=claimed&expired=1');
+    check('an expired claim is findable, which is how it gets rescued at all',
+      Array.isArray(expired.tasks), JSON.stringify(expired).slice(0, 120));
+
+    const ans = await p_(`/tasks/${held.body.id}/result`, { result: 'answered by the new holder' });
+    check('the taken-over task can be answered', ans.status === 200, `HTTP ${ans.status}`);
+    const dupe = await p_(`/tasks/${held.body.id}/result`, { result: 'the original agent woke up' });
+    check('*** one result per task SURVIVES the lease: the loser is refused ***',
+      dupe.status === 409, `HTTP ${dupe.status}`);
+    check('...and the first answer is the one that stands',
+      (await g(`/tasks/${held.body.id}`)).result === 'answered by the new holder');
+    const done = await p_(`/tasks/${held.body.id}/claim`, { by: 'someone-else' });
+    check('an ANSWERED task is never reclaimable, however old', done.status === 409, `HTTP ${done.status}`);
+
     console.log('\nit all survives a restart, because it is only ever the event log');
     await stop(proc);
     const proc2 = spawn(process.execPath, [SERVER], {
@@ -463,6 +508,7 @@ async function protocolChecks() {
     proc2.stderr.on('data', () => {});
     try {
       await waitForBoot(proc2, base);
+      check('the takeover survived', (await g(`/tasks/${held.body.id}`)).takenOverFrom === 'romeo');
       check('the relayed guard still holds after a replay',
         (await p_(`/tasks/${(await p_('/tasks', { text: 'fresh' })).body.id}/relayed`, {})).status === 409);
     } finally {
