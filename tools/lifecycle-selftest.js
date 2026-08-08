@@ -34,7 +34,11 @@ const os = require('node:os');
 const path = require('node:path');
 
 const SERVER = path.join(__dirname, '..', 'server.js');
-const PORT = Number(process.env.LIFECYCLE_TEST_PORT || 3919);
+// 3931, not 3919: checklist-selftest landed on 3919 independently, and two
+// suites sharing a default is a race waiting for someone to run them together.
+// (The real fix is an ephemeral port plus a nonce proving the server is ours —
+// a harness that binds a fixed port can silently interrogate a stranger's.)
+const PORT = Number(process.env.LIFECYCLE_TEST_PORT || 3931);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
