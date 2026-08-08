@@ -257,6 +257,15 @@ async function pushChecks() {
     env: {
       ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1',
       WATCH_SOURCE: '0', PUSH_DEBOUNCE_MS: '120',
+      /*
+       * The hourly ceiling is deliberately NOT the variable under test here.
+       * This one long-lived server flushes a dozen notifications in a few
+       * seconds, so the real default of 6/hour would run out midway and every
+       * later assertion would fail for the wrong reason (it did, the first
+       * time this ran after the default dropped from 20 to 6). The ceiling
+       * itself is pinned in tools/push-selftest.js, on a fresh instance.
+       */
+      PUSH_PER_HOUR: '1000',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -315,8 +324,21 @@ async function pushChecks() {
       check('...and it is not internal', seen.body.visibility === 'conversation');
       await settle();
       const after2 = await stats();
-      check('...and it DOES queue a notification', after2.queued === before.queued + 1, String(after2.queued));
-      check('...and it flushes', after2.flushed === before.flushed + 1);
+      /*
+       * Since 2026-08-08 an agent message is silent unless it asks to be heard.
+       * It used to default to 'done', which put 17 pushes on his phone in one
+       * hour while he was abroad. Still in the thread; simply not on the phone.
+       */
+      check('...but it still queues NOTHING, because pushing is opt-in',
+        after2.queued === before.queued, `${before.queued} -> ${after2.queued}`);
+      check('...and so nothing flushes', after2.flushed === before.flushed);
+
+      const loud = await p_('/messages', { text: 'the disk you asked about is full', from: 'zora', notify: 'done' });
+      check('an agent that opts in with a notify hint is accepted', loud.status === 201);
+      await settle();
+      const after3 = await stats();
+      check('...and THAT one does queue a notification', after3.queued === after2.queued + 1, String(after3.queued));
+      check('...and it flushes', after3.flushed === after2.flushed + 1);
     }
 
     console.log('\npush — he is never buzzed by the phone he typed on');
@@ -340,6 +362,12 @@ async function pushChecks() {
        * The documented way for an agent to speak unprompted is to post a task
        * and immediately answer it. Without the cancel that is two buzzes for
        * one update, which is exactly the noise he asked to be spared.
+       *
+       * Since pushing became opt-in it is now ZERO buzzes by default, and that
+       * is right: an agent that answers its own question inside a second never
+       * needed him, so what it posted was progress, not a question. The cancel
+       * still runs — notify() calls it before classify() — which is what keeps
+       * the count at one rather than two when the answer DOES opt in below.
        */
       const before = await stats();
       const t = await p_('/tasks', { text: 'unprompted update', from: 'vega' });
@@ -347,8 +375,20 @@ async function pushChecks() {
       check('the result posted', answered.status === 200, String(answered.status));
       await settle();
       const after = await stats();
-      check('two things wanted to notify', after.queued === before.queued + 2);
-      check('but only one buzz went out', after.flushed === before.flushed + 1, `${before.flushed} -> ${after.flushed}`);
+      check('only the task wanted to notify; the answer did not',
+        after.queued === before.queued + 1, `${before.queued} -> ${after.queued}`);
+      check('and the answer cancelled it, so NO buzz went out at all',
+        after.flushed === before.flushed, `${before.flushed} -> ${after.flushed}`);
+
+      // The same pattern, but the agent asks to be heard. Still exactly one buzz.
+      const t2 = await p_('/tasks', { text: 'a thing he actually wanted', from: 'vega' });
+      await p_(`/tasks/${t2.body.id}/result`, { result: 'and here it is', notify: 'done' });
+      await settle();
+      const opted = await stats();
+      check('an opted-in answer queues its own notification',
+        opted.queued === after.queued + 2, `${after.queued} -> ${opted.queued}`);
+      check('...but the cancel still collapses it to one buzz',
+        opted.flushed === after.flushed + 1, `${after.flushed} -> ${opted.flushed}`);
     }
 
     console.log('\npush — an explicit notify hint is honoured');
@@ -367,12 +407,12 @@ async function pushChecks() {
       const off = await p_('/push/config', { categories: { done: false } });
       check('a category can be turned off', off.status === 200 && off.body.categories.done === false);
       const before = await stats();
-      await p_('/messages', { text: 'another finished thing', from: 'zora' });
+      await p_('/messages', { text: 'another finished thing', from: 'zora', notify: 'done' });
       await settle();
       check('a "done" message is then ignored', (await stats()).queued === before.queued);
       const on = await p_('/push/config', { categories: { done: true } });
       check('and it can be turned back on', on.status === 200 && on.body.categories.done === true);
-      await p_('/messages', { text: 'and another', from: 'zora' });
+      await p_('/messages', { text: 'and another', from: 'zora', notify: 'done' });
       await settle();
       check('...after which it queues again', (await stats()).queued === before.queued + 1);
     }
@@ -396,7 +436,7 @@ async function pushChecks() {
       check('...and saying when it lifts', typeof wrap.body.quiet.changesInMin === 'number');
 
       const before = await stats();
-      await p_('/messages', { text: 'this should be held back', from: 'zora' });
+      await p_('/messages', { text: 'this should be held back', from: 'zora', notify: 'done' });
       await settle();
       const during = await stats();
       check('the message was queued', during.queued === before.queued + 1);
@@ -405,7 +445,7 @@ async function pushChecks() {
 
       const past = await p_('/push/config', { quietFrom: hhmm(nowMin - 61), quietTo: hhmm(nowMin - 60) });
       check('a window that ended a minute ago is NOT active', past.body.quiet.active === false, JSON.stringify(past.body.quiet));
-      await p_('/messages', { text: 'this one should get through', from: 'zora' });
+      await p_('/messages', { text: 'this one should get through', from: 'zora', notify: 'done' });
       await settle();
       check('...so the next message flushes', (await stats()).flushed === during.flushed + 1);
 
@@ -428,7 +468,7 @@ async function pushChecks() {
       await p_('/messages', { text: 'still on fire', from: 'zora', notify: 'broken' });
       await settle();
       check('...after which "broken" gets through', (await stats()).flushed === mid.flushed + 1);
-      await p_('/messages', { text: 'a routine thing', from: 'zora' });
+      await p_('/messages', { text: 'a routine thing', from: 'zora', notify: 'done' });
       await settle();
       check('...but "done" still does not', (await stats()).flushed === mid.flushed + 1);
       await p_('/push/config', { quietFrom: null, quietTo: null, brokenOverridesQuiet: false });
