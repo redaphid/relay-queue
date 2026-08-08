@@ -199,6 +199,75 @@ const checks = new Map();
 let logFd = null;
 let mutations = 0; // bumped on every applied event; memoisation keys off it
 
+/* ------------------------------------------------------------ activity feed
+ * What is this coordinator actually doing right now: which subagents it spawned,
+ * which finished, and — if something is bothering to report them — which tools
+ * it ran. An append-only ring per conversation, capped, oldest dropped first.
+ *
+ * DURABILITY IS SPLIT ON PURPOSE, and the split is the whole design:
+ *
+ *   - subagent spawned/finished and worktree claims are DURABLE. They are rare,
+ *     and they are the only record of what is still running and what is still
+ *     holding a git worktree when this process restarts. This server restarts
+ *     itself whenever server.js changes, i.e. constantly, and forgetting "there
+ *     are three subagents out there holding trees" across a restart would
+ *     recreate the exact ghost the stop fields above exist to prevent.
+ *
+ *   - tool calls are EPHEMERAL, memory only. They are high volume and would
+ *     bury the actual history in `events.jsonl` — the same reason heartbeats
+ *     are not logged. A live view is allowed to start empty after a restart;
+ *     the queue's own record of what happened is not.
+ *
+ * NOTHING HERE FEEDS LIVENESS. A tool call is not proof of useful work: an agent
+ * sitting in a poll loop emits them forever while achieving nothing, which is
+ * precisely the lie a heartbeat tells. `lastActedAt` keeps coming from claims
+ * and results only. This feed is colour, not evidence.
+ */
+const ACTIVITY = new Map(); // conversationId -> entry[] (oldest first)
+const ACTIVITY_CAP = Number(process.env.ACTIVITY_CAP || 200); // per conversation
+const ACTIVITY_CONVS = 50; // distinct conversations tracked before the quietest is dropped
+const DURABLE_KINDS = new Set(['spawned', 'finished', 'worktree']);
+
+function pushActivity(entry) {
+  if (!entry || typeof entry.conversationId !== 'string') return null;
+  let feed = ACTIVITY.get(entry.conversationId);
+  if (!feed) {
+    if (ACTIVITY.size >= ACTIVITY_CONVS) {
+      // Drop whichever feed has been quiet longest, not whichever was created
+      // first — a long-lived busy conversation must not be evicted by churn.
+      let oldestId = null;
+      let oldestAt = Infinity;
+      for (const [id, f] of ACTIVITY) {
+        const at = f.length ? msOf(f[f.length - 1].at) : 0;
+        if (at < oldestAt) { oldestAt = at; oldestId = id; }
+      }
+      if (oldestId !== null) ACTIVITY.delete(oldestId);
+    }
+    feed = [];
+    ACTIVITY.set(entry.conversationId, feed);
+  }
+  feed.push(entry);
+  while (feed.length > ACTIVITY_CAP) feed.shift();
+  return entry;
+}
+
+/*
+ * THE STOP FIELDS, AND THE LIE THEY EXIST TO PREVENT.
+ *
+ * A coordinator is two separate things: this row, and a Claude agent running in
+ * some session. The UI can only reach the row. Archiving or deleting it does
+ * NOT stop the agent — it keeps running, keeps holding git worktrees, and may
+ * keep posting into a conversation that now looks closed. That is strictly
+ * worse than leaving it alone, because it *looks* resolved.
+ *
+ * So there is no kill here, and deliberately never will be. `stopRequested` is
+ * a note pinned to the door: the agent reads it the next time it happens to
+ * wake, and stops itself. Nothing in this process can make that happen sooner,
+ * because an agent cannot be woken from outside — a Monitor event is only
+ * delivered at the start of a turn. The acknowledgement fields exist purely so
+ * the difference between "asked" and "actually stopped" stays visible instead
+ * of being assumed, and they are only ever written by the agent itself.
+ */
 function newConversation(id, title, agent) {
   return {
     id,
@@ -207,7 +276,35 @@ function newConversation(id, title, agent) {
     createdAt: nowIso(),
     archived: false,
     archivedAt: null,
+    stopRequested: false,
+    stopRequestedAt: null,
+    stopRequestedBy: null,
+    // Written by the agent, from inside a turn. `null` means it has not been
+    // heard from since the request — the normal state, not an error.
+    stopAck: null,        // null | 'stopping' | 'stopped'
+    stopAckAt: null,
+    stoppedAt: null,
+    stopNote: null,
+    // What the agent says it was holding when it wound down. Reported, never
+    // observed: this server does not touch git and cannot verify a word of it.
+    worktrees: null,
   };
+}
+
+/*
+ * Conversations written before the stop fields existed replay as bare objects.
+ * Normalising on the way in keeps every reader free of `undefined` checks and,
+ * more importantly, stops "never asked to stop" and "asked, no answer yet" from
+ * both arriving as `undefined` at the point where the UI picks a badge.
+ */
+function normaliseConv(conv) {
+  const base = {
+    archived: false, archivedAt: null,
+    stopRequested: false, stopRequestedAt: null, stopRequestedBy: null,
+    stopAck: null, stopAckAt: null, stoppedAt: null, stopNote: null, worktrees: null,
+  };
+  for (const [k, v] of Object.entries(base)) if (conv[k] === undefined) conv[k] = v;
+  return conv;
 }
 
 /*
@@ -237,10 +334,14 @@ function applyEvent(ev) {
     const task = tasks.get(ev.id);
     if (task) Object.assign(task, ev.patch);
   } else if (ev.t === 'conv') {
-    conversations.set(ev.conv.id, ev.conv);
+    conversations.set(ev.conv.id, normaliseConv(ev.conv));
   } else if (ev.t === 'convpatch') {
     const conv = conversations.get(ev.id);
     if (conv) Object.assign(conv, ev.patch);
+  } else if (ev.t === 'act') {
+    // The durable half of the activity feed — see the feed section below for
+    // why only some kinds get a line in the log at all.
+    pushActivity(ev.entry);
   } else if (ev.t === 'sub') {
     // One row per browser. Firefox and Chrome are separate subscriptions with
     // separate push services, so this is a set and never a single value.
@@ -884,9 +985,112 @@ function agentLiveness(c) {
   return { ...base, state: 'idle' };
 }
 
+/*
+ * THE LIFECYCLE VALUE — one field, and the only one a badge should switch on.
+ *
+ * Liveness (is it there?) and stopping (has it been asked to go?) are two
+ * independent axes, and both are kept in the payload. But a UI needs a single
+ * value to render, and if each client recombines the axes itself they will
+ * disagree — so the combination is made here, once.
+ *
+ * The precedence exists to keep five things that are genuinely different from
+ * ever rendering the same:
+ *
+ *   unassigned      no agent has ever been assigned. Nothing to stop.
+ *   never           assigned, but has not acted or checked in even once.
+ *   idle/watching   assigned, acted recently, nothing waiting or being handled.
+ *   stale/silent/stuck  assigned, work is waiting, nothing is happening.
+ *   stop-requested  asked to stop, HAS NOT ANSWERED. Still running, as far as
+ *                   anyone here knows. This is the state people will misread as
+ *                   "done", so it carries the loudest wording in the payload.
+ *   stopping        it answered, and is winding down.
+ *   stopped         it said it was finished and stood itself down. The ONLY
+ *                   state that means the agent is actually gone.
+ *
+ * `stopped` outranks `unassigned` deliberately: a stopped agent unassigns itself
+ * as its last act, so without this a clean shutdown would be indistinguishable
+ * from a conversation that never had an agent at all.
+ */
+function stopStateOf(c) {
+  const requestedAgoSec = secSince(c.stopRequestedAt);
+  const ackAgoSec = secSince(c.stopAckAt);
+  const phase = c.stopAck === 'stopped' ? 'stopped'
+    : c.stopAck === 'stopping' ? 'stopping'
+      : c.stopRequested ? 'requested' : null;
+
+  // Did the agent do any real queue work AFTER being asked? Proof it is alive
+  // and has not read the note — the difference between "winding down" and
+  // "carrying on regardless", which no timeout could tell you.
+  const actedSince = c.stopRequestedAt && c.lastActedAt
+    ? msOf(c.lastActedAt) > msOf(c.stopRequestedAt) : false;
+
+  return {
+    phase,
+    requested: !!c.stopRequested,
+    requestedAt: c.stopRequestedAt || null,
+    requestedAgoSec,
+    requestedBy: c.stopRequestedBy || null,
+    ack: c.stopAck || null,
+    ackAt: c.stopAckAt || null,
+    ackAgoSec,
+    stoppedAt: c.stoppedAt || null,
+    note: c.stopNote || null,
+    worktrees: c.worktrees || null,
+    worktreesAreSelfReported: true,
+    actedSinceRequest: actedSince,
+    /*
+     * Nobody is listening. A stop request on a conversation with no agent is a
+     * note pinned to a door with no room behind it — it will sit `requested`
+     * forever, and that must not be mistaken for "any moment now".
+     */
+    willNeverBeSeen: !!c.stopRequested && !c.agent && !c.stopAck,
+    // Asked a while ago, still nothing back. Not necessarily broken — an agent
+    // is only able to notice at the start of a turn — but worth showing plainly.
+    unacknowledgedForSec: c.stopRequested && !c.stopAck ? requestedAgoSec : null,
+  };
+}
+
+function agentLifecycle(c) {
+  const live = agentLiveness(c);
+  const stop = stopStateOf(c);
+  const lifecycle = stop.phase === 'stopped' ? 'stopped'
+    : stop.phase === 'stopping' ? 'stopping'
+      : stop.phase === 'requested' ? 'stop-requested'
+        : live.state;
+  return {
+    ...live,
+    lifecycle,
+    stop,
+    /*
+     * Carried on every row, not just on the ones being stopped, because the UI
+     * has to be able to explain the limit at the moment he reaches for the
+     * control — not after he has already assumed it worked.
+     */
+    forceKill: FORCE_KILL_NOTE,
+  };
+}
+
 /** Summaries plus live agent state — what the conversation list actually renders. */
 const conversationsWithLiveness = () =>
-  conversationSummaries().map((c) => ({ ...c, agentState: agentLiveness(c) }));
+  conversationSummaries().map((c) => ({
+    ...c,
+    agentState: agentLifecycle(c),
+    // Compact enough to ride along on the list; the full feed has its own route.
+    activity: activitySummary(c.id),
+  }));
+
+/** Just the counters, for the conversation list. The entries are the big part. */
+function activitySummary(id) {
+  const a = activityOf(id);
+  return {
+    running: a.running,
+    subagents: a.subagents.length,
+    toolCalls: a.toolCalls,
+    lastAt: a.lastAt,
+    reporting: a.reporting,
+    count: a.count,
+  };
+}
 
 // ---------------------------------------------------------------- live stream
 /*
@@ -2885,11 +3089,236 @@ function updateConversation(res, id, body) {
     }
     patch.archived = body.archived;
     patch.archivedAt = body.archived ? nowIso() : null;
+    /*
+     * Archiving says nothing whatsoever about the agent, and must not be allowed
+     * to imply otherwise. It files the conversation away; the agent carries on.
+     * If you want it to wind down you have to ask, separately and explicitly,
+     * with `stopRequested` — and even then see below about what that buys you.
+     */
   }
 
-  if (!Object.keys(patch).length) return fail(res, 400, 'nothing to update (title, agent or archived)');
+  if (body.stopRequested !== undefined) {
+    if (typeof body.stopRequested !== 'boolean') {
+      return fail(res, 400, 'stopRequested must be true or false');
+    }
+    if (body.stopRequested) {
+      patch.stopRequested = true;
+      patch.stopRequestedAt = nowIso();
+      patch.stopRequestedBy = typeof body.stopRequestedBy === 'string' && body.stopRequestedBy.trim()
+        ? body.stopRequestedBy.trim().slice(0, MAX_AGENT)
+        : 'human';
+      // A fresh request clears any previous acknowledgement: an agent that
+      // stopped, was reassigned, and is now being asked again must not still be
+      // wearing the last round's "stopped" badge.
+      patch.stopAck = null;
+      patch.stopAckAt = null;
+      patch.stoppedAt = null;
+    } else {
+      // Withdrawing the request. The agent may already have acted on it — there
+      // is no recall — so this only clears the ask, never the acknowledgement.
+      patch.stopRequested = false;
+      patch.stopRequestedAt = null;
+      patch.stopRequestedBy = null;
+    }
+  }
+
+  if (!Object.keys(patch).length) {
+    return fail(res, 400, 'nothing to update (title, agent, archived or stopRequested)');
+  }
   appendEvent({ t: 'convpatch', id, patch });
+  /*
+   * Answer with the honest truth about what just happened, so no client can
+   * render this as a kill by accident. Asking is not stopping, and the reply
+   * says so in words a UI can put straight on the screen.
+   */
+  if (patch.stopRequested === true) {
+    return send(res, 200, { ...conv, stopRequestEffect: stopRequestEffect(conv) });
+  }
   send(res, 200, conv);
+}
+
+/*
+ * The paragraph the UI should show after asking a coordinator to stop. It lives
+ * here rather than in the page because every client must say the same thing,
+ * and because the one sentence that must never be dropped in a redesign is the
+ * last one.
+ */
+function stopRequestEffect(conv) {
+  const live = conv.agent
+    ? `"${conv.agent}" will see this the next time something wakes it.`
+    : 'No agent is assigned to this conversation, so nothing will read it.';
+  return {
+    requested: true,
+    stopped: false,
+    agent: conv.agent || null,
+    summary: `Asked to stop. ${live}`,
+    detail: 'This is a request, not a kill. The queue cannot start, signal or stop an '
+      + 'agent: it can only leave a note that the agent reads the next time it wakes on '
+      + 'its own. Until it acknowledges, assume it is still running and still holding any '
+      + 'git worktrees it checked out.',
+    forceKill: FORCE_KILL_NOTE,
+  };
+}
+
+/*
+ * Said in exactly one place so it cannot drift between the API and the page.
+ * A UI that shows a stop control MUST be able to tell him where the real kill
+ * switch is, because it is not here and never will be.
+ */
+const FORCE_KILL_NOTE = {
+  availableHere: false,
+  where: 'top-level Claude session',
+  how: 'Only the top-level Claude session that spawned the agent can actually terminate '
+    + 'it (TaskStop, or ending the session). Nothing in relay-queue — archiving, deleting, '
+    + 'or unassigning — will stop a running agent.',
+};
+
+/*
+ * POST /conversations/:id/stop-ack — the agent answering the note on the door.
+ *
+ * Two phases, and both matter. `stopping` means "I have seen it and I am winding
+ * down": claims released, worktrees being handed back. `stopped` means the agent
+ * is done, and is the ONLY thing in this system entitled to say so. It unassigns
+ * itself as its last act, because an `agent` still set on a stopped conversation
+ * is the ghost all over again.
+ *
+ * This is a write only an agent can make, from inside a turn, which is why it is
+ * trustworthy in a way no timeout could be. There is no server-side fallback
+ * that marks a conversation stopped after N minutes of silence: that would be
+ * inventing the very confirmation this endpoint exists to require.
+ */
+function stopAckRoute(res, id, body) {
+  const conv = conversations.get(id);
+  if (!conv) return fail(res, 404, `no conversation with id "${id}"`);
+
+  const phase = typeof body.phase === 'string' ? body.phase.trim() : '';
+  if (phase !== 'stopping' && phase !== 'stopped') {
+    return fail(res, 400, 'phase must be "stopping" (winding down) or "stopped" (finished)');
+  }
+  if (conv.stopAck === 'stopped' && phase === 'stopping') {
+    return fail(res, 409, 'this conversation is already marked stopped; a stopped agent cannot go back to stopping', {
+      stopAck: conv.stopAck, stoppedAt: conv.stoppedAt,
+    });
+  }
+
+  const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : null;
+  let worktrees = null;
+  if (body.worktrees !== undefined && body.worktrees !== null) {
+    if (!Array.isArray(body.worktrees)) return fail(res, 400, 'worktrees must be an array of strings');
+    worktrees = body.worktrees
+      .filter((w) => typeof w === 'string' && w.trim())
+      .map((w) => w.trim().slice(0, 300))
+      .slice(0, 50);
+  }
+
+  const at = nowIso();
+  const patch = { stopAck: phase, stopAckAt: at, stopNote: note };
+  if (worktrees !== null) patch.worktrees = worktrees;
+  if (phase === 'stopped') {
+    patch.stoppedAt = at;
+    // Its last act: stand down from the conversation. Recorded first so that
+    // even if this is the final thing the agent ever does, the row is honest.
+    patch.agent = null;
+  }
+  appendEvent({ t: 'convpatch', id, patch });
+
+  /*
+   * Worktrees are REPORTED, not verified — this server does not touch git and
+   * has no way to know whether they were really released. Say so, so nobody
+   * reads the list as a guarantee that the disk is clean.
+   */
+  send(res, 200, {
+    ...conv,
+    worktreesAreSelfReported: true,
+    releasedBy: typeof body.agent === 'string' ? body.agent.slice(0, MAX_AGENT) : null,
+  });
+}
+
+/*
+ * POST /conversations/:id/activity — a coordinator narrating its own work.
+ *
+ * Deliberately tiny, and deliberately not required: an agent that reports
+ * nothing behaves exactly as it does today, and the panel simply shows that
+ * nothing was reported. The distinction between "quiet" and "not instrumented"
+ * is carried by `reporting` in the feed response rather than being guessed at.
+ */
+const ACT_KINDS = new Set(['spawned', 'finished', 'tool', 'note']);
+
+function activityRoute(res, id, body) {
+  const conv = conversations.get(id);
+  if (!conv) return fail(res, 404, `no conversation with id "${id}"`);
+
+  const kind = typeof body.kind === 'string' ? body.kind.trim() : '';
+  if (!ACT_KINDS.has(kind)) {
+    return fail(res, 400, `kind must be one of: ${[...ACT_KINDS].join(', ')}`, { got: kind || null });
+  }
+  const str = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+  const subagent = str(body.subagent, 100);
+  if ((kind === 'spawned' || kind === 'finished') && !subagent) {
+    return fail(res, 400, `kind "${kind}" needs a subagent name, so the panel can pair the two halves`);
+  }
+
+  const entry = {
+    at: nowIso(),
+    conversationId: id,
+    kind,
+    agent: str(body.agent, MAX_AGENT),   // who is reporting
+    subagent,                            // who it is about, for spawned/finished
+    task: str(body.task, 200),           // what that subagent was asked to do
+    tool: str(body.tool, 80),
+    text: str(body.text, 300),
+    ok: typeof body.ok === 'boolean' ? body.ok : null,
+  };
+
+  if (DURABLE_KINDS.has(kind)) {
+    appendEvent({ t: 'act', entry }); // applyEvent pushes it into the ring
+  } else {
+    pushActivity(entry);
+  }
+  send(res, 201, { ok: true, entry, durable: DURABLE_KINDS.has(kind) });
+}
+
+/*
+ * The panel's data. Subagents are folded up into a roster here rather than in
+ * the browser, because pairing spawned/finished is the only part with a rule to
+ * get wrong: a subagent is "running" until a `finished` with the same name
+ * arrives, and one that never finishes stays visible forever on purpose.
+ */
+function activityOf(conversationId) {
+  const feed = ACTIVITY.get(conversationId) || [];
+  const subagents = new Map();
+  let tools = 0;
+  for (const e of feed) {
+    if (e.kind === 'tool') tools++;
+    if (e.kind !== 'spawned' && e.kind !== 'finished') continue;
+    const cur = subagents.get(e.subagent) || { name: e.subagent, task: null, startedAt: null, finishedAt: null, ok: null };
+    if (e.kind === 'spawned') { cur.startedAt = e.at; cur.task = e.task || cur.task; cur.finishedAt = null; cur.ok = null; }
+    else { cur.finishedAt = e.at; cur.ok = e.ok; if (e.task && !cur.task) cur.task = e.task; }
+    subagents.set(e.subagent, cur);
+  }
+  const roster = [...subagents.values()].map((s) => ({
+    ...s,
+    running: s.finishedAt === null && s.startedAt !== null,
+    runningForSec: s.finishedAt === null ? secSince(s.startedAt) : null,
+  }));
+  return {
+    entries: feed,
+    count: feed.length,
+    capped: feed.length >= ACTIVITY_CAP,
+    cap: ACTIVITY_CAP,
+    subagents: roster,
+    running: roster.filter((s) => s.running).length,
+    toolCalls: tools,
+    lastAt: feed.length ? feed[feed.length - 1].at : null,
+    /*
+     * Empty means one of two very different things and the UI must not guess:
+     * either this coordinator has done nothing, or nobody taught it to report.
+     * Agents report nothing by default, so "never" is overwhelmingly the latter.
+     */
+    reporting: feed.length > 0,
+    toolCallsAreEphemeral: true,
+    ephemeralSince: new Date(STARTED_AT).toISOString(),
+  };
 }
 
 /*
