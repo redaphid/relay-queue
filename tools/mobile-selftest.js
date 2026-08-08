@@ -67,7 +67,17 @@ const CONVS = {
   conversations: [conv('main', 'Main', 'Zora', 'watching'), conv('iceland', 'Iceland', 'Iceland', 'idle')],
 };
 
+// The checklist the user actually asked for, at the end so it is on screen.
+{
+  const ts = new Date(now - 30000).toISOString();
+  ENTRIES.push({
+    id: 'packing', role: 'agent', status: 'done', ts, rev: ts, conversationId: 'main',
+    text: '## Iceland packing\n\n- [ ] passport and boarding pass\n- [ ] travel adapters\n- [x] wool socks\n- [ ] waterproof shell\n\nSee [the forecast](https://example.com/wx). Injection attempt: <img src=x onerror=alert(1)> and [tap](javascript:alert(2)).',
+  });
+}
+
 let sse = [];
+const posted = [];
 const clientLogs = [];
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
@@ -91,6 +101,16 @@ const server = http.createServer((req, res) => {
     res.write('retry: 3000\n\n');
     sse.push(res);
     req.on('close', () => { sse = sse.filter((r) => r !== res); });
+    return;
+  }
+  if (u.pathname === '/tasks' && req.method === 'POST') {
+    let b = '';
+    req.on('data', (d) => { b += d; });
+    req.on('end', () => {
+      try { posted.push(JSON.parse(b)); } catch (e) { /* ignore */ }
+      res.writeHead(201, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'chk-' + posted.length }));
+    });
     return;
   }
   if (u.pathname === '/client-log') {
@@ -196,6 +216,78 @@ function REACHABLE(sel) {
   await page.waitForTimeout(400);
   const closed = await page.evaluate(() => document.querySelector('#drawer').hidden);
   check('Escape closes it again', closed === true, String(closed));
+
+  console.log('\nthe checklist is usable with a thumb');
+  {
+    const boxes = await page.$$('#list .mdtask input[type="checkbox"]');
+    check('the task list renders checkboxes', boxes.length === 4, `${boxes.length}`);
+
+    // A checkbox you cannot hit is a checkbox you do not have. 24px is about the
+    // floor for a thumb; the row's label is what actually gets tapped.
+    const sizes = await page.evaluate(() => Array.from(document.querySelectorAll('#list .mdtask'))
+      .map((li) => {
+        const b = li.getBoundingClientRect();
+        const box = li.querySelector('input');
+        const cb = box.getBoundingClientRect();
+        const hit = document.elementFromPoint(cb.left + cb.width / 2, cb.top + cb.height / 2);
+        return { rowH: Math.round(b.height), boxW: Math.round(cb.width), reachable: !!(hit && (hit === box || box.contains(hit) || li.contains(hit))) };
+      }));
+    check('every row is big enough to hit', sizes.every((s) => s.rowH >= 30 && s.boxW >= 20), JSON.stringify(sizes));
+    check('every checkbox is actually reachable', sizes.every((s) => s.reachable), JSON.stringify(sizes));
+    check('the list does not overflow the bubble width',
+      await page.evaluate(() => {
+        const l = document.querySelector('#list .mdtasks').getBoundingClientRect();
+        return l.left >= -0.5 && l.right <= window.innerWidth + 0.5;
+      }), 'list overflows');
+
+    // Injection, in a browser that would actually execute it.
+    const injected = await page.evaluate(() => ({
+      imgs: document.querySelectorAll('#list img').length,
+      scripts: document.querySelectorAll('#list script').length,
+      hrefs: Array.from(document.querySelectorAll('#list a')).map((a) => a.getAttribute('href')),
+      shown: document.querySelector('#list .msg:last-child .body').textContent.indexOf('onerror') >= 0,
+    }));
+    check('*** no element is created from message markup ***',
+      injected.imgs === 0 && injected.scripts === 0, JSON.stringify(injected));
+    check('*** only allowlisted schemes become links ***',
+      injected.hrefs.length === 1 && injected.hrefs[0] === 'https://example.com/wx', JSON.stringify(injected.hrefs));
+    check('...and the rejected markup is still visible as text', injected.shown, JSON.stringify(injected));
+
+    // Tick one, as a finger would.
+    posted.length = 0;
+    await page.click('#list .mdtask:first-child label');
+    await page.waitForTimeout(1200);
+    const ticked = await page.evaluate(() => {
+      const li = document.querySelector('#list .mdtask:first-child');
+      return {
+        checked: li.querySelector('input').checked,
+        cls: li.className,
+        mark: li.querySelector('.tmark').textContent,
+      };
+    });
+    check('tapping the row ticks the box straight away', ticked.checked === true, JSON.stringify(ticked));
+    check('the agent is told, with the item and the Vikunja request',
+      posted.length === 1 && /passport/.test(posted[0].text) && /vikunja/i.test(posted[0].text),
+      JSON.stringify(posted));
+    check('*** an unconfirmed tick says so rather than looking done ***',
+      /saving/i.test(ticked.mark) && /unsettled/.test(ticked.cls), JSON.stringify(ticked));
+
+    // And it must come back ticked after a reload, since that is the whole point.
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForTimeout(1800);
+    const afterReload = await page.evaluate(() => {
+      const li = document.querySelector('#list .mdtask:first-child');
+      return li ? { checked: li.querySelector('input').checked, mark: li.querySelector('.tmark').textContent } : null;
+    });
+    check('*** the tick survives a reload ***', afterReload && afterReload.checked === true, JSON.stringify(afterReload));
+    check('...and is still honest about not being confirmed',
+      afterReload && /saving|not confirmed/i.test(afterReload.mark), JSON.stringify(afterReload));
+
+    for (const [name, sel] of [['the message box', '#input'], ['the hamburger menu', '#menu'], ['Send', '#send']]) {
+      const r = await page.evaluate(REACHABLE, sel);
+      check(`${name} is still reachable with a checklist on screen`, r.ok, r.why);
+    }
+  }
 
   console.log('\nthe conversation survives a reload, in a real browser');
   {

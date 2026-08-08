@@ -282,7 +282,76 @@
   #empty { color: var(--muted); text-align: center; margin: 32px 12px; font-size: 15px; }
 
   .msg { max-width: 86%; margin: 0 0 12px; padding: 10px 13px; border-radius: 17px; }
-  .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+  /* Blocks bring their own spacing now that the body is rendered Markdown, so
+     `pre-wrap` would double every gap. Single newlines inside a paragraph are
+     kept as <br> by the renderer, which is what preserves dictated line breaks. */
+  .msg .body { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+
+  /* ---- rendered Markdown ------------------------------------------------ */
+  .msg .body > :first-child { margin-top: 0; }
+  .msg .body > :last-child { margin-bottom: 0; }
+  .mdp { margin: 0 0 8px; }
+  .mdh { margin: 10px 0 6px; font-weight: 700; line-height: 1.3; }
+  .mdh1 { font-size: 19px; } .mdh2 { font-size: 17px; } .mdh3 { font-size: 16px; }
+  .mdh4, .mdh5, .mdh6 { font-size: 15px; }
+  .mdlist, .mdtasks { margin: 0 0 8px; padding-left: 22px; }
+  .mdtasks { list-style: none; padding-left: 0; }
+  .mdlist li { margin: 2px 0; }
+  .mdquote {
+    margin: 0 0 8px; padding: 2px 0 2px 10px;
+    border-left: 3px solid var(--line); opacity: .85;
+  }
+  .msg .body code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .92em; padding: 1px 5px; border-radius: 6px;
+    background: rgba(127, 127, 127, .18);
+  }
+  .msg .body pre {
+    margin: 0 0 8px; padding: 9px 11px; border-radius: 11px;
+    overflow-x: auto; background: rgba(127, 127, 127, .16);
+  }
+  .msg .body pre code { padding: 0; background: none; white-space: pre; }
+  .msg .body a { color: inherit; text-underline-offset: 2px; }
+
+  /* ---- checklists -------------------------------------------------------
+     The reason markdown is here at all. Rows are big enough to hit with a
+     thumb: 44px is the smallest target that reliably works on a phone, and
+     this list is read while walking around a bedroom holding a suitcase. */
+  .mdtask {
+    display: flex; align-items: flex-start; gap: 10px;
+    margin: 0; padding: 5px 0; min-height: 34px;
+  }
+  .mdtask label {
+    display: flex; align-items: flex-start; gap: 10px;
+    flex: 1 1 auto; min-width: 0; cursor: pointer;
+    padding: 4px 0; /* pads the row out to a comfortable target */
+  }
+  .mdtask input[type="checkbox"] {
+    flex: 0 0 auto; width: 22px; height: 22px; margin: 0;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  .mdtask .tlabel { flex: 1 1 auto; min-width: 0; }
+  /* Done, and known to be done. Struck through as well as faded: a colour or an
+     opacity on its own is not something everyone can read. */
+  .mdtask.on .tlabel { text-decoration: line-through; opacity: .62; }
+  /*
+     A tick that has not been written through yet must NOT look identical to one
+     that has. Three states, each with words rather than just a colour, because
+     "it says it is done" being a lie is the failure this is designed against.
+  */
+  .tmark {
+    flex: 0 0 auto; align-self: center;
+    font-size: 11px; font-weight: 650; line-height: 1.6;
+    padding: 0 7px; border-radius: 999px; white-space: nowrap;
+  }
+  .tmark[hidden] { display: none; }
+  .tmark.saving { background: var(--claim-bg); color: var(--claim-fg); }
+  .tmark.unsure { background: var(--pend-bg); color: var(--pend-fg); }
+  .tmark.failed { background: var(--err-bg); color: var(--err-fg); cursor: pointer; }
+  /* The whole row goes amber when the tick is not known to have landed, so it
+     is visible while scanning rather than only when read. */
+  .mdtask.unsettled { box-shadow: inset 3px 0 0 var(--pend-bg); padding-left: 8px; }
+  .mdtask.broken { box-shadow: inset 3px 0 0 var(--err-fg); padding-left: 8px; }
   .msg .meta { margin-top: 5px; font-size: 12px; opacity: .72; }
   .msg.user {
     margin-left: auto; background: var(--accent-grad); color: #fff;
@@ -554,13 +623,341 @@
   function nearBottom() { return thread.scrollHeight - thread.scrollTop - thread.clientHeight < 120; }
   function scrollBottom() { thread.scrollTop = thread.scrollHeight; }
 
+  // ------------------------------------------------------------------ markdown
+  /*
+   * A small Markdown subset, rendered by BUILDING NODES rather than by
+   * assigning HTML.
+   *
+   * WHY IT IS SHAPED THIS WAY, AND IT IS NOT A STYLE PREFERENCE. This queue has
+   * no authentication and is published on every interface the machine has, so
+   * anything that can reach it can put text on this page — and this page is the
+   * one that talks to every agent on the box. There is no `innerHTML` anywhere
+   * in this file and there is none here: every character of message text
+   * reaches the document through `textContent`, which makes injection
+   * structurally impossible rather than merely filtered. No library, for the
+   * same reason the rest of this project has no dependencies — a Markdown
+   * parser is the classic place for an HTML-passthrough option to be on by
+   * default.
+   *
+   * The one place a string becomes something the browser will *act* on is a
+   * link's href, so that is allowlisted by scheme and nothing else is linked.
+   */
+  var SAFE_URL = /^(?:https?:\/\/|mailto:[^\s]|\/(?!\/))/i;
+
+  function linkNode(label, href) {
+    var url = String(href || '');
+    if (!SAFE_URL.test(url)) {
+      // `javascript:`, `data:`, and anything else we do not recognise. Show the
+      // text so nothing is hidden from the reader, but do not make it clickable.
+      return document.createTextNode(label === url ? url : label + ' (' + url + ')');
+    }
+    var a = document.createElement('a');
+    a.href = url;
+    a.textContent = label;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer nofollow';
+    return a;
+  }
+
+  /* Inline spans. Tried in order at each position; every branch consumes at
+     least one character, so this cannot spin. */
+  function inlineInto(parent, text) {
+    var s = String(text == null ? '' : text);
+    var i = 0;
+    while (i < s.length) {
+      var rest = s.slice(i), m;
+      if ((m = /^`([^`\n]+)`/.exec(rest))) {
+        var code = document.createElement('code');
+        code.textContent = m[1];
+        parent.appendChild(code);
+        i += m[0].length; continue;
+      }
+      if ((m = /^\[([^\]\n]*)\]\(\s*([^)\s]+)[^)]*\)/.exec(rest))) {
+        parent.appendChild(linkNode(m[1] || m[2], m[2]));
+        i += m[0].length; continue;
+      }
+      if ((m = /^(https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]])/.exec(rest))) {
+        parent.appendChild(linkNode(m[1], m[1]));
+        i += m[0].length; continue;
+      }
+      if ((m = /^(\*\*|__)([\s\S]+?)\1/.exec(rest))) {
+        var b = document.createElement('strong');
+        inlineInto(b, m[2]);
+        parent.appendChild(b);
+        i += m[0].length; continue;
+      }
+      if ((m = /^~~([\s\S]+?)~~/.exec(rest))) {
+        var d = document.createElement('del');
+        inlineInto(d, m[1]);
+        parent.appendChild(d);
+        i += m[0].length; continue;
+      }
+      if ((m = /^(\*|_)([^*_\n]+?)\1/.exec(rest))) {
+        var em = document.createElement('em');
+        inlineInto(em, m[2]);
+        parent.appendChild(em);
+        i += m[0].length; continue;
+      }
+      // A plain run, up to the next thing that could begin a span. The URL case
+      // is matched in full rather than by its leading `h`, or every letter h in
+      // ordinary prose would end the run and cost a text node.
+      var next = rest.slice(1).search(/[`[*_~]|https?:\/\//);
+      var take = next === -1 ? rest.length : next + 1;
+      parent.appendChild(document.createTextNode(rest.slice(0, take)));
+      i += take;
+    }
+  }
+
+  var RE_FENCE = /^\s*```/;
+  var RE_HEAD = /^(#{1,6})\s+(.*)$/;
+  var RE_QUOTE = /^\s*>\s?(.*)$/;
+  var RE_TASK = /^\s*[-*+]\s+\[([ xX])\]\s*(.*)$/;
+  var RE_BULLET = /^\s*[-*+]\s+(.*)$/;
+  var RE_ORDER = /^\s*(\d{1,3})[.)]\s+(.*)$/;
+
+  function isBlockStart(line) {
+    return RE_FENCE.test(line) || RE_HEAD.test(line) || RE_QUOTE.test(line) ||
+      RE_TASK.test(line) || RE_BULLET.test(line) || RE_ORDER.test(line);
+  }
+
+  function mdRender(text, entry) {
+    var frag = document.createDocumentFragment();
+    var lines = String(text == null ? '' : text).split(/\r?\n/);
+    var i = 0, taskIndex = 0, list = null, kind = null;
+    function endList() { list = null; kind = null; }
+    function into(k, cls) {
+      if (kind !== k) {
+        list = document.createElement(k === 'ol' ? 'ol' : 'ul');
+        list.className = cls;
+        frag.appendChild(list);
+        kind = k;
+      }
+      return list;
+    }
+
+    while (i < lines.length) {
+      var line = lines[i], m;
+
+      if (RE_FENCE.test(line)) {
+        endList();
+        var buf = [];
+        i++;
+        while (i < lines.length && !RE_FENCE.test(lines[i])) { buf.push(lines[i]); i++; }
+        i++; // the closing fence, if there was one
+        var pre = document.createElement('pre');
+        var pc = document.createElement('code');
+        pc.textContent = buf.join('\n');
+        pre.appendChild(pc);
+        frag.appendChild(pre);
+        continue;
+      }
+
+      if (!line.trim()) { endList(); i++; continue; }
+
+      if ((m = RE_HEAD.exec(line))) {
+        endList();
+        var h = document.createElement('div');
+        h.className = 'mdh mdh' + m[1].length;
+        h.setAttribute('role', 'heading');
+        h.setAttribute('aria-level', String(m[1].length));
+        inlineInto(h, m[2]);
+        frag.appendChild(h);
+        i++; continue;
+      }
+
+      if ((m = RE_QUOTE.exec(line))) {
+        endList();
+        var q = document.createElement('div');
+        q.className = 'mdquote';
+        var firstQ = true;
+        while (i < lines.length && (m = RE_QUOTE.exec(lines[i]))) {
+          if (!firstQ) q.appendChild(document.createElement('br'));
+          inlineInto(q, m[1]);
+          firstQ = false; i++;
+        }
+        frag.appendChild(q);
+        continue;
+      }
+
+      if ((m = RE_TASK.exec(line))) {
+        into('task', 'mdtasks').appendChild(taskNode(m[2], /x/i.test(m[1]), entry, taskIndex++));
+        i++; continue;
+      }
+
+      if ((m = RE_BULLET.exec(line))) {
+        var li = document.createElement('li');
+        inlineInto(li, m[1]);
+        into('ul', 'mdlist').appendChild(li);
+        i++; continue;
+      }
+
+      if ((m = RE_ORDER.exec(line))) {
+        var oli = document.createElement('li');
+        inlineInto(oli, m[2]);
+        into('ol', 'mdlist').appendChild(oli);
+        i++; continue;
+      }
+
+      endList();
+      var p = document.createElement('p');
+      p.className = 'mdp';
+      var first = true;
+      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+        if (!first) p.appendChild(document.createElement('br'));
+        inlineInto(p, lines[i]);
+        first = false; i++;
+      }
+      frag.appendChild(p);
+    }
+    return frag;
+  }
+
+  // ---------------------------------------------------------------- checklists
+  /*
+   * A ticked box has to survive a reload, and it has to reach Vikunja, which is
+   * where "what is left to pack" actually lives. Two sources of truth for that
+   * is the failure worth avoiding, so this does not keep its own list: the tick
+   * renders instantly from local state, and posts a message asking the
+   * conversation's agent to make the change in Vikunja. The browser never
+   * touches Vikunja and therefore never holds a Vikunja credential.
+   *
+   * WHICH MEANS THE TICK CAN LIE. The agent may be idle, dead, or holding a
+   * token that Vikunja has expired — and it will expire, they always do. A
+   * checkbox that silently shows "done" when nothing was written is worse than
+   * one that is slow, so a tick that has not been confirmed does not look like
+   * one that has: it carries the word "saving", or "not confirmed", or "not
+   * saved", and the row is striped. Idle and broken must not look the same.
+   *
+   * Confirmation reuses machinery that already exists rather than inventing a
+   * protocol: the posted message is an ordinary queue task, so its lifecycle
+   * (pending -> claimed -> answered) is already tracked and already pushed over
+   * SSE. Answered means an agent acted. If the agent later restates the list
+   * with the box ticked, the message text itself agrees and the local record
+   * stops mattering at all.
+   */
+  var CHECKS_KEY = 'relay.checks';
+  var MAX_CHECKS = 400;      // the record is a cache, not a store; keep it bounded
+  var UNSURE_AFTER_MS = 240000; // 4 min unanswered: say so rather than keep spinning
+  var checksMem = null;
+
+  function allChecks() {
+    if (checksMem) return checksMem;
+    try { checksMem = JSON.parse(pref(CHECKS_KEY) || '{}') || {}; } catch (e) { checksMem = {}; }
+    return checksMem;
+  }
+  function checkState(key) { return allChecks()[key] || null; }
+  function setCheck(key, val) {
+    var all = allChecks();
+    all[key] = val;
+    var keys = Object.keys(all);
+    if (keys.length > MAX_CHECKS) {
+      keys.sort(function (a, b) { return (all[a].at || 0) - (all[b].at || 0); });
+      for (var i = 0; i < keys.length - MAX_CHECKS; i++) delete all[keys[i]];
+    }
+    try { pref(CHECKS_KEY, JSON.stringify(all)); } catch (e) { /* stays in memory only */ }
+  }
+
+  /*
+   * What to say about this tick, in words. Returns null when there is nothing
+   * to say — the tick is either untouched by us or known to have landed.
+   */
+  function checkMark(key, st, agreesWithSource) {
+    if (!st) return null;                 // never touched here: the text is the truth
+    if (agreesWithSource) return null;    // the agent has restated it our way
+    if (st.done) return null;             // we watched the task get answered
+    if (st.failed) return { cls: 'failed', text: 'not saved — tap to retry' };
+    if (st.taskId) {
+      var task = entries.get(st.taskId);
+      if (task && task.status === 'done') {
+        st.done = true; setCheck(key, st);  // remember it, so eviction cannot un-confirm it
+        return null;
+      }
+      if (Date.now() - (st.at || 0) > UNSURE_AFTER_MS) {
+        return { cls: 'unsure', text: 'not confirmed' };
+      }
+      return { cls: 'saving', text: 'saving' };
+    }
+    return { cls: 'saving', text: 'saving' };
+  }
+
+  function paintTask(li, mark, key, st, agreesWithSource) {
+    var m = checkMark(key, st, agreesWithSource);
+    mark.className = 'tmark' + (m ? ' ' + m.cls : '');
+    mark.textContent = m ? m.text : '';
+    mark.hidden = !m;
+    li.className = 'mdtask' + ((st ? st.on : false) ? ' on' : '') +
+      (m && m.cls === 'failed' ? ' broken' : m ? ' unsettled' : '');
+  }
+
+  function taskNode(label, checkedInSource, entry, idx) {
+    var key = (entry && entry.id ? entry.id : '?') + ':' + idx;
+    var conv = (entry && entry.conversationId) || activeConv;
+    var st = checkState(key);
+    // The message text is the source of truth until this device changes it —
+    // the queue is append-only, so a message can never be rewritten in place.
+    var on = st ? !!st.on : checkedInSource;
+    if (st) st.on = on;
+
+    var li = document.createElement('li');
+    var lab = document.createElement('label');
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = on;
+
+    var span = document.createElement('span');
+    span.className = 'tlabel';
+    inlineInto(span, label);
+
+    var mark = document.createElement('span');
+    mark.className = 'tmark';
+    mark.hidden = true;
+
+    lab.appendChild(box);
+    lab.appendChild(span);
+    li.appendChild(lab);
+    li.appendChild(mark);
+    paintTask(li, mark, key, st, st ? st.on === checkedInSource : true);
+
+    function send(want) {
+      var rec = { on: want, taskId: null, done: false, failed: false, at: Date.now() };
+      setCheck(key, rec);
+      paintTask(li, mark, key, rec, want === checkedInSource);
+      var plain = String(label).replace(/\s+/g, ' ').trim().slice(0, 200);
+      postTask((want ? 'Checked off: “' : 'Un-checked: “') + plain +
+        (want ? '” — please tick it off in Vikunja.'
+          : '” — please un-tick it in Vikunja.'), 'checklist', conv)
+        .then(function (j) {
+          rec.taskId = (j && j.id) || null;
+          rec.failed = false;
+          setCheck(key, rec);
+          paintTask(li, mark, key, rec, want === checkedInSource);
+          // Show the message we just posted without waiting for the next poll.
+          if (conv === activeConv) poll(false);
+        })
+        .catch(function (err) {
+          rec.failed = true;
+          rec.error = (err && err.message) || 'network error';
+          setCheck(key, rec);
+          paintTask(li, mark, key, rec, want === checkedInSource);
+        });
+    }
+
+    box.addEventListener('change', function () { send(!!box.checked); });
+    // A failed write is not a dead end: the marker is the retry button.
+    mark.addEventListener('click', function () {
+      var cur = checkState(key);
+      if (cur && cur.failed) send(!!cur.on);
+    });
+    return li;
+  }
+
   function nodeFor(e) {
     var wrap = document.createElement('div');
     wrap.className = 'msg ' + (e.role === 'agent' ? 'agent' : 'user');
 
     var body = document.createElement('div');
     body.className = 'body';
-    body.textContent = e.text == null ? '' : String(e.text);   // textContent only: never innerHTML
+    body.appendChild(mdRender(e.text, e));   // nodes only: never innerHTML
 
     var meta = document.createElement('div');
     meta.className = 'meta';
@@ -1601,7 +1998,9 @@
    *
    * The thresholds below are the knobs worth turning if endpointing feels wrong:
    * raise SILENCE_MS if it cuts you off mid-thought, raise NOISE_MULT/RMS_FLOOR
-   * if a noisy room keeps it from ever hearing silence.
+   * if a noisy room keeps it from ever hearing silence. SILENCE_MS has already
+   * been raised once for exactly that reason — read the note on it before
+   * moving it back.
    */
   var V = {
     RATE: 16000,         // sample rate the engine wants
@@ -1610,11 +2009,25 @@
     NOISE_MULT: 2.2,     // speech must be this many times louder than the room
     RMS_FLOOR: 0.010,    // ...and at least this loud outright
     START_MS: 120,       // sustained loud audio before it counts as speech
-    SILENCE_MS: 1200,    // trailing silence that ends a one-shot dictation
-    // Continuous speech pauses to think, and 1.2 s cuts people off mid-sentence —
-    // right before "so…", "and…", "first, I…". Conversation mode gets a much
-    // longer window; one-shot dictation keeps the short one, where the user is
-    // deliberately saying one thing and wants it to end promptly.
+    /*
+     * Trailing silence that ends a one-shot dictation. Was 1200, and that was
+     * wrong — DO NOT TUNE IT BACK DOWN because short utterances feel slow.
+     *
+     * The old value came with the reasoning that one-shot means "the user is
+     * deliberately saying one thing and wants it to end promptly". That is not
+     * how this user dictates: he pauses to think mid-sentence, and 1.2 s is
+     * shorter than his thinking pause, so messages were being cut off in the
+     * middle — "I mean that my…", "Okay, I'm so dumb of…" are both real
+     * examples from one evening's queue.
+     *
+     * The trade-off is real in both directions: a longer window means every
+     * short utterance takes about a second longer to send. That is the cheaper
+     * mistake by a wide margin. A truncated message costs a whole round trip to
+     * notice and repair, on a phone, and the repair is itself dictated.
+     */
+    SILENCE_MS: 2400,
+    // Conversation mode is longer still: there the user is talking continuously
+    // and the stitch debounce joins the fragments anyway.
     CONV_SILENCE_MS: 3000,
     NO_SPEECH_MS: 8000,  // give up if nothing is ever said
     MAX_MS: 60000,       // hard cap on one dictation
