@@ -210,6 +210,29 @@ then let it reach `localhost:3456` without public exposure.)
 
 ## Traps — do not rediscover these
 
+- **`--nudge-until` makes quiet hours unreachable.** `watchdog.py:329-336` does
+  `cutoff = now.replace(hour, minute)` then `if cutoff <= local: cutoff +=
+  timedelta(days=1)`. So the cutoff is never *in the past* — the moment your
+  quiet time passes, it silently becomes the same time **tomorrow**, and the
+  nudger stays armed through the whole night it was meant to protect. Compounding
+  it, the container has **no `TZ` set** and runs UTC, so `02:00` is not the local
+  hour anyone intended. Found 2026-08-08 at 05:00 local, hours after the user
+  went to bed, with the nudger still armed and configured to escalate
+  lights → **voice** into his bedroom every 15 minutes. It happened not to fire
+  only because a queue restart had wiped `Iceland` from the roster, so it could
+  not measure silence — safe by accident, not by design. **Fix the rollover and
+  set `TZ` before trusting any quiet window.**
+
+- **Restarting an MCP container looks like the server dying.** Streamable-HTTP
+  MCP sessions live in memory, so `docker compose up -d` on `mindmeld-mcp`
+  invalidates every session id in flight. Clients then get **HTTP 400, "no valid
+  session ID"** — which reads as *server down* and sends people debugging a
+  healthy service. Verified 2026-08-08 08:35: `/health` ok, a fresh `initialize`
+  on :3847 issues a session and `tools/list` works, while a stale id reproduces
+  the 400 on demand. **The fix is to reconnect, not to debug.** Before restarting
+  any MCP container, warn the sessions that hold connections to it — the restart
+  is usually fine, the silence about it is what costs the time.
+
 - **An agent cannot start a conversation. It can only answer one.** `createTask`
   sets `role` itself (`server.js:1566` — *"server-set, never taken from the
   client"*), so every `POST /tasks` is a **user** message no matter what `role`
