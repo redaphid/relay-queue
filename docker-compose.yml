@@ -13,6 +13,10 @@ services:
       # go out through Docker Desktop's host alias.
       STT_HOST: "host.docker.internal"
       STT_PORT: "10300"
+      # ...and POST /tts to wyoming-piper on 10200, the same way. Same protocol,
+      # same client code in server.js, different port.
+      TTS_HOST: "host.docker.internal"
+      TTS_PORT: "10200"
     ports:
       # All interfaces: reachable from LAN and Tailscale. The page has no auth
       # yet — anyone on those networks can read/post. Revisit when the

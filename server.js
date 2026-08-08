@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const NAME = 'relay-queue';
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -38,6 +38,16 @@ const MAX_AUDIO = 8 * 1024 * 1024; // ~4.4 min of 16 kHz mono int16
 const STT_CONNECT_MS = 5000;
 const STT_TIMEOUT_MS = 120000; // whole exchange, including model inference
 const STT_CHUNK_BYTES = 4096; // audio bytes per audio-chunk event
+
+// --- text to speech (POST /tts) -------------------------------------------
+// wyoming-piper speaks the *same* protocol as wyoming-whisper on a different
+// port, so this reuses the identical client below — the only differences are
+// which events are sent and which are listened for.
+const TTS_HOST = process.env.TTS_HOST || '127.0.0.1';
+const TTS_PORT = Number(process.env.TTS_PORT || 10200);
+const TTS_VOICE = process.env.TTS_VOICE || null; // null = the engine's default voice
+const TTS_TIMEOUT_MS = 60000;
+const MAX_SPEAK_TEXT = 2000; // one reply's worth; the page condenses before it gets here
 const STARTED_AT = Date.now();
 const STATUSES = ['pending', 'claimed', 'done'];
 const DEFAULT_ROLE = 'user'; // records written before roles existed are the human's messages
@@ -353,7 +363,7 @@ function wyomingEvent(type, data, payload) {
   return payload && payload.length ? Buffer.concat([line, payload]) : line;
 }
 
-/** Returns a feed(chunk) that invokes onEvent(type, data) per decoded event. */
+/** Returns a feed(chunk) that invokes onEvent(type, data, payload) per decoded event. */
 function wyomingDecoder(onEvent) {
   let buf = Buffer.alloc(0);
   return function feed(chunk) {
@@ -379,43 +389,67 @@ function wyomingDecoder(onEvent) {
           throw httpErr(502, 'speech engine sent a malformed event data block');
         }
       }
-      buf = buf.subarray(end); // payload bytes (if any) are skipped: replies carry none
-      onEvent(header.type, data);
+      // ASR replies carry no payload; TTS replies are almost entirely payload.
+      const payload = pLen ? buf.subarray(nl + 1 + dLen, end) : null;
+      buf = buf.subarray(end);
+      onEvent(header.type, data, payload);
     }
   };
 }
 
-/** PCM (int16 LE) -> transcript text. Rejects with an httpErr on any failure. */
-function transcribe(pcm, fmt) {
+/*
+ * One request/response exchange with a Wyoming server. Both engines here are
+ * one-shot — send a request, read events until the terminal one, connection
+ * closes — so the whole socket lifecycle (connect watchdog, overall deadline,
+ * settle-exactly-once, premature close) is identical and lives here. /stt and
+ * /tts differ only in what they write and which event ends the exchange.
+ *
+ * `onEvent(type, data, payload, done)` calls done(value) to resolve.
+ */
+function wyomingExchange(opts) {
+  const { host, port, what, timeoutMs, send, onEvent } = opts;
   return new Promise((resolve, reject) => {
-    const sock = net.createConnection({ host: STT_HOST, port: STT_PORT });
+    const sock = net.createConnection({ host, port });
     let settled = false;
-    const finish = (err, text) => {
+    const finish = (err, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       sock.destroy();
-      if (err) reject(err); else resolve(text);
+      if (err) reject(err); else resolve(value);
     };
     const timer = setTimeout(
-      () => finish(httpErr(504, `speech engine did not answer within ${STT_TIMEOUT_MS} ms`)),
-      STT_TIMEOUT_MS,
+      () => finish(httpErr(504, `${what} did not answer within ${timeoutMs} ms`)),
+      timeoutMs,
     );
 
     sock.setTimeout(STT_CONNECT_MS, () => {
-      if (sock.connecting) finish(httpErr(504, `speech engine at ${STT_HOST}:${STT_PORT} did not accept a connection`));
+      if (sock.connecting) finish(httpErr(504, `${what} at ${host}:${port} did not accept a connection`));
     });
-    const feed = wyomingDecoder((type, data) => {
-      if (type === 'transcript') finish(null, typeof data.text === 'string' ? data.text : '');
+    const feed = wyomingDecoder((type, data, payload) => {
+      onEvent(type, data, payload, (value) => finish(null, value));
     });
     sock.on('data', (c) => { try { feed(c); } catch (err) { finish(err); } });
     sock.on('error', (err) =>
-      finish(httpErr(502, `cannot reach the speech engine at ${STT_HOST}:${STT_PORT} — ${err.message}`)));
+      finish(httpErr(502, `cannot reach the ${what} at ${host}:${port} — ${err.message}`)));
     // Only reached if the engine hung up early; a normal close comes after we resolve.
-    sock.on('close', () => finish(httpErr(502, 'speech engine closed the connection without a transcript')));
+    sock.on('close', () => finish(httpErr(502, `${what} closed the connection without a reply`)));
 
     sock.on('connect', () => {
       sock.setTimeout(0); // connect watchdog only; inference can legitimately take a while
+      send(sock);
+    });
+  });
+}
+
+/** PCM (int16 LE) -> transcript text. Rejects with an httpErr on any failure. */
+function transcribe(pcm, fmt) {
+  return wyomingExchange({
+    host: STT_HOST,
+    port: STT_PORT,
+    what: 'speech engine',
+    timeoutMs: STT_TIMEOUT_MS,
+    send(sock) {
       const frame = fmt.width * fmt.channels;
       const audio = { rate: fmt.rate, width: fmt.width, channels: fmt.channels };
       sock.cork();
@@ -427,8 +461,60 @@ function transcribe(pcm, fmt) {
       }
       sock.write(wyomingEvent('audio-stop', { timestamp: Math.round((pcm.length / frame / fmt.rate) * 1000) }));
       sock.uncork();
-    });
+    },
+    onEvent(type, data, payload, done) {
+      if (type === 'transcript') done(typeof data.text === 'string' ? data.text : '');
+    },
   });
+}
+
+/*
+ * Text -> spoken audio, via wyoming-piper. The engine answers with `audio-start`
+ * (which declares the sample format — piper's own rate, typically 22050 Hz, NOT
+ * the 16 kHz the ASR side uses), then a run of `audio-chunk` payloads, then
+ * `audio-stop`. Chunks are collected rather than streamed to the client so the
+ * response can carry a correct WAV header and content-length, which is what
+ * lets the browser decode it without a media-source pipeline.
+ */
+function synthesize(text) {
+  const parts = [];
+  let fmt = { rate: 22050, width: 2, channels: 1 }; // sane default if audio-start is skipped
+  return wyomingExchange({
+    host: TTS_HOST,
+    port: TTS_PORT,
+    what: 'text-to-speech engine',
+    timeoutMs: TTS_TIMEOUT_MS,
+    send(sock) {
+      const data = { text };
+      if (TTS_VOICE) data.voice = { name: TTS_VOICE };
+      sock.write(wyomingEvent('synthesize', data));
+    },
+    onEvent(type, data, payload, done) {
+      if (type === 'audio-start') {
+        fmt = {
+          rate: Number(data.rate) || fmt.rate,
+          width: Number(data.width) || fmt.width,
+          channels: Number(data.channels) || fmt.channels,
+        };
+      } else if (type === 'audio-chunk' && payload && payload.length) {
+        parts.push(Buffer.from(payload)); // copy: the decoder's buffer is reused
+      } else if (type === 'audio-stop') {
+        done({ pcm: Buffer.concat(parts), ...fmt });
+      }
+    },
+  });
+}
+
+/** A 44-byte canonical RIFF/WAVE header for `bytes` of PCM. */
+function wavHeader(bytes, rate, channels, width) {
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + bytes, 4); h.write('WAVE', 8);
+  h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); // 1 = PCM
+  h.writeUInt16LE(channels, 22); h.writeUInt32LE(rate, 24);
+  h.writeUInt32LE(rate * channels * width, 28);
+  h.writeUInt16LE(channels * width, 32); h.writeUInt16LE(width * 8, 34);
+  h.write('data', 36); h.writeUInt32LE(bytes, 40);
+  return h;
 }
 
 /** POST /stt — body is raw int16 LE PCM; returns { text }. */
@@ -457,6 +543,48 @@ async function sttRoute(req, res, q) {
     audioMs: Math.round((pcm.length / frame / fmt.rate) * 1000),
     tookMs: Date.now() - startedAt,
   });
+}
+
+/*
+ * POST /tts — { text } in, a WAV out.
+ *
+ * Deliberately a dumb primitive, exactly like /stt: it speaks what it is given
+ * and knows nothing about the conversation. Deciding *what* is worth listening
+ * to (stripping URLs, collapsing code blocks) belongs to the page, which is
+ * also where it can be seen and tuned.
+ *
+ * WAV rather than raw PCM because the browser has to decode this: a 44-byte
+ * header is the difference between `decodeAudioData` working everywhere and
+ * hand-rolling a PCM reader. Content-length is set, so playback can start
+ * without a streaming pipeline.
+ */
+async function ttsRoute(req, res) {
+  const body = await readBody(req);
+  const text = typeof body.text === 'string' ? body.text.trim() : '';
+  if (!text) return fail(res, 400, 'text is required and must be a non-empty string');
+  if (text.length > MAX_SPEAK_TEXT) {
+    return fail(res, 400, `text too long to speak: ${text.length} chars, max ${MAX_SPEAK_TEXT}`);
+  }
+
+  const startedAt = Date.now();
+  const audio = await synthesize(text);
+  if (!audio.pcm.length) return fail(res, 502, 'the text-to-speech engine returned no audio');
+
+  const wav = Buffer.concat([
+    wavHeader(audio.pcm.length, audio.rate, audio.channels, audio.width),
+    audio.pcm,
+  ]);
+  const frame = audio.width * audio.channels;
+  res.writeHead(200, {
+    'content-type': 'audio/wav',
+    'content-length': wav.length,
+    'cache-control': 'no-store',
+    // Handy for the page's status line and for curl-based debugging, since a
+    // binary body cannot carry them itself.
+    'x-audio-ms': String(Math.round((audio.pcm.length / frame / audio.rate) * 1000)),
+    'x-took-ms': String(Date.now() - startedAt),
+  });
+  res.end(wav);
 }
 
 // ---------------------------------------------------------------- client log
@@ -606,6 +734,12 @@ async function route(req, res) {
   if (seg.length === 1 && seg[0] === 'stt') {
     if (!need('POST')) return;
     return sttRoute(req, res, q);
+  }
+
+  // /tts — text in, spoken WAV out (relayed to the Wyoming TTS engine)
+  if (seg.length === 1 && seg[0] === 'tts') {
+    if (!need('POST')) return;
+    return ttsRoute(req, res);
   }
 
   // /results
