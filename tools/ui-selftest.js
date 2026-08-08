@@ -319,6 +319,15 @@ function check(name, cond, detail) {
 const settle = () => new Promise((r) => setTimeout(r, 25));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** A conversation summary as GET /conversations returns one. */
+const conv2 = (id, title, extra) => Object.assign({
+  id, title, agent: null, createdAt: '2026-01-01T00:00:00.000Z', archived: false, archivedAt: null,
+  counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
+  messages: 0, lastTs: '2026-01-01T00:00:00.000Z', lastRole: 'user', lastText: '',
+  spark: new Array(12).fill(0), sparkBucketMs: 900000,
+  agentState: { state: 'unassigned', agoSec: null },
+}, extra || {});
+
 /** All the text a stub element and its descendants would render. */
 function textOf(el) {
   if (!el) return '';
@@ -952,6 +961,58 @@ async function main() {
     check('and a later utterance posts to the new one',
       env.sent().length === 2 && env.sent()[1].body.conversationId === 'c2',
       JSON.stringify(env.sent().map((p) => p.body.conversationId)));
+  }
+
+  console.log('\nconversations — sparkline and agent liveness');
+  {
+    const env = liveEnv();
+    env.store.convs = [
+      conv2('main', 'Main', { spark: [0, 2, 5, 1, 0, 0, 3, 8, 2, 0, 1, 4], sparkBucketMs: 900000,
+        agent: 'communicator', agentState: { state: 'watching', agoSec: 4 } }),
+      conv2('c2', 'Widget audit', { spark: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], sparkBucketMs: 900000,
+        agent: 'coordinator-2', agentState: { state: 'silent', agoSec: 7200 } }),
+      conv2('c3', 'Empty', { spark: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], sparkBucketMs: 900000,
+        agent: null, agentState: { state: 'unassigned', agoSec: null } }),
+    ];
+    await settle();
+    env.els.menu.dispatch('click');
+    await settle();
+
+    const rows = env.els.convlist.children;
+    check('all three conversations are listed', rows.length === 3, `${rows.length}`);
+    const sparks = rows.map((r) => r.children.find((k) => /spark/.test(k.className)));
+    check('a busy conversation gets a sparkline', !!sparks[0] && sparks[0].children.length === 12,
+      `${sparks[0] && sparks[0].children.length} bars`);
+    check('bar heights vary with the data',
+      new Set(sparks[0].children.map((b) => b.style.height)).size > 1,
+      JSON.stringify(sparks[0].children.map((b) => b.style.height)));
+    check('it is described in words, not just drawn',
+      /messages in the last/.test(sparks[0].getAttribute('aria-label') || ''),
+      sparks[0].getAttribute('aria-label'));
+    check('a busy conversation is tinted with its own hue',
+      !!sparks[0].children[1].style.backgroundColor, String(sparks[0].children[1].style.backgroundColor));
+
+    check('an empty conversation still draws a baseline, not nothing',
+      sparks[2].children.length === 12
+      && sparks[2].children.every((b) => parseFloat(b.style.height) > 0),
+      JSON.stringify(sparks[2].children.map((b) => b.style.height)));
+    check('...and is marked quiet rather than left blank', /quiet/.test(sparks[2].className),
+      sparks[2].className);
+    check('...and says so in words', /nothing in the last/.test(sparks[2].getAttribute('aria-label') || ''),
+      sparks[2].getAttribute('aria-label'));
+
+    const agents = rows.map((r) => r.children.find((k) => /convagent/.test(k.className)));
+    check('the owning agent is named', textOf(agents[0]).indexOf('communicator') > -1, textOf(agents[0]));
+    check('a watching agent says so', /watching/.test(textOf(agents[0])), textOf(agents[0]));
+    check('*** a silent agent is unmistakable ***',
+      /NOT RESPONDING/.test(textOf(agents[1])) && /silent/.test(agents[1].className),
+      `${textOf(agents[1])} | ${agents[1].className}`);
+    check('the silent one is named too', textOf(agents[1]).indexOf('coordinator-2') > -1, textOf(agents[1]));
+    check('liveness is not conveyed by colour alone',
+      textOf(agents[0]).indexOf('●') > -1 && textOf(agents[1]).indexOf('!') > -1,
+      `${textOf(agents[0])} / ${textOf(agents[1])}`);
+    check('an unassigned conversation says nobody is on it',
+      /nobody assigned/.test(textOf(agents[2])), textOf(agents[2]));
   }
 
   console.log('\ncolour — decoration that carries information');

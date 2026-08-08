@@ -180,6 +180,23 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .convmeta { margin-top: 3px; font-size: 12px; color: var(--off); }
+  /* Sparkline: tall enough to read on a phone, no gridlines, no labels. */
+  .spark {
+    display: flex; align-items: flex-end; gap: 2px;
+    height: 24px; margin-top: 8px;
+  }
+  .spark i { flex: 1 1 0; min-width: 0; background: var(--line); border-radius: 1px 1px 0 0; }
+  /* Empty reads as a deliberate flat baseline, never as a broken empty box. */
+  .spark.quiet i { background: var(--line); opacity: .8; }
+  .convagent { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; font-size: 12px; }
+  .convagent .adot { flex: 0 0 auto; font-size: 11px; }
+  .convagent.watching { color: #1a7f4b; }
+  .convagent.stale { color: var(--off); }
+  /* The one thing this list most needs to shout. Not hue alone: it also says
+     "NOT RESPONDING" and swaps the glyph for an exclamation mark. */
+  .convagent.silent { color: var(--rec); font-weight: 700; }
+  .convagent.never, .convagent.unassigned { color: var(--muted); }
+  @media (prefers-color-scheme: dark) { .convagent.watching { color: #4ade80; } }
   #statusopen {
     margin-top: 12px; width: 100%; min-height: 48px;
     font: inherit; font-size: 15px; color: var(--fg);
@@ -783,6 +800,71 @@
     markMenu();
   }
 
+  /*
+   * A dozen bars of recent activity. It answers one question — busy, quiet or
+   * dead — so it has no axes, no labels and no library. Bars are built from
+   * divs rather than SVG because that is one fewer namespace to get wrong and
+   * scales perfectly at phone size.
+   *
+   * A conversation with nothing in it renders as a deliberate flat baseline, NOT
+   * as an empty box: "quiet" and "broken" must not look the same. The words are
+   * in the aria-label because a row of coloured bars is not information a screen
+   * reader or a colourblind reader can use on its own.
+   */
+  function sparkNode(c) {
+    var data = (c && c.spark) || [];
+    var wrap = document.createElement('div');
+    wrap.className = 'spark';
+    var max = 0, total = 0, i;
+    for (i = 0; i < data.length; i++) { total += data[i]; if (data[i] > max) max = data[i]; }
+    var mins = Math.round(((c && c.sparkBucketMs) || 900000) * data.length / 60000);
+    wrap.setAttribute('role', 'img');
+    wrap.setAttribute('aria-label', total
+      ? total + ' messages in the last ' + (mins >= 60 ? Math.round(mins / 60) + ' hours' : mins + ' minutes')
+      : 'nothing in the last ' + (mins >= 60 ? Math.round(mins / 60) + ' hours' : mins + ' minutes'));
+    if (!total) wrap.className = 'spark quiet';
+    var hue = hueOf(c.id);
+    for (i = 0; i < data.length; i++) {
+      var bar = document.createElement('i');
+      // Always at least a sliver, so an idle stretch reads as a baseline.
+      bar.style.height = (max ? Math.max(8, Math.round((data[i] / max) * 100)) : 6) + '%';
+      if (total) bar.style.backgroundColor = 'hsl(' + hue + ' 78% 55%)';
+      wrap.appendChild(bar);
+    }
+    return wrap;
+  }
+
+  var AGENT_STATE = {
+    watching: 'watching',
+    stale: 'quiet for a bit',
+    silent: 'NOT RESPONDING',
+    never: 'has never checked in',
+    unassigned: 'nobody assigned'
+  };
+
+  /*
+   * Who owns this conversation, and are they actually there? An agent that has
+   * gone silent is the most important thing this list can tell you, so it gets
+   * a word ("NOT RESPONDING"), a glyph and a colour rather than any one of them.
+   */
+  function agentNode(c) {
+    var st = (c && c.agentState) || { state: 'unassigned', agoSec: null };
+    var line = document.createElement('div');
+    line.className = 'convagent ' + st.state;
+    var dot = document.createElement('span');
+    dot.className = 'adot';
+    dot.textContent = st.state === 'watching' ? '●' : st.state === 'stale' ? '◐' : st.state === 'silent' ? '!' : '○';
+    line.appendChild(dot);
+    var label = c.agent ? c.agent + ' · ' + AGENT_STATE[st.state] : AGENT_STATE.unassigned;
+    if ((st.state === 'stale' || st.state === 'silent') && st.agoSec !== null) {
+      label += ' (' + rel(new Date(Date.now() - st.agoSec * 1000).toISOString()) + ')';
+    }
+    var name = document.createElement('span'); // spacing comes from the flex gap
+    name.textContent = label;
+    line.appendChild(name);
+    return line;
+  }
+
   function convNode(c) {
     var row = document.createElement('button');
     row.type = 'button';
@@ -818,10 +900,12 @@
     row.appendChild(top);
     row.appendChild(snip);
 
+    row.appendChild(sparkNode(c));
+    row.appendChild(agentNode(c));
+
     var bits = [];
-    if (counts.pending) bits.push(counts.pending + (counts.pending === 1 ? ' waiting' : ' waiting'));
+    if (counts.pending) bits.push(counts.pending + ' waiting');
     if (counts.claimed) bits.push(counts.claimed + ' in progress');
-    if (c.agent) bits.push(c.agent);
     if (bits.length) {
       var meta = document.createElement('div');
       meta.className = 'convmeta';

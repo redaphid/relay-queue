@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const NAME = 'relay-queue';
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -323,10 +323,33 @@ function threadEntries(conversationId) {
  * be wasteful — but a scan is trivially correct, and invalidating on any write
  * keeps it that way. Nothing here reads the event log; it is all in memory.
  */
-let summaryCache = { at: -1, list: null };
+let summaryCache = { at: '', list: null };
+
+/*
+ * A sparkline of recent activity per conversation: how many messages and
+ * replies landed in each slice of the last few hours. It only has to answer
+ * "busy, quiet, or dead" at a glance, so it is a dozen small integers — no
+ * axes, no labels, nothing to over-engineer. Bucketed here rather than in the
+ * page so the browser never needs the event log.
+ */
+const SPARK_BUCKETS = 12;
+const SPARK_BUCKET_MS = 15 * 60 * 1000; // 12 x 15 min = the last three hours
+const SPARK_SPAN_MS = SPARK_BUCKETS * SPARK_BUCKET_MS;
 
 function conversationSummaries() {
-  if (summaryCache.at === mutations) return summaryCache.list;
+  // The buckets are relative to now, so the memo has to expire with time as
+  // well as with writes — otherwise a quiet hour would keep showing stale bars.
+  const key = mutations + ':' + Math.floor(Date.now() / SPARK_BUCKET_MS);
+  if (summaryCache.at === key) return summaryCache.list;
+
+  const spanStart = Date.now() - SPARK_SPAN_MS;
+  const bucketOf = (iso) => {
+    const t = msOf(iso);
+    if (!t || t < spanStart) return -1;
+    const i = Math.floor((t - spanStart) / SPARK_BUCKET_MS);
+    return i >= SPARK_BUCKETS ? SPARK_BUCKETS - 1 : i;
+  };
+
   const acc = new Map();
   for (const c of conversations.values()) {
     acc.set(c.id, {
@@ -336,6 +359,8 @@ function conversationSummaries() {
       lastTs: null,
       lastRole: null,
       lastText: '',
+      spark: new Array(SPARK_BUCKETS).fill(0),
+      sparkBucketMs: SPARK_BUCKET_MS,
     });
   }
   for (const t of tasks.values()) {
@@ -345,12 +370,21 @@ function conversationSummaries() {
       // A task pointing at a conversation that was never recorded. Surfacing it
       // under a placeholder beats hiding the user's messages.
       a = { ...newConversation(id, id, null), counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
-        messages: 0, lastTs: null, lastRole: null, lastText: '', missing: true };
+        messages: 0, lastTs: null, lastRole: null, lastText: '', missing: true,
+        spark: new Array(SPARK_BUCKETS).fill(0), sparkBucketMs: SPARK_BUCKET_MS };
       acc.set(id, a);
     }
     a.counts[t.status]++;
     if (!t.relayed) a.counts.unrelayed++;
     a.messages++;
+    // Both halves of a turn count as activity — a conversation where the agent
+    // is answering is busy, not idle.
+    const bIn = bucketOf(t.ts);
+    if (bIn >= 0) a.spark[bIn]++;
+    if (t.resultTs) {
+      const bOut = bucketOf(t.resultTs);
+      if (bOut >= 0) a.spark[bOut]++;
+    }
     const hasResult = t.result !== null && t.result !== undefined;
     const at = hasResult ? (t.resultTs || t.ts) : t.ts;
     if (!a.lastTs || msOf(at) >= msOf(a.lastTs)) {
@@ -360,9 +394,27 @@ function conversationSummaries() {
     }
   }
   const list = [...acc.values()].sort((a, b) => msOf(b.lastTs || b.createdAt) - msOf(a.lastTs || a.createdAt));
-  summaryCache = { at: mutations, list };
+  summaryCache = { at: key, list };
   return list;
 }
+
+/*
+ * Is the agent that owns this conversation actually there? Same thresholds the
+ * status page uses, so "watching" means the same thing in both places. Computed
+ * outside the memo above because heartbeats arrive without changing the queue.
+ */
+function agentLiveness(name) {
+  if (!name) return { state: 'unassigned', agoSec: null };
+  const h = HEARTBEATS.get(name);
+  if (!h) return { state: 'never', agoSec: null };
+  const agoSec = secSince(h.at);
+  const ms = agoSec * 1000;
+  return { state: ms <= WATCHING_MS ? 'watching' : ms <= SILENT_MS ? 'stale' : 'silent', agoSec };
+}
+
+/** Summaries plus live agent state — what the conversation list actually renders. */
+const conversationsWithLiveness = () =>
+  conversationSummaries().map((c) => ({ ...c, agentState: agentLiveness(c.agent) }));
 
 // ---------------------------------------------------------------- live stream
 /*
@@ -1199,7 +1251,7 @@ async function route(req, res) {
   // /conversations
   if (seg.length === 1 && seg[0] === 'conversations') {
     if (m === 'GET') {
-      let list = conversationSummaries();
+      let list = conversationsWithLiveness();
       // Archived ones are hidden unless asked for; `archived=only` shows just them.
       const archived = q.get('archived');
       if (archived === 'only') list = list.filter((c) => c.archived);
@@ -1222,7 +1274,7 @@ async function route(req, res) {
   // /conversations/:id
   if (seg.length === 2 && seg[0] === 'conversations') {
     if (m === 'GET') {
-      const found = conversationSummaries().find((c) => c.id === seg[1]);
+      const found = conversationsWithLiveness().find((c) => c.id === seg[1]);
       if (!found) return fail(res, 404, `no conversation with id "${seg[1]}"`);
       return send(res, 200, found);
     }

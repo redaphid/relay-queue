@@ -79,6 +79,14 @@ pinned to the bottom.
   queue up and are posted **in the order they were spoken**. Silence is fine and expected: a
   conversation never times out, it just re-measures the room every 10 s and keeps waiting.
   Messages from it are tagged `from:"voice-conversation"`.
+  **One train of thought is one message.** Continuous speech pauses to think, so conversation mode
+  waits **3 s** of silence before ending an utterance (one-shot dictation keeps its snappier 1.2 s),
+  and then holds the finished transcript for a moment longer before posting: anything said in that
+  window is appended to it instead of becoming a second message. The wait extends while you are
+  still speaking or a transcription is still running, so a slow engine cannot split a sentence
+  either. The words appear in the composer as they accumulate — you can watch what is about to be
+  sent, and press **Send** to cut it short. Stopping mid-thought leaves them in the box rather than
+  posting or discarding them.
   **Nothing worthless reaches the queue.** Empty transcripts, punctuation-only transcripts, sounds
   shorter than 350 ms, and the small set of phrases Whisper `tiny-int8` is known to hallucinate on
   near-silence (`thank you`, `you`, `thanks for watching`, `[BLANK_AUDIO]`, …) are all dropped, with
@@ -356,6 +364,66 @@ utterance immediately afterwards still posts normally.
 
 ---
 
+## Is anything listening?
+
+The web UI's hamburger menu has a **Status** item, and it exists to answer one question: *is anyone
+actually there, or am I typing into a void?* That is a question about trust, not statistics — so the
+headline comes first, in plain words, and combines liveness with backlog.
+
+**The rule that governs the whole page: quiet must never look broken.** An empty queue with nobody
+checking in reads "Nothing is waiting" and can never reach an alarm level. Crying wolf when there is
+simply nothing to do is how a status page teaches you to ignore it. Work that is waiting with
+nothing checking in is the case that does raise the alarm.
+
+`GET /status` returns the whole picture as JSON:
+
+```bash
+curl -s http://127.0.0.1:3901/status
+curl -s 'http://127.0.0.1:3901/status?engines=0'   # skip the STT/TTS probes
+```
+
+| Field | What it is |
+| ----- | ---------- |
+| `headline` | `{level, text}` — `ok` / `idle` / `warn` / `alarm`, and the sentence to show |
+| `watch` | who is checking in, how long ago, and whether that is a heartbeat or an inference |
+| `counts` | pending / claimed / done / unrelayed |
+| `responsiveness` | median and worst time-to-claim and time-to-answer over the last 25 messages, plus the oldest unanswered message and how long it has waited |
+| `recent` | the last 25 things that happened — message in, claimed by X, answered |
+| `server` | version, uptime, open SSE streams, conversation and task totals |
+| `engines` | whether the Whisper and piper engines answer a TCP connect (cached 15 s) |
+
+Everything is derived from records already in memory and memoised on a mutation counter. **This
+endpoint never reads the event log**, so it is safe to poll.
+
+### Heartbeats
+
+The server cannot know whether an agent is alive, so agents say so:
+
+```bash
+curl -s -X POST http://127.0.0.1:3901/heartbeat \
+  -H 'content-type: application/json' \
+  -d '{"agent":"coordinator-2","note":"polling"}'
+```
+
+Call it on every poll. `agent` should match the `agent` field on the conversation you own, which is
+what ties liveness to a conversation in the menu. Thresholds:
+
+| Since last heartbeat | State |
+| -------------------- | ----- |
+| under 60 s | **watching** — an agent is there |
+| 60 s to 10 min | **stale** — quiet for a bit; only worrying once work is waiting for more than 4 min |
+| over 10 min | **silent** — treated as nothing responding |
+
+**Heartbeats are held in memory and are never written to `events.jsonl`.** They are ephemeral
+liveness, not queue state, and one durable line per poll would bury the actual history. They are
+therefore forgotten on restart, which is honest — the restart is visible in `uptimeSec`.
+
+If nobody ever calls `/heartbeat`, the page falls back to inference: an agent that claimed or
+answered something recently is evidently alive, and `watch.source` says `inferred` rather than
+`heartbeat` so the difference is never hidden.
+
+---
+
 ## Staying up to date
 
 The copy of the page this machine serves is meant to always be the latest merged code, with nobody
@@ -491,6 +559,30 @@ curl -s 'http://127.0.0.1:3901/tasks?conversation=REPLACE_ID&status=pending'
 
 Thread entries now carry `conversationId`, and `GET /events` frames carry it too — see
 [live updates](#live-updates-across-conversations).
+
+### What the list tells you about each conversation
+
+`GET /conversations` returns two things per conversation beyond its counts, both computed
+server-side so the page never needs the event log:
+
+- **`spark`** — 12 integers, one per 15-minute slice of the last 3 hours, counting messages *and*
+  replies. `sparkBucketMs` says how wide a slice is. It exists to answer "busy, quiet or dead" at a
+  glance and nothing more, so it has no axes and no labels. A conversation with no activity renders
+  as a deliberate flat baseline rather than an empty box — **quiet and broken must not look the
+  same** — and the page also states the count in words in an `aria-label`.
+- **`agentState`** — whether the agent named in `agent` is actually there, using the same thresholds
+  as [the status page](#is-anything-listening):
+
+  | `state` | Meaning |
+  | ------- | ------- |
+  | `watching` | checked in within 60 s |
+  | `stale` | checked in within 10 minutes |
+  | `silent` | last check-in older than 10 minutes |
+  | `never` | an agent is assigned but has never called `/heartbeat` |
+  | `unassigned` | no `agent` set on the conversation |
+
+  A `silent` agent is the single most important thing this list can surface, so the page says
+  **NOT RESPONDING** in words, changes the glyph, *and* colours it — never colour alone.
 
 ### The menu
 
@@ -652,11 +744,35 @@ curl -s -X POST http://127.0.0.1:3901/tasks -H 'content-type: application/json' 
 curl -s http://127.0.0.1:3901/tasks
 ```
 
-**List only pending tasks** — what the Coordinator polls for new work.
+**List only pending tasks in your conversation** — what a Coordinator polls for new work.
 
 ```bash
-curl -s 'http://127.0.0.1:3901/tasks?status=pending'
+curl -s 'http://127.0.0.1:3901/tasks?conversation=REPLACE_ID&status=pending'
 ```
+
+> ### An agent owns exactly one conversation
+>
+> **Never claim, post a result to, or mark relayed a task outside your own conversation.**
+> A task takes exactly **one** result, so claiming someone else's message does not merely duplicate
+> work — it silently steals it. The other agent's `POST /tasks/:id/result` then fails with `409`,
+> the human's message gets an answer from an agent that was not asked and has none of the context,
+> and nothing anywhere reports that it happened.
+>
+> This is not hypothetical: an unscoped `?status=pending` poll reached into another coordinator's
+> conversation and claimed its message. **Always pass `conversation=`.** The unscoped call below
+> still exists because it predates conversations and the API is backward compatible — it is for
+> looking at the whole queue by hand, not for a watcher loop.
+>
+> ```bash
+> # every conversation, all pending work — for a human looking around, NOT for a poll
+> curl -s 'http://127.0.0.1:3901/tasks?status=pending'
+> ```
+>
+> If you do not know your conversation id, find it by the `agent` field you set on it:
+>
+> ```bash
+> curl -s 'http://127.0.0.1:3901/conversations?pending=1'
+> ```
 
 **Claim a task** — returns `200` + the task with `status:"claimed"`; `404` unknown id, `409` if already claimed or done.
 
@@ -776,12 +892,17 @@ JSON
 | GET    | `/events`             | **new** — Server-Sent Events; every change pushed as it happens  |
 | POST   | `/stt`                | raw PCM in, `{text}` out, via the local Whisper engine           |
 | POST   | `/tts`                | **new** — `{text}` in, a WAV out, via the local piper engine     |
-| POST   | `/client-log`         | **new** — one diagnostic line from the browser into the container log |
+| GET    | `/status`             | **new** — is anything listening: headline, liveness, timings, recent activity |
+| POST   | `/heartbeat`          | **new** — an agent reporting that it is alive (memory only, never logged) |
+| POST   | `/client-log`         | one diagnostic line from the browser into the container log      |
 
 `POST /client-log` stores nothing and touches no queue state; it only writes a rate-limited,
 control-character-stripped line to stdout. It exists because the UI's real home is a phone, where
 there is no console to read and "the mic did nothing" is otherwise undebuggable.
 
+Changed in 1.5.0, all backward compatible: `GET /status` and `POST /heartbeat` answer "is anything
+listening"; `/conversations` entries gained `spark` (recent activity buckets) and `agentState`
+(whether the assigned agent is checking in). No existing endpoint or record changed.
 Changed in 1.4.0, all backward compatible: tasks gained a server-set `conversationId`, defaulting to
 `main`; `/conversations` lists, creates and updates them; `/thread`, `/tasks` and `/results` take a
 `conversation` filter; `/events` frames name their conversation. Records and calls that predate
