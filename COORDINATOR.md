@@ -107,6 +107,20 @@ queue status, progress, or acknowledgements — the user asked for this
 specifically after I over-used it. Write for the ear: expand paths phonetically,
 one or two sentences (~40 words is ~13 s of playback, already long out loud).
 
+**Never mark `relayed` until you have seen the `result` POST return 200.** I
+chained result-then-relayed in one command, the result came back **400**, and the
+task was left `claimed` with `result: null` but `relayed: true` — closed, with
+his question silently unanswered. Check the status code between the two calls.
+
+**Build the result JSON with a serializer, never by hand in a shell heredoc.**
+A malformed body makes the server answer `"result is required"` — which reads
+like you forgot the field, not like your JSON failed to parse, so you will debug
+the wrong thing. There is no `jq` on this machine. `node -e` hits Git-Bash path
+translation (`/tmp` becomes `D:\tmp`, and `$env:TEMP\\file` loses its backslash);
+PowerShell with `ConvertTo-Json` and a UTF-8 byte body is the route that works
+first time. Results are bounded only by `MAX_BODY`; the 8000-char `MAX_TEXT` cap
+applies to `instruction`, not to what you write back.
+
 **Write down what you learned, especially the traps.** Your context ends when
 you do. What you wrote down is what survives. If you find a note that turned out
 to be wrong, correct the note — a stale memory caused a repeat outage.
