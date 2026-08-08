@@ -9,6 +9,8 @@ const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+// The home-screen icons, drawn and PNG-encoded rather than committed as blobs.
+const icons = require('./icons.js');
 
 const NAME = 'relay-queue';
 const VERSION = '1.5.0';
@@ -690,6 +692,14 @@ function sendIndex(res) {
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'no-referrer',
+    /*
+     * The service worker will only save a shell carrying this header. It exists
+     * because the page sits behind Cloudflare Access, whose login screen is a
+     * 200 full of HTML — and a worker that cached *that* as the app would lock
+     * him out of his own thread with a saved copy of a login form. Nothing else
+     * served here sets it.
+     */
+    'x-relay-app': '1',
     // The page is fully self-contained; this forbids any external request from it.
     // `blob:` in script-src/worker-src is for the inline AudioWorklet used by voice
     // dictation — the worklet source is built into a Blob so the page stays one file.
@@ -697,9 +707,15 @@ function sendIndex(res) {
     // `worker-src 'self'` was added for /sw.js: a service worker must be a real
     // same-origin file, a blob: worker cannot control the page, and without this
     // registration fails silently in a way that looks like the browser's fault.
+    // `manifest-src 'self'` and `'self'` in img-src were added when the app
+    // became installable: without the first the manifest is blocked outright
+    // and Android will not offer to install, and the icons are now real files
+    // rather than the data: URI the favicon still uses. Note that a service
+    // worker is governed by worker-src, which was already 'self' — script-src
+    // stays as tight as it was.
     'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; " +
-      "script-src 'unsafe-inline' blob:; worker-src 'self' blob:; img-src data:; " +
-      "media-src blob: data:; connect-src 'self'; " +
+      "script-src 'unsafe-inline' blob:; worker-src 'self' blob:; img-src 'self' data:; " +
+      "media-src blob: data:; connect-src 'self'; manifest-src 'self'; " +
       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   });
   res.end(indexCache.buf);
@@ -2125,6 +2141,73 @@ function sendServiceWorker(res) {
   res.end(swCache.buf);
 }
 
+/*
+ * GET /manifest.webmanifest and the icons — what makes this installable.
+ *
+ * The manifest is an inline constant rather than a file, in keeping with the
+ * rest of the page. The icons are drawn by icons.js rather than committed, so
+ * `public/` stays text-only and the artwork stays reviewable as code.
+ *
+ * The name is deliberately not just "relay": on a home screen full of icons,
+ * `short_name` is all he will see, and the full name is what a launcher search
+ * matches on.
+ */
+const MANIFEST = Buffer.from(JSON.stringify({
+  name: 'relay — messages to your agents',
+  short_name: 'relay',
+  description: 'The queue between you and your agents. Reads offline.',
+  start_url: '/',
+  scope: '/',
+  id: '/',
+  display: 'standalone',
+  orientation: 'portrait',
+  // Matches the dark theme's --bg, which is what the splash screen shows while
+  // the page is starting. A white flash before a dark app is a jarring tell.
+  background_color: '#0e1116',
+  theme_color: '#0e1116',
+  icons: [
+    { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+    { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    /*
+     * A separate entry rather than `purpose: "any maskable"`. Combining them
+     * makes one drawing serve two jobs it cannot both do: a maskable icon must
+     * keep its content inside the central 80%, which leaves a plain icon
+     * looking small and lost. Two entries, two croppings.
+     */
+    { src: '/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+  ],
+}, null, 2), 'utf8');
+
+function sendManifest(res) {
+  res.writeHead(200, {
+    'content-type': 'application/manifest+json; charset=utf-8',
+    'content-length': MANIFEST.length,
+    'cache-control': 'no-cache',
+    'x-content-type-options': 'nosniff',
+  });
+  res.end(MANIFEST);
+}
+
+/*
+ * Icons are looked up in a fixed set by exact name, never by joining anything
+ * from the URL onto a path. There is no filesystem read here at all, which is
+ * the tidiest possible answer to the traversal bug this route would otherwise
+ * be the first opportunity for.
+ */
+function sendIcon(res, name) {
+  const buf = icons.icon(name);
+  if (!buf) return fail(res, 404, `no such icon "${name}"`);
+  res.writeHead(200, {
+    'content-type': 'image/png',
+    'content-length': buf.length,
+    // They are generated from source that only changes when the code does, and
+    // the manifest is re-read on every install. A day is plenty.
+    'cache-control': 'public, max-age=86400',
+    'x-content-type-options': 'nosniff',
+  });
+  res.end(buf);
+}
+
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
   // `text` is the UI's field name and an alias for `instruction`; both are accepted.
@@ -2552,6 +2635,16 @@ async function route(req, res) {
   if (seg.length === 1 && seg[0] === 'sw.js') {
     if (!need('GET')) return;
     return sendServiceWorker(res);
+  }
+
+  // /manifest.webmanifest and the icons — the installable-app metadata
+  if (seg.length === 1 && seg[0] === 'manifest.webmanifest') {
+    if (!need('GET')) return;
+    return sendManifest(res);
+  }
+  if (seg.length === 1 && icons.names().indexOf(seg[0]) >= 0) {
+    if (!need('GET')) return;
+    return sendIcon(res, seg[0]);
   }
 
   // /push/* — web push subscriptions and the quiet-hours config

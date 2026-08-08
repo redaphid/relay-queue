@@ -7,6 +7,20 @@
 <meta name="robots" content="noindex, nofollow">
 <title>relay</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Ccircle%20cx='16'%20cy='16'%20r='13'%20fill='%232f6fed'/%3E%3C/svg%3E">
+<!--
+  Installable, so the thread can be read with no connection at all.
+
+  `crossorigin="use-credentials"` is not optional here and is easy to miss: a
+  manifest is fetched WITHOUT cookies by default, so behind Cloudflare Access it
+  would come back as the login page and the install prompt would simply never
+  appear, with nothing in the page to say why.
+-->
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<!-- Colours the Android status bar to match the page, in whichever theme is on. -->
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f6f8">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e1116">
 <style>
   /*
    * Colour, on purpose.
@@ -411,6 +425,28 @@
   #err.sticky { cursor: pointer; }
   #err.sticky::after { content: ' — tap to dismiss'; opacity: .65; }
 
+  /*
+   * The offline bar. Deliberately NOT the error bar: an error is an event that
+   * has happened and can be dismissed, this is a condition that is still true.
+   * It cannot be tapped away, because the whole point is that it stays up for
+   * as long as what he is reading might be out of date.
+   *
+   * It sits directly above the composer, which is the one place it cannot be
+   * missed by someone about to type — that is the message it is really
+   * carrying: not "you are offline" but "this will not send".
+   */
+  #offbar {
+    display: none; flex: 0 0 auto;
+    margin: 0; padding: 9px 14px; font-size: 13px; line-height: 1.45;
+    color: var(--off); background: var(--panel);
+    border-top: 1px solid var(--line);
+  }
+  #offbar.show { display: block; }
+  #offbar b { font-weight: 600; }
+  #offbar .when { opacity: .8; }
+  /* Offline is a state of the composer too, not just a banner above it. */
+  #composer.off textarea { opacity: .75; }
+
   /* Voice dictation: status line + live input level, shown only while listening. */
   #voice {
     display: none; flex: 0 0 auto; align-items: center; gap: 10px;
@@ -518,6 +554,7 @@
   </main>
 
   <p id="err"></p>
+  <p id="offbar" aria-live="polite"></p>
 
   <div id="voice" aria-live="polite">
     <span id="meter" aria-hidden="true"><i></i></span><span id="vtext"></span>
@@ -593,7 +630,9 @@
   var input = document.getElementById('input');
   var sendBtn = document.getElementById('send');
   var errBar = document.getElementById('err');
+  var offBar = document.getElementById('offbar');
   var conn = document.getElementById('conn');
+  var composer = document.getElementById('composer');
 
   var entries = new Map();   // id -> entry
   var sigs = new Map();      // id -> change signature
@@ -601,6 +640,14 @@
   var fails = 0, polls = 0, timer = null, errTimer = null;
   var everRendered = false, sending = false;
   var stream = null, streamOk = false;
+  /*
+   * `offlineAt` is the moment the newest thing on screen was saved by the
+   * service worker, or null when the page is genuinely talking to the server.
+   * It is the difference between "we are having trouble reaching the queue" and
+   * "you are reading history", and the two must never be shown as the same
+   * thing — one of them means a message he sends will not arrive.
+   */
+  var offlineAt = null;
   var freshAgent = [];       // agent entries merged since the last speech harvest
   var booted = false;        // true once the first read has landed; see harvestSpeech()
 
@@ -1035,11 +1082,54 @@
     empty.style.display = all.length ? 'none' : 'block';
     if (stick) scrollBottom();
     if (all.length) everRendered = true;
+    // Whatever is on screen is what should be there without a network. Hooked
+    // to render() rather than to the poll, so every path that changes the
+    // thread — a poll, a push over the stream, switching conversation — keeps
+    // the saved copy honest through one line instead of four.
+    queueSave(all);
+  }
+
+  /*
+   * Hand the thread to the service worker to keep for reading offline.
+   *
+   * Debounced, because a busy conversation renders several times a second and
+   * this serialises the whole window each time. Two seconds of staleness in the
+   * saved copy is not worth a phone getting warm.
+   */
+  var saveTimer = null;
+  var savePending = null;
+  function queueSave(all) {
+    if (!navigator.serviceWorker || !navigator.serviceWorker.controller) return;
+    savePending = { conv: activeConv, all: all };
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSave, 2000);
+  }
+  function flushSave() {
+    var job = savePending;
+    savePending = null;
+    if (!job || !navigator.serviceWorker || !navigator.serviceWorker.controller) return;
+    /*
+     * Never save an empty thread over a good one. An empty render happens on a
+     * conversation switch and on a failed cold read, and letting either of
+     * those overwrite the saved copy would delete his history at exactly the
+     * moment he is about to need it.
+     */
+    if (!job.all.length) return;
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        relay: 'save-thread',
+        conversation: job.conv,
+        body: JSON.stringify({ count: job.all.length, now: new Date().toISOString(), entries: job.all })
+      });
+    } catch (e) { /* no controller any more; the next render tries again */ }
   }
 
   function refreshTimes() {
     var els = list.querySelectorAll('.time');
     for (var i = 0; i < els.length; i++) els[i].textContent = rel(els[i].getAttribute('data-ts'));
+    // "saved 2m ago" has to keep counting, or a thread left open on a plane
+    // goes on claiming to be two minutes old for the whole flight.
+    if (offlineAt) { conn.textContent = 'offline — saved ' + rel(offlineAt); paintOffBar(); }
   }
 
   function merge(arr) {
@@ -1077,7 +1167,74 @@
     }
   }
 
-  function setConn(ok) { conn.className = ok ? '' : 'show'; }
+  /*
+   * Reading a header off something that may not be a real Response. The stub
+   * suite hands back plain objects, and a page that threw here would take the
+   * whole poll loop down over a diagnostic.
+   */
+  function header(r, name) {
+    try { return (r && r.headers && r.headers.get) ? r.headers.get(name) : null; } catch (e) { return null; }
+  }
+
+  /*
+   * Three states, not two, and the third is the one that was missing.
+   *
+   *   connected     — nothing shown, as before.
+   *   offline       — "offline — retrying". Nothing saved; the thread on screen
+   *                   is whatever was already in memory.
+   *   offline+saved — the service worker answered from its copy. Say when it
+   *                   was saved, and say that sending is off, because a message
+   *                   typed here would go nowhere and the page would look no
+   *                   different while it failed to.
+   *
+   * `savedAt` is the timestamp from the worker, or null if this is just a
+   * failed request.
+   */
+  function setConn(ok, savedAt) {
+    conn.className = ok ? '' : 'show';
+    offlineAt = ok ? null : (savedAt || offlineAt);
+    if (ok) {
+      conn.textContent = 'offline — retrying';
+      offBar.className = '';
+      offBar.textContent = '';
+      composer.className = '';
+      input.placeholder = 'Message…';
+      if (!sending) sendBtn.disabled = false;
+      return;
+    }
+    if (!offlineAt) {
+      // Offline with nothing saved to fall back on. The existing wording, and
+      // the composer is left alone: the server may answer the very next try.
+      conn.textContent = 'offline — retrying';
+      offBar.className = '';
+      offBar.textContent = '';
+      composer.className = '';
+      input.placeholder = 'Message…';
+      return;
+    }
+    conn.textContent = 'offline — saved ' + rel(offlineAt);
+    paintOffBar();
+    composer.className = 'off';
+    input.placeholder = 'Offline — can’t send';
+    sendBtn.disabled = true;
+  }
+
+  function paintOffBar() {
+    if (!offlineAt) return;
+    offBar.textContent = '';
+    var b = document.createElement('b');
+    b.textContent = 'Offline.';
+    offBar.appendChild(b);
+    offBar.appendChild(document.createTextNode(' You are reading messages saved '));
+    var w = document.createElement('span');
+    w.className = 'when';
+    w.textContent = rel(offlineAt);
+    offBar.appendChild(w);
+    offBar.appendChild(document.createTextNode(
+      '. Newer ones will not be here, and nothing can be sent until you are back on. ' +
+      'Anything you type stays in the box.'));
+    offBar.className = 'show';
+  }
 
   // `sticky` keeps the message up until it is tapped away. Used when the reason
   // matters and the user has to go do something about it — a nine-second flash is
@@ -1208,15 +1365,52 @@
     var url = (!fullRead && cursorMs)
       ? '/thread?' + scope + '&since=' + cursorMs
       : '/thread?' + scope + '&limit=' + WINDOW;
-    return fetch(url, { headers: { accept: 'application/json' }, cache: 'no-store' })
+    /*
+     * No `cache: 'no-store'` here, and it must stay that way.
+     *
+     * Firefox does not route a request made with `cache: 'no-store'` through
+     * the service worker at all — it goes straight to the network and fails
+     * outright when there isn't one. This read used to carry that flag, and the
+     * effect was that offline reading silently did nothing on his main browser:
+     * the thread was saved correctly, the worker was installed and controlling,
+     * and the one request that mattered walked straight past it.
+     *
+     * Nothing is lost by dropping it. The server already answers every JSON
+     * route with `cache-control: no-store`, so the HTTP cache was never going
+     * to hold these anyway — the flag was belt and braces, and the belt was
+     * strangling the feature.
+     */
+    return fetch(url, { headers: { accept: 'application/json' } })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
+        /*
+         * A read answered from the service worker's saved copy looks exactly
+         * like a successful one from here — same status, same JSON — which is
+         * the whole hazard. The worker stamps it, and this is where that stamp
+         * is turned into the difference between "live" and "history".
+         */
+        var cached = header(r, 'x-relay-from-cache') === '1';
+        // Held as ISO like every other time in this page, because rel() and
+        // ms() parse dates and would silently return '' for an epoch number.
+        var stamp = Number(header(r, 'x-relay-cached-at') || 0);
+        var at = stamp ? new Date(stamp).toISOString() : null;
+        return r.json().then(function (j) { return { j: j, cached: cached, at: at }; });
       })
-      .then(function (j) {
+      .then(function (got) {
+        var j = got.j;
         var arr = (j && Array.isArray(j.entries)) ? j.entries : [];
         if (merge(arr) || !everRendered) render();
         harvestSpeech();
+        if (got.cached) {
+          /*
+           * Not a success. `fails` is left climbing so the retry keeps backing
+           * off — the network really is gone, and hammering it from a phone
+           * with no signal is how the battery goes.
+           */
+          fails++;
+          setConn(false, got.at);
+          return false;
+        }
         fails = 0; setConn(true);
         return true;
       })
@@ -1389,7 +1583,10 @@
   }
 
   function loadConvs() {
-    return fetch('/conversations', { headers: { accept: 'application/json' }, cache: 'no-store' })
+    // No `cache: 'no-store'`, for the reason spelled out in poll(): in Firefox
+    // it would take this read straight past the service worker, so the
+    // conversation list would be missing offline. The server sends no-store.
+    return fetch('/conversations', { headers: { accept: 'application/json' } })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -2192,11 +2389,33 @@
     useTz.addEventListener('click', function () { saveConfig({ timezone: phoneZone() }); });
     quiet.appendChild(useTz);
 
+    /*
+     * ---- reading offline, and the way out of it
+     *
+     * The button is the point of this card. Caching the app of a project whose
+     * checkout is its deployment is a calculated risk, and the calculation only
+     * works if there is a way out that does not involve a laptop: no phone
+     * browser gives him a "clear this site's service worker" he could find
+     * while abroad. Network-first should mean he never needs this. It is here
+     * because "should" is not a recovery plan.
+     */
+    var off = scard('Reading offline');
+    off.appendChild(el('p', 'snote',
+      'Messages are saved on this phone as you read them, so the thread still opens with no ' +
+      'signal. Sending always needs a connection.'));
+    var forget = el('button', 'nbtn', 'Forget saved messages');
+    forget.type = 'button';
+    forget.addEventListener('click', forgetOffline);
+    off.appendChild(forget);
+    off.appendChild(el('p', 'snote',
+      'Throws away the saved copy and reloads. Use it if the app looks out of date or stuck.'));
+
     notifyBody.appendChild(card);
     notifyBody.appendChild(kinds);
     notifyBody.appendChild(quiet);
+    notifyBody.appendChild(off);
     nEls = { state: state, stateText: stateText, arm: arm, test: test, note: note,
-             boxes: boxes, from: from, to: to, br: br, tz: tz, useTz: useTz };
+             boxes: boxes, from: from, to: to, br: br, tz: tz, useTz: useTz, forget: forget };
   }
 
   function phoneZone() {
@@ -2269,13 +2488,158 @@
     return h + 'h' + (r ? ' ' + r + 'm' : '');
   }
 
+  // ------------------------------------------------------------------ offline
+  /*
+   * Registering the worker so the thread can be read with no connection.
+   *
+   * This used to happen only when he armed alerts, because the worker did
+   * nothing but receive pushes and registering it for anything else would have
+   * been registering it for nothing. It now also carries the offline cache, so
+   * it is registered on load. Registration on its own is silent — it asks for
+   * no permission and shows no prompt — so the rule that matters is untouched:
+   * the *notification* permission is still requested only on a deliberate tap.
+   *
+   * Most of what follows is about the update path rather than the cache. The
+   * checkout is the deployment, so the danger is not that offline fails, it is
+   * that offline succeeds too well and pins him to a build from last Tuesday.
+   * The worker's own network-first rule is the main defence; these are the rest.
+   */
+  var swReg = null;
+  var hadController = false;
+  var reloadingForUpdate = false;
+  var lastUpdateCheck = 0;
+
+  /** Run `fn` once, as soon as a worker is actually controlling this page. */
+  function whenControlled(fn) {
+    var sw = navigator.serviceWorker;
+    if (!sw) return;
+    var ran = false;
+    function go() {
+      if (ran || !sw.controller) return;
+      ran = true;
+      try { fn(); } catch (e) { /* the page is mid-teardown */ }
+    }
+    if (sw.controller) { go(); return; }
+    sw.addEventListener('controllerchange', go);
+    // A backstop, because controllerchange is one event and missing it would
+    // mean an install that quietly saves nothing until the next visit.
+    setTimeout(go, 3000);
+  }
+
+  function checkForUpdate() {
+    // Once a minute at most. update() is a real network request, and this fires
+    // on every return to the app.
+    if (!swReg || Date.now() - lastUpdateCheck < 60000) return;
+    lastUpdateCheck = Date.now();
+    try { swReg.update(); } catch (e) { /* browser is between workers */ }
+  }
+
+  function initOffline() {
+    // A worker needs https (or localhost). Without this the failure is an
+    // unhandled rejection on every plain-http load, which is noise, not news.
+    if (!navigator.serviceWorker || !window.isSecureContext) return;
+    hadController = !!navigator.serviceWorker.controller;
+
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(function (reg) {
+        swReg = reg;
+        if (!pushReg) pushReg = reg;
+        lastUpdateCheck = Date.now();
+        return navigator.serviceWorker.ready;
+      })
+      .then(function (reg) {
+        swReg = reg || swReg;
+        /*
+         * On the very first install the worker starts controlling the page
+         * mid-life, having missed the reads that already happened — so nothing
+         * is saved yet. One more read now goes through it fills the cache,
+         * which makes "install it and walk out of signal" work instead of
+         * needing a second visit nobody would know to make.
+         *
+         * It must be poll(TRUE). A normal poll is a `since=` delta, and the
+         * worker deliberately refuses to save those — a delta is three messages
+         * out of four hundred, and saving one would look like an empty thread.
+         *
+         * The wait for `controller` is not paranoia: ready() resolves when
+         * there is an active worker, which is BEFORE clients.claim() has
+         * actually taken this page over. Warming at that moment sends the read
+         * straight past the worker and saves nothing, which is precisely the
+         * bug this comment replaced.
+         */
+        whenControlled(function () { poll(true); loadConvs(); flushSave(); });
+      })
+      .catch(function (err) {
+        logClient('sw-register-failed', { message: (err && err.message) || String(err) });
+      });
+
+    /*
+     * A new worker has taken over, which means the code on screen is older than
+     * the code on the server. Reload onto it rather than leaving him reading a
+     * page that has already been replaced.
+     *
+     * Guarded three ways: not on the first install (claiming a page that just
+     * loaded is not an update), never twice, and never while there is something
+     * in the composer — no update is worth eating what he was in the middle of
+     * typing. In that case the next reload picks it up, which is safe because
+     * the worker asks the network first anyway.
+     */
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController) { hadController = true; return; }
+      if (reloadingForUpdate || sending) return;
+      if (input && input.value && input.value.trim()) return;
+      reloadingForUpdate = true;
+      location.reload();
+    });
+
+    // Coming back to an installed app is exactly when a week-old build would
+    // otherwise go unnoticed, since it may never have been closed.
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) checkForUpdate();
+    });
+
+    /*
+     * The OS's own opinion about connectivity. It is not authoritative — a
+     * captive portal or hotel wifi is "online" and reaches nothing — so it is
+     * used only to react fast: going offline is believed at once, while coming
+     * back merely triggers a read, and the read is what decides.
+     */
+    window.addEventListener('online', function () { fails = 0; checkForUpdate(); kick(); });
+    window.addEventListener('offline', function () { if (offlineAt) setConn(false, offlineAt); });
+
+    // The worker's reply to "forget everything you saved".
+    navigator.serviceWorker.addEventListener('message', function (ev) {
+      var d = ev && ev.data;
+      if (d && d.relay === 'offline-forgotten') location.reload();
+    });
+  }
+
+  /** The escape hatch: throw the saved copies away and start clean. */
+  function forgetOffline() {
+    var sw = navigator.serviceWorker;
+    if (!sw) return;
+    if (sw.controller) {
+      try { sw.controller.postMessage({ relay: 'forget-offline' }); return; } catch (e) { /* fall through */ }
+    }
+    // No controller to ask, so do it from here and reload regardless.
+    if (window.caches && caches.keys) {
+      caches.keys().then(function (names) {
+        return Promise.all(names.map(function (n) {
+          return n.indexOf('relay-') === 0 ? caches.delete(n) : null;
+        }));
+      }).catch(function () { return null; }).then(function () { location.reload(); });
+    } else {
+      location.reload();
+    }
+  }
+
   function initNotify() {
     if (!notifyBody) return;
     buildNotifyUi();
     renderNotify();
     /*
-     * Passive on load: getRegistration() never prompts and never registers.
-     * Only the button calls register()/requestPermission().
+     * Passive on load as far as permission goes: getRegistration() never
+     * prompts. initOffline() registers the worker, but registration asks for
+     * nothing — only the button calls requestPermission().
      */
     if (navigator.serviceWorker && navigator.serviceWorker.getRegistration) {
       navigator.serviceWorker.getRegistration().then(function (reg) {
@@ -2325,6 +2689,17 @@
     if (pendingInBox) { from = 'voice-conversation'; clearStitch(true); }
     var text = input.value;
     if (!text.trim()) { input.focus(); return Promise.resolve(false); }
+    /*
+     * Refuse before trying, when we already know there is nothing to try. The
+     * button is disabled in this state, but Enter reaches here too, and so does
+     * a dictated utterance — and the one outcome that must never happen is a
+     * message that looks sent and is not. This is also why there is no offline
+     * send queue: the honest failure is worth more than a hopeful one.
+     */
+    if (offlineAt) {
+      showErr('Offline — not sent. Your words are still here; send them when you are back on.', true);
+      return Promise.resolve(false);
+    }
     if (text.length > MAX_CHARS) {
       showErr('Too long — ' + text.length + ' of ' + MAX_CHARS + ' characters.');
       return Promise.resolve(false);
@@ -3767,6 +4142,16 @@
     initNotify();
   } catch (err) {
     logClient('notify-init-failed', { message: (err && err.message) || String(err) });
+  }
+  /*
+   * Offline reading. Defensive for the same reason voice is: a browser that
+   * cannot register a worker must still be a working messaging app, and this
+   * runs before the first read so the worker is on its way while it happens.
+   */
+  try {
+    initOffline();
+  } catch (err) {
+    logClient('offline-init-failed', { message: (err && err.message) || String(err) });
   }
   render();
   autosize();
