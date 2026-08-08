@@ -85,10 +85,32 @@ function makeAudio(store) {
     this.state = 'running';
     this.destination = {};
     this.audioWorklet = { addModule: () => Promise.resolve() };
+    this.handlers = {};
+    this.onstatechange = null;
     store.ctxs.push(this);
   }
+  Ctx.prototype.addEventListener = function (ev, fn) {
+    (this.handlers[ev] = this.handlers[ev] || []).push(fn);
+  };
+  Ctx.prototype.setState = function (s) {
+    if (this.state === s) return;
+    this.state = s;
+    (this.handlers.statechange || []).slice().forEach((f) => f.call(this, { type: 'statechange' }));
+    if (this.onstatechange) this.onstatechange({ type: 'statechange' });
+  };
+  /*
+   * A phone backgrounding the tab. The page did not ask for this and gets no say
+   * in it — which is the whole point: a suspended context pulls no audio, so the
+   * graph goes quiet while every object involved still looks perfectly healthy.
+   */
+  Ctx.prototype.background = function () { this.setState('suspended'); };
   Ctx.prototype.createGain = function () { return { gain: {}, connect() {}, disconnect() {} }; };
-  Ctx.prototype.createMediaStreamSource = function () { return { connect() {}, disconnect() {} }; };
+  // Only the capture graph has a MediaStreamSource, so this is how the tests
+  // tell the recording context from the playback one.
+  Ctx.prototype.createMediaStreamSource = function () {
+    store.capCtx = this;
+    return { connect() {}, disconnect() {} };
+  };
   Ctx.prototype.createBuffer = function () { return { duration: 0 }; };
   Ctx.prototype.createBufferSource = function () {
     const src = {
@@ -100,9 +122,18 @@ function makeAudio(store) {
     return src;
   };
   Ctx.prototype.decodeAudioData = function () { return Promise.resolve({ duration: 1.5 }); };
-  Ctx.prototype.resume = function () { this.state = 'running'; return Promise.resolve(); };
-  Ctx.prototype.suspend = function () { this.state = 'suspended'; return Promise.resolve(); };
-  Ctx.prototype.close = function () { this.state = 'closed'; };
+  /*
+   * iOS will refuse to resume without a fresh user gesture, and the refusal is a
+   * rejected promise, not an exception — a page that assumes resume() works comes
+   * back from a lock screen deaf while believing it is listening.
+   */
+  Ctx.prototype.resume = function () {
+    if (store.resumeRefused) return Promise.reject(new Error('resume requires a user gesture'));
+    this.setState('running');
+    return Promise.resolve();
+  };
+  Ctx.prototype.suspend = function () { this.setState('suspended'); return Promise.resolve(); };
+  Ctx.prototype.close = function () { this.setState('closed'); };
 
   function Node() { this.port = { onmessage: null }; store.nodes.push(this); }
   Node.prototype.connect = function () {};
@@ -111,11 +142,38 @@ function makeAudio(store) {
   return { Ctx, Node };
 }
 
+/*
+ * A microphone that can also DIE, because real ones do. A MediaStreamTrack ends
+ * when the source goes away — a Bluetooth headset walks out of range, another
+ * app takes the capture device, the OS revokes the permission — and it goes
+ * `muted` (recoverably) when something borrows it, such as an incoming call.
+ * Neither is anything the page asked for, and both leave a stream that is still
+ * an object, still wired into the graph, and delivering nothing.
+ *
+ * `readyState` and the events are what the page reads to tell "listening" from
+ * "holding a dead stream", so the stub has to have them or that code is untested.
+ * Note that per spec `stop()` does NOT fire 'ended' — only the source vanishing
+ * does — and this stub keeps that distinction.
+ */
 function workingMic(store) {
   return {
     getUserMedia() {
       if (store.micError) return Promise.reject(store.micError);
-      const track = { kind: 'audio', enabled: true, stopped: false, stop() { this.stopped = true; } };
+      const track = {
+        kind: 'audio', enabled: true, stopped: false, muted: false, readyState: 'live',
+        handlers: {},
+        addEventListener(ev, fn) { (this.handlers[ev] = this.handlers[ev] || []).push(fn); },
+        removeEventListener(ev, fn) {
+          this.handlers[ev] = (this.handlers[ev] || []).filter((f) => f !== fn);
+        },
+        fire(ev) { (this.handlers[ev] || []).slice().forEach((f) => f.call(this, { type: ev })); },
+        stop() { this.stopped = true; this.readyState = 'ended'; },
+        /** The source went away for good: headset unplugged, device taken. */
+        end() { this.readyState = 'ended'; this.fire('ended'); },
+        /** Borrowed, not lost — a phone call. Comes back on unmute(). */
+        mute() { this.muted = true; this.fire('mute'); },
+        unmute() { this.muted = false; this.fire('unmute'); },
+      };
       store.tracks.push(track);
       return Promise.resolve({ getTracks: () => [track], getAudioTracks: () => [track] });
     },
@@ -552,6 +610,177 @@ async function main() {
     check('nothing said while transcribing was lost',
       env.sent().length === 1 && /one two three|check the widget report/.test(env.sent()[0].body.text),
       JSON.stringify(env.sent().map((p) => p.body.text)));
+  }
+
+  /*
+   * ================================================================
+   * "LISTENING — GO AHEAD." MUST BE A FACT, NOT AN INTENTION.
+   *
+   * The reported bug: the bar said it was listening when it was not, only
+   * sometimes. It is dictated into from a phone, so a bar that lies costs a
+   * whole message — spoken into nothing, and not noticed until a reply never
+   * comes.
+   *
+   * There were three ways to get there, and they share one cause: the status
+   * line was written by whoever last had an opinion about what should be
+   * happening, and never re-read whether it was. So it is tested from the other
+   * end here — take the microphone away by each of the means a phone actually
+   * uses, and assert the words on the screen change to match.
+   */
+  console.log('\nthe listening indicator is a fact, not an intention');
+
+  // 1. A request still in flight when the conversation is stopped. Its
+  //    continuation runs after the teardown, and used to relight the bar.
+  {
+    const env = liveEnv();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const realFetch = env.sandbox.fetch;
+    env.sandbox.fetch = (url, init) => (url === '/stt' ? gate.then(() => realFetch(url, init)) : realFetch(url, init));
+    await startConv(env);
+    env.sayOneThing();
+    await settle();
+    check('a transcription is in flight when the user stops', env.stt().length === 0, `${env.stt().length} finished`);
+
+    env.els.vstop.dispatch('click');
+    await settle();
+    check('stopping puts the bar out at once', env.els.voice.className === '', env.els.voice.className);
+    check('and the microphone is really released', env.track().stopped === true);
+
+    release();
+    await settle(); await settle(); await settle();
+    check('*** a transcription landing after the stop does not relight "Listening" ***',
+      !/^listening/i.test(env.els.vtext.textContent), JSON.stringify(env.els.vtext.textContent));
+    check('and the bar stays out', env.els.voice.className === '', env.els.voice.className);
+  }
+
+  // 2. The source goes away underneath a live conversation: a Bluetooth headset
+  //    walks off, or another app takes the capture device. Nothing the page did.
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.feed(450, false); // calibrate, which is what first says "go ahead"
+    await settle();
+    check('it does say "Listening" while the mic really is open',
+      /^listening — go ahead/i.test(env.els.vtext.textContent), env.els.vtext.textContent);
+
+    env.track().end();
+    await settle();
+    check('*** the indicator stops claiming to listen the moment the mic dies ***',
+      !/^listening/i.test(env.els.vtext.textContent), JSON.stringify(env.els.vtext.textContent));
+    check('it says the microphone is what went, in words',
+      /microphone/i.test(env.els.vtext.textContent + ' ' + env.els.err.textContent),
+      env.els.vtext.textContent + ' | ' + env.els.err.textContent);
+    check('the loss is reported to the server',
+      env.posted.some((p) => p.url === '/client-log' && p.body && p.body.event === 'mic-lost'),
+      JSON.stringify(env.posted.filter((p) => p.url === '/client-log').map((p) => p.body.event)));
+    check('the conversation button no longer reads as running',
+      env.els.convo.className !== 'on', env.els.convo.className);
+
+    // And it must stay honest: nothing more may be posted from a dead stream.
+    const sent = env.sent().length;
+    env.sayOneThing();
+    await wait(2400);
+    check('a dead stream cannot post anything more', env.sent().length === sent,
+      `${env.sent().length - sent} phantom messages`);
+  }
+
+  // 3. The phone backgrounds the tab. Every object stays healthy-looking; the
+  //    context simply stops pulling audio, and no frame ever arrives again.
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.feed(450, false);
+    await settle();
+    check('listening while the context is running', /^listening — go ahead/i.test(env.els.vtext.textContent),
+      env.els.vtext.textContent);
+
+    env.store.capCtx.background();
+    await settle();
+    check('*** a suspended audio context is not reported as listening ***',
+      !/^listening/i.test(env.els.vtext.textContent), JSON.stringify(env.els.vtext.textContent));
+
+    env.doc.hidden = false;
+    env.doc.dispatch('visibilitychange');
+    await settle();
+    check('and it says so again once the tab comes back and audio resumes',
+      /^listening — go ahead/i.test(env.els.vtext.textContent), env.els.vtext.textContent);
+  }
+
+  // 4. ...and when the browser refuses to resume (iOS wants a fresh gesture),
+  //    coming back to the tab must not be mistaken for coming back to life.
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.feed(450, false);
+    await settle();
+    env.store.resumeRefused = true;
+    env.store.capCtx.background();
+    env.doc.hidden = false;
+    env.doc.dispatch('visibilitychange');
+    await settle(); await settle();
+    check('*** a refused resume is not reported as listening ***',
+      !/^listening/i.test(env.els.vtext.textContent), JSON.stringify(env.els.vtext.textContent));
+    check('it tells the user what to do about it',
+      /tap|resume|again/i.test(env.els.vtext.textContent), env.els.vtext.textContent);
+  }
+
+  // 5. Borrowed, not lost — an incoming call mutes the track and hands it back.
+  //    Recoverable, so this one must NOT tear the conversation down.
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.feed(450, false);
+    await settle();
+    env.track().mute();
+    await settle();
+    check('a muted track is not reported as listening',
+      !/^listening/i.test(env.els.vtext.textContent), JSON.stringify(env.els.vtext.textContent));
+    check('but the conversation is not torn down over it — it comes back',
+      env.track().stopped === false && env.els.convo.className.indexOf('on') === 0, env.els.convo.className);
+    env.track().unmute();
+    await settle();
+    check('and it says "Listening" again once the mic is handed back',
+      /^listening — go ahead/i.test(env.els.vtext.textContent), env.els.vtext.textContent);
+  }
+
+  // 6. The same rule for one-shot dictation: the bar may not outlive the mic.
+  {
+    const env = liveEnv();
+    env.els.mic.dispatch('click');
+    await settle();
+    env.feed(450, false);
+    await settle();
+    check('one-shot dictation says it is listening while it is', /^listening — go ahead/i.test(env.els.vtext.textContent),
+      env.els.vtext.textContent);
+    env.track().end();
+    await settle();
+    check('*** one-shot stops claiming to listen when the mic dies ***',
+      !/^listening/i.test(env.els.vtext.textContent), JSON.stringify(env.els.vtext.textContent));
+    check('the mic button does not stay lit either', env.els.mic.className !== 'on', env.els.mic.className);
+  }
+
+  // 7. ...and words already spoken when the mic went are not thrown away. A
+  //    lying indicator and a binned message are the same failure one step apart.
+  {
+    const env = liveEnv();
+    env.els.mic.dispatch('click');
+    await settle();
+    env.feed(450, false);  // room level
+    env.feed(900, true);   // a real sentence, still being spoken
+    await settle();
+    env.track().end();     // the headset goes, mid-word
+    await wait(200);
+    check('a dictation cut short by a dead mic is still transcribed', env.stt().length === 1,
+      `${env.stt().length} /stt calls`);
+    check('...and still reaches the queue', env.sent().length === 1,
+      JSON.stringify(env.sent().map((p) => p.body.text)));
+    // The error bar is deliberately NOT asserted here: the send succeeded, and a
+    // successful send clears it. Losing the words is the failure; a tidy bar is not.
+    check('and the reason it was cut short is on the record',
+      env.posted.some((p) => p.url === '/client-log' && p.body && p.body.event === 'mic-lost'
+        && p.body.detail && p.body.detail.phase === 'speak'),
+      JSON.stringify(env.posted.filter((p) => p.url === '/client-log').map((p) => p.body)));
   }
 
   // ================================================================ THE ECHO LOOP
