@@ -18,9 +18,23 @@ services:
       TTS_HOST: "host.docker.internal"
       TTS_PORT: "10200"
     ports:
-      # All interfaces: reachable from LAN and Tailscale. The page has no auth
-      # yet — anyone on those networks can read/post. Revisit when the
-      # Access-gated relay.hypnodroid.com exposure lands.
+      # Loopback only. The page has no auth of its own, so the sole way in is
+      # relay.hypnodroid.com through the tunnel, where Cloudflare Access checks
+      # identity. Publishing on all interfaces used to let anyone on the LAN or
+      # Tailscale read and post with no login at all, bypassing Access entirely.
+      # Both families are bound on purpose: cloudflared runs network_mode: host,
+      # and an origin rule written as "localhost" resolves ::1 before 127.0.0.1 —
+      # binding only IPv4 would break the tunnel for that spelling.
+      # Loopback only. This page has no login of its own, so the sole way in is
+      # relay.hypnodroid.com through the tunnel, where Cloudflare Access checks
+      # identity. Published on all interfaces this was readable and postable by
+      # anyone on the LAN or Tailscale — and a post here makes agents act.
+      #
+      # IPv4 only, deliberately: the tunnel's origin rule must be spelled
+      # 127.0.0.1:3901, NOT localhost:3901. cloudflared runs network_mode: host
+      # and resolves localhost to ::1 first, while Docker Desktop accepts a [::1]
+      # publish and then refuses connections on it — that combination took the
+      # page down once. Verify the ingress rule before ever touching this line.
       - "3901:3901"
     volumes:
       # The whole working tree, read-only. Mounting the *directory* rather than

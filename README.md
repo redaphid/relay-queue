@@ -32,10 +32,14 @@ and [Why it cannot hear itself](#why-it-cannot-hear-itself).
 
 Open **http://127.0.0.1:3901/** — one page, no build step, no login.
 
-What you see, top to bottom: a `relay` header (which grows an `offline — retrying` note if the
-server goes away, and holds the **speaker** toggle for spoken replies), the message thread, a status
-line that appears while voice is in use, then a **mic** button, a **conversation** button, a textarea
-and a **Send** button pinned to the bottom.
+What you see, top to bottom: a header with the **hamburger menu** on the left, the name of the
+conversation you are in, an `offline — retrying` note if the server goes away, and the **speaker**
+toggle for spoken replies; then the message thread, a status line that appears while voice is in
+use, and finally a **mic** button, a **conversation** button, a textarea and a **Send** button
+pinned to the bottom.
+
+- **Conversations**: the hamburger opens a list of separate threads you can switch between, with a
+  new-conversation box at the top. See [Conversations](#conversations).
 
 - **The thread** runs oldest at the top, newest at the bottom, and auto-scrolls to the bottom on
   load and whenever something new arrives. If you have scrolled up to read history it leaves you
@@ -230,7 +234,7 @@ no audio APIs cannot take the messaging half of the page down with it.
 node tools/ui-selftest.js
 ```
 
-It now also drives conversation mode end to end — utterance capture, the transcription queue, the
+It now also drives the conversation menu, switching, and conversation mode end to end — utterance capture, the transcription queue, the
 noise filter, spoken replies, and the echo gate described in
 [Why it cannot hear itself](#why-it-cannot-hear-itself).
 
@@ -374,6 +378,159 @@ driving. Two pieces, no Docker socket and no webhooks:
 Because a sync loop is writing to the checkout, **agents should not commit straight into it** once
 the repo is published — work on a branch or a worktree and merge on GitHub. See
 `.github-drafts/PUBLISH.md`.
+
+---
+
+## Conversations
+
+One queue, many threads. Every task carries a **`conversationId`**; the UI shows exactly one
+conversation at a time and switches between them from the hamburger menu.
+
+**Nothing about this is a migration.** A conversation is a label on records you already have:
+
+- Tasks written before conversations existed have no `conversationId` and replay into the **default
+  conversation, `main`**, so the entire existing history lands in one sensible thread.
+- The default conversation is created **in memory** at boot and is never written to the log, so
+  `data/events.jsonl` from an older version is left byte for byte untouched. Nothing is rewritten in
+  place; renaming it just appends a patch on top, like every other mutation here.
+- **Every pre-existing call keeps working unchanged.** Omitting `conversationId` on `POST /tasks`
+  files the message under `main`; omitting the filter on `GET /thread` or `GET /tasks` returns the
+  whole queue exactly as before. Every curl command in this README is unaffected.
+- `main` cannot be archived — it is where an omitted `conversationId` lands.
+
+This is verified by `node tools/replay-selftest.js`, which boots a real server against a
+hand-written old log (records from before `role` existed, from before conversations existed, and a
+torn final line) and asserts all of the above, including that the log file is not modified.
+
+A conversation record:
+
+```json
+{
+  "id": "msjfwakm-pgrjbw",
+  "title": "Widget audit",
+  "agent": "coordinator-2",
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "archived": false,
+  "archivedAt": null
+}
+```
+
+**`agent` is the agent side's field.** It names whoever is meant to answer in this conversation.
+relay-queue never reads it, never acts on it and **never spawns anything** — it is a passive queue,
+and this is somewhere to record routing that something else decides. `assignee` is accepted as an
+alias on write.
+
+### The conversation API
+
+**List conversations** — most recently active first. Each carries its derived `counts`, a `messages`
+total, and `lastTs` / `lastRole` / `lastText` (a 140-character snippet of the newest message), so a
+menu can be drawn from this one call. Archived ones are hidden unless asked for.
+
+```bash
+curl -s http://127.0.0.1:3901/conversations
+```
+
+Returns `{count, defaultId, conversations:[…]}`. Filters, which stack:
+
+| Query | Meaning |
+| ----- | ------- |
+| `?pending=1` | only conversations with work waiting — **the agent side's poll** |
+| `?unread=1`  | only conversations with unrelayed results |
+| `?archived=1` | include archived ones |
+| `?archived=only` | *only* archived ones |
+
+**Where is there work waiting, and who is meant to do it?**
+
+```bash
+curl -s 'http://127.0.0.1:3901/conversations?pending=1'
+```
+
+**Create a conversation** — `title` is required, `agent` optional. Returns `201` + the record.
+
+```bash
+curl -s -X POST http://127.0.0.1:3901/conversations \
+  -H 'content-type: application/json' \
+  -d '{"title":"Widget audit","agent":"coordinator-2"}'
+```
+
+**Get one** — same shape as a list entry, with counts. `404` if unknown.
+
+```bash
+curl -s http://127.0.0.1:3901/conversations/REPLACE_ID
+```
+
+**Rename, reassign or archive** — POST any of `title`, `agent` (or `assignee`), `archived`. Only the
+fields present are changed.
+
+```bash
+curl -s -X POST http://127.0.0.1:3901/conversations/REPLACE_ID \
+  -H 'content-type: application/json' \
+  -d '{"agent":"coordinator-7"}'
+
+curl -s -X POST http://127.0.0.1:3901/conversations/REPLACE_ID \
+  -H 'content-type: application/json' \
+  -d '{"archived":true}'
+```
+
+**Post into a conversation** — `400` if the id is unknown, so a typo cannot orphan a message where
+nobody will see it.
+
+```bash
+curl -s -X POST http://127.0.0.1:3901/tasks \
+  -H 'content-type: application/json' \
+  -d '{"text":"how many widgets are left?","conversationId":"REPLACE_ID"}'
+```
+
+**Read one conversation's thread** — `conversation=` (alias: `conversationId=`) works on `/thread`,
+`/tasks` and `/results`, and stacks with `status`, `since`, `unread` and `limit`.
+
+```bash
+curl -s 'http://127.0.0.1:3901/thread?conversation=REPLACE_ID&limit=20'
+curl -s 'http://127.0.0.1:3901/tasks?conversation=REPLACE_ID&status=pending'
+```
+
+Thread entries now carry `conversationId`, and `GET /events` frames carry it too — see
+[live updates](#live-updates-across-conversations).
+
+### The menu
+
+The hamburger at the top left opens a drawer listing every conversation, most recently active first,
+each showing its title, a hint of the last message, how long ago that was, how much is waiting and
+which agent is assigned. The one you are in is highlighted and named in the header. Type a title and
+press **+** to start a new one; you are switched into it. Tap outside, press Escape, or pick a
+conversation to close the drawer.
+
+A red dot on the hamburger means something arrived in a conversation you are **not** looking at, and
+that conversation gets a dot of its own in the list — so switching is an informed choice rather than
+a guess. The active conversation is remembered across reloads.
+
+### Live updates across conversations
+
+`GET /events` remains **one stream carrying everything**, and every frame names its conversation:
+
+```
+data: {"now":"…","conversationId":"main","entries":[…]}
+data: {"now":"…","conversation":{"id":"…","title":"…","agent":"…","archived":false}}
+```
+
+A page merges frames for the conversation it is showing and merely *flags* the rest. This is
+deliberately not filtered server-side: it is what lets the menu light up for a conversation you are
+not watching without opening a second connection. Conversation records are pushed the same way, so a
+rename appears everywhere at once. Polling remains the fallback and its back-off is unchanged —
+`GET /thread` is simply scoped with `conversation=`, and the menu is refreshed on the periodic full
+read.
+
+### Voice and conversations
+
+Dictation, conversation mode and spoken replies all operate on the **active** conversation.
+
+- A dictated utterance is tagged with the conversation that was open **when it was spoken**, not
+  when its transcript came back — so switching threads while Whisper is still working cannot
+  misroute what you said. There is a test for exactly this.
+- Switching conversations does **not** stop a running microphone; it keeps listening, and subsequent
+  utterances go to the new conversation.
+- Only the conversation on screen is read aloud. Hearing an answer to something in a thread you are
+  not looking at is disorienting, and the menu already flags that it arrived.
 
 ---
 
@@ -604,14 +761,18 @@ JSON
 | ------ | --------------------- | -------------------------------------------------------------- |
 | GET    | `/`                   | **new** — the mobile web UI (`text/html`; `503` if the page file is missing) |
 | GET    | `/health`             | liveness + counts                                               |
-| POST   | `/tasks`              | create (`400` if `instruction`/`text` missing or over 8000 chars) |
-| GET    | `/tasks`              | list; `status` `unread` `since` `limit` (first N)               |
+| POST   | `/tasks`              | create (`400` if `instruction`/`text` missing, over 8000 chars, or the conversation is unknown) |
+| GET    | `/tasks`              | list; `conversation` `status` `unread` `since` `limit` (first N) |
 | GET    | `/tasks/:id`          | one task                                                        |
 | POST   | `/tasks/:id/claim`    | pending -> claimed (`404`/`409`)                                |
 | POST   | `/tasks/:id/result`   | -> done, **and posts the agent's reply into the thread** (`404`/`409`) |
-| GET    | `/results`            | done tasks only; `unread` `since` `limit`                       |
+| GET    | `/results`            | done tasks only; `conversation` `unread` `since` `limit`         |
 | POST   | `/tasks/:id/relayed`  | mark shown to human (idempotent)                                |
-| GET    | `/thread`             | chronological human+agent view; `since` (on `rev`) `limit` (last N) |
+| GET    | `/thread`             | chronological human+agent view; `conversation` `since` (on `rev`) `limit` (last N) |
+| GET    | `/conversations`      | **new** — list with counts and a snippet; `pending` `unread` `archived` |
+| POST   | `/conversations`      | **new** — create one (`title`, optional `agent`)                 |
+| GET    | `/conversations/:id`  | **new** — one conversation with its counts                       |
+| POST   | `/conversations/:id`  | **new** — rename / reassign / archive (`title`, `agent`, `archived`) |
 | GET    | `/events`             | **new** — Server-Sent Events; every change pushed as it happens  |
 | POST   | `/stt`                | raw PCM in, `{text}` out, via the local Whisper engine           |
 | POST   | `/tts`                | **new** — `{text}` in, a WAV out, via the local piper engine     |
@@ -621,6 +782,10 @@ JSON
 control-character-stripped line to stdout. It exists because the UI's real home is a phone, where
 there is no console to read and "the mic did nothing" is otherwise undebuggable.
 
+Changed in 1.4.0, all backward compatible: tasks gained a server-set `conversationId`, defaulting to
+`main`; `/conversations` lists, creates and updates them; `/thread`, `/tasks` and `/results` take a
+`conversation` filter; `/events` frames name their conversation. Records and calls that predate
+conversations are unaffected — see [Conversations](#conversations).
 Changed in 1.3.0, all backward compatible: `POST /tts` speaks text through the local piper engine,
 and the page gained hands-free conversation mode and spoken replies. No existing endpoint, record or
 curl call changed.
