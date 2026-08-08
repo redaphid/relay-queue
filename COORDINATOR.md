@@ -121,13 +121,68 @@ recap of what you were asked. Detail belongs in files and commits, not in your
 context or the user's thread.
 
 **Speak only what matters.** `POST http://127.0.0.1:12020/speak` `{"text":"..."}`
-— unauthenticated loopback, plays on the Echo Studio, needs no session. It is
-the only channel that reaches the user with no page open, which is exactly why
-it must not be spent on noise: it interrupts a room, not a screen. Speak
+— unauthenticated loopback, plays on the Echo Studio, needs no session. It
+reaches the user with no page open (so does web push, below), which is exactly
+why it must not be spent on noise: it interrupts a room, not a screen. Speak
 completions, blockers, failures, and anything needing their hands. Never speak
 queue status, progress, or acknowledgements — the user asked for this
 specifically after I over-used it. Write for the ear: expand paths phonetically,
 one or two sentences (~40 words is ~13 s of playback, already long out loud).
+
+**Any agent can push his phone, and almost none of them should.** Web push is
+live and confirmed on his handset. No `/push/*` route has authentication, so a
+bare `curl` from anything on this machine reaches him with no page open, no
+session, and no speaker in the room. That makes it the right channel when he is
+away or asleep — and the easiest one in this system to ruin. The bar is his
+standing instruction, and it is the same bar as the speaker: **things that need
+him, things he was waiting on that finished, and things that are broken. Not
+progress, not status, not acknowledgements.** He had to rein the speaker in
+after it was over-used; do not make him do it twice. On the night push shipped,
+17 notifications reached his phone in one hour — that is what over-use looks
+like, and nobody decided to do it.
+
+Two ways to send one. Prefer the second: it carries *your* words.
+
+```bash
+# (a) fixed-text ping. Skips the debounce AND quiet hours, by design. You
+# cannot set the body — it always says "Test — it works". 409 if nothing armed.
+curl -s -X POST http://127.0.0.1:3901/push/test -H 'content-type: application/json' \
+  -d '{"category":"done"}'          # needs-you | done | broken
+
+# (b) the real one: any POST /tasks or /tasks/:id/result takes a `notify` hint,
+# and your text becomes the notification body (first 140 chars).
+curl -s -X POST http://127.0.0.1:3901/tasks/<id>/result -H 'content-type: application/json' \
+  -d '{"result":"...","notify":"done"}'   # or "needs-you" / "broken" / "none"
+
+curl -s http://127.0.0.1:3901/push/config   # read-only: armed devices, quiet hours, budget
+```
+
+What the categories mean to him: `needs-you` buzzes "Needs you", `done` buzzes
+"Reply ready", `broken` buzzes "Something is broken". `none` suppresses a push
+that would otherwise fire — use it when you answer your own posted task, or when
+the reply is routine. Sends are debounced (15 s; 3 s for `broken`) and capped at
+20/hour, so a burst collapses into one buzz and a runaway loop cannot empty his
+battery. An answer arriving cancels the `needs-you` still waiting to go out.
+
+Four facts that will otherwise cost you:
+
+- **`201`/`2xx` means the push service accepted it, not that he saw it.** The
+  last hop — Mozilla autopush or FCM to the handset — is invisible from here.
+  Never report a notification as delivered on the strength of a status code.
+  Say "sent"; only he can say "arrived".
+- **Subscriptions are per browser.** Firefox and Chrome are separate rows with
+  separate push services. Today exactly one device is armed (**Firefox**), so a
+  push is reaching one browser on one phone. "It works" in Firefox says nothing
+  about Chrome, and `GET /push/config` lists what is actually armed — check it
+  rather than assuming.
+- **Quiet hours are NOT configured.** `quietFrom` and `quietTo` are both `null`,
+  so the window is off and *nothing is ever suppressed, at any hour*. The
+  timezone reads `UTC`, which is correct in Iceland and wrong by his home offset
+  the day he flies back. Until he sets a window in the UI, a 3am buzz is on you,
+  not on the server. Assume no guardrail exists, because none does.
+- **Channel traffic can never push him.** `classify()` drops anything
+  `internal` before any other rule, so agent-to-agent `POST /messages` with a
+  `channel` is silent by construction — verified live. Coordinate freely there.
 
 **When nobody is watching, never attempt an action that might need approval.**
 A permission prompt with no human to answer it does not fail — it **parks the
