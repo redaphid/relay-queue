@@ -41,6 +41,18 @@ change), so an in-place edit ships unreviewed work to his live page, and two
 agents in one checkout silently lose each other's work. Put it in every brief
 you write, because an agent that was not told will default to the obvious place.
 
+**Commit incrementally, from the first working increment, even half-finished.**
+Agents do not commit until told to — this is a default, not an oversight, and it
+was caught twice in one night in two different repos by two different
+coordinators. Three relay worktrees (`pwa-offline`, `markdown-rich`,
+`mobile-zoom-back`) all sat at `90f8478` with hours of work existing only as
+uncommitted working-tree state, and `sporefall-station` had `door-fix` and
+`enemy-art` in exactly the same condition. A WIP commit on your own branch costs
+nothing and is trivially revertible; it is the difference between a crash
+costing five minutes and costing an evening. **Put this in every worker's brief
+at spawn time** — a worker told this at the start is correct from the start,
+whereas one told at the end has already taken the risk.
+
 **Reports go outside the checkout.** Never `relay-queue/reports/`. A report
 written inside the repo becomes something the next agent must notice, rebase
 around, or accidentally commit. Give each worker an explicit path outside the
