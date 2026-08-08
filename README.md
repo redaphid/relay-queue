@@ -622,6 +622,67 @@ deleted rather than retried forever.
 
 ---
 
+## Reading it with no signal
+
+Installed to a home screen, relay opens and shows the thread with the network off — on a plane, in
+a tunnel, on hotel wifi that has stopped answering. **Reading** works offline. **Sending never
+does**, and the page says so rather than pretending.
+
+**What is kept**, in the Cache API, by `public/sw.js`:
+
+- the app shell and the icons, under `relay-shell-<version>`;
+- the most recent state of each conversation's thread, and the conversation list, under
+  `relay-data-<version>`.
+
+Threads are stored as `/thread` *responses*, one per conversation, so the page needs no second code
+path: `poll()` gets the JSON it always gets and `merge()` is untouched. Keeping the store honest is
+the page's job — it hands the worker the thread it currently holds (debounced) whenever the thread
+changes, because the page reads a full window once and then lives on `since=` deltas, and a delta
+saved on its own would look like an empty conversation. It is bounded by construction: one entry
+per conversation, at most `MAX_THREADS`, each already limited to the page's window.
+
+**A saved page can never outlive a deploy.** This is the thing that would actually hurt, because the
+checkout *is* the deployment here — see [Staying up to date](#staying-up-to-date) — and a phone
+abroad has no way to clear a cache. So:
+
+- the shell is **network-first**, never cache-first: while there is a network the freshly deployed
+  page wins, every time. The cache answers only when the network has failed or gone quiet, and the
+  in-flight request is still allowed to finish and refresh the cache;
+- caches are **versioned** and every older one of ours is deleted on `activate`;
+- `skipWaiting()` + `clients.claim()`, and the page reloads onto a new worker when one takes over
+  (never mid-compose — nothing typed is ever thrown away for an update);
+- nothing is saved unless the server stamped it **`x-relay-app: 1`**, so the Cloudflare Access login
+  page — a 200 full of HTML — can never be cached *as* the app;
+- **Status → Reading offline → "Forget saved messages"** throws the lot away and reloads. It should
+  never be needed. It exists because "should" is not a recovery plan.
+
+**Saying so honestly.** The worker marks anything it served from its own store, and the page turns
+that into an `offline — saved 12m ago` header note, a bar above the composer, and a disabled Send
+whose placeholder reads *Offline — can't send*. Pressing Enter anyway refuses and says why; the
+draft stays in the box.
+
+**There is deliberately no offline send queue.** Firefox on Android has no Background Sync, and the
+origin sits behind Access, where a deferred POST can come back as a login page. A message that looks
+sent and never arrives is worse than a clear refusal, so the refusal is what it does.
+
+Two traps worth knowing, both found by testing rather than reasoning:
+
+- **`cache: 'no-store'` bypasses the service worker in Firefox.** A request made with it never
+  reaches the worker. The thread read carried that flag, and offline reading therefore did nothing
+  at all on his main browser while looking perfectly correct from the outside. The server already
+  sends `cache-control: no-store` on every JSON route, so it was redundant as well as fatal. **Do
+  not add it back.**
+- **A hanging network is not a failing one.** A dead-but-open socket never errors; it just never
+  answers. Reads give up after `DATA_TIMEOUT_MS` and show what was saved, while the request carries
+  on in the background to refresh it. Genuine airplane mode does not wait for that at all —
+  `navigator.onLine === false` is trusted in the negative and answers from the cache at once.
+
+Verified in real Firefox by `tools/mobile-selftest.js`, which installs the app, **stops the server**
+and reloads. `context.setOffline()` alone is not enough: in Firefox it stops the page reaching the
+network but leaves the *worker* able to fetch, so every assertion would pass for the wrong reason.
+
+---
+
 ## Staying up to date
 
 The copy of the page this machine serves is meant to always be the latest merged code, with nobody
@@ -1099,7 +1160,9 @@ JSON
 | GET    | `/status`             | **new** — is anything listening: headline, liveness, timings, recent activity |
 | POST   | `/heartbeat`          | **new** — an agent reporting that it is alive (memory only, never logged) |
 | POST   | `/client-log`         | one diagnostic line from the browser into the container log      |
-| GET    | `/sw.js`              | **new** — the service worker; the only file besides the page      |
+| GET    | `/sw.js`              | the service worker: web push, and the offline cache               |
+| GET    | `/manifest.webmanifest` | **new** — what makes it installable on a phone                  |
+| GET    | `/icon-192.png`, `/icon-512.png`, `/icon-maskable-512.png`, `/apple-touch-icon.png` | **new** — home-screen icons, drawn by `icons.js`, never on disk |
 | GET    | `/push/config`        | **new** — VAPID key, quiet-hours state, armed devices; `deviceId` says whether *this* browser is armed |
 | POST   | `/push/config`        | **new** — set `timezone`, `quietFrom`, `quietTo`, `categories`, `brokenOverridesQuiet` |
 | POST   | `/push/subscribe`     | **new** — store a browser's push subscription (`400` if the keys will not encrypt) |
