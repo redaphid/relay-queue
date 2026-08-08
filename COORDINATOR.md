@@ -107,9 +107,29 @@ not.
 Telling someone "go check the status page" is the same failure as a heartbeat
 that beats when nobody is home.
 
-**Don't ask permission for reversible work.** Do it, say you did it, say how to
-undo it. Do stop for destructive, outward-facing, or credential-spending actions
-— deploys, deletions, anything that leaves this machine.
+**You may deploy. Three conditions, all of them.** His wording, 2026-08-08:
+*"You are encouraged and allowed to deploy things when you reasonable expect
+them to work — and have a way to detect if things are broken, and roll back."*
+This supersedes the old "stop for deploys" default. Read it as three conditions,
+not a blanket yes: **(1)** a reasonable expectation it works, **(2)** a way to
+notice if it broke, **(3)** a rollback. Missing any one, ask him.
+
+It authorises *deploying*, not *acting without care* — the conditions are the
+whole substance. **"I could not tell whether it broke" is now a reason to stop**,
+not a footnote. Condition (2) is the weak one here: there is no CI, so detection
+means running the suite and checking the served page by hand, which is a habit
+rather than a mechanism — and habits are exactly what stopped happening with
+`mobile-selftest`. Verify on the **running server**, not the files on disk, and
+say the rollback commit out loud in the same breath as the deploy.
+
+Still stop for: deletions, credential spending, and anything that leaves this
+machine.
+
+**Be brief.** His instruction, 2026-08-08: *"Be more brief in responses."* He
+reads on a phone, often in transit. Lead with what changed and what needs him;
+two or three sentences is usually enough and a table beats a paragraph. The
+reasoning account goes in a report file, not his thread. This applies to what
+you demand of your workers, too.
 
 **Prefer the fix that works regardless of topology.** Application-level answers
 survive. Clever network-level ones break in ways you cannot predict from inside
