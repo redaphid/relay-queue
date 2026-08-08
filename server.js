@@ -536,6 +536,22 @@ function findUiFile() {
   return null;
 }
 
+/*
+ * Does this look like a whole page, or one we caught mid-write?
+ *
+ * This matters far more than it looks. The UI is served straight from the
+ * working tree and cached by mtime, so reading a half-written file caches the
+ * truncated bytes AGAINST THAT MTIME — and then keeps serving them until the
+ * file happens to change again. One unlucky read becomes a persistent outage on
+ * the only page the user can reach us through, with no crash and nothing in the
+ * log to show for it. A truncated page loses its composer and its menu, which is
+ * exactly what that failure looked like from the phone.
+ */
+function looksComplete(buf) {
+  if (!buf || buf.length < 200) return false;
+  return /<\/html\s*>\s*$/i.test(buf.subarray(Math.max(0, buf.length - 256)).toString('utf8'));
+}
+
 function sendIndex(res) {
   const found = findUiFile();
   if (!found) {
@@ -543,7 +559,16 @@ function sendIndex(res) {
   }
   try {
     if (!indexCache || indexCache.file !== found.file || indexCache.mtimeMs !== found.mtimeMs) {
-      indexCache = { ...found, buf: fs.readFileSync(found.file) };
+      const buf = fs.readFileSync(found.file);
+      if (looksComplete(buf)) {
+        indexCache = { ...found, buf };
+      } else if (indexCache) {
+        // Keep serving the last good copy and try again on the next request,
+        // rather than caching a half-written page for everyone who asks.
+        console.log(`ui:  ${found.file} looked truncated — kept serving the previous copy`);
+      } else {
+        return fail(res, 503, `UI page looks truncated, likely mid-write: ${found.file}`);
+      }
     }
   } catch {
     return fail(res, 503, `UI page is unreadable: ${found.file}`);
@@ -874,7 +899,21 @@ function heartbeatRoute(res, body) {
   const agent = typeof body.agent === 'string' && body.agent.trim() ? body.agent.trim().slice(0, 100) : 'agent';
   const note = typeof body.note === 'string' ? body.note.slice(0, 200) : null;
   const at = nowIso();
-  HEARTBEATS.set(agent, { at, note });
+  /*
+   * `note` is free text, but two prefixes are now a convention:
+   *   tool: <name>    what the agent just ran — posted by the PostToolUse hook
+   *   holds: <path>   which repo/worktree it has open, so the roster doubles as
+   *                   a noticeboard and two agents do not grab the same tree
+   * Anything else in the note is still kept and shown verbatim.
+   */
+  const prev = HEARTBEATS.get(agent);
+  const meta = parseNote(note);
+  const tools = (prev && prev.tools) || [];
+  if (meta.tool) {
+    tools.push({ tool: meta.tool, at });
+    while (tools.length > TOOL_RING) tools.shift(); // bounded: a live view, not history
+  }
+  HEARTBEATS.set(agent, { at, note, tools, holds: meta.holds || (prev && prev.holds) || null });
   // Keep the newest few; a typo in an agent name should not grow forever.
   if (HEARTBEATS.size > MAX_AGENTS) {
     const oldest = [...HEARTBEATS.entries()].sort((a, b) => msOf(a[1].at) - msOf(b[1].at))[0];
