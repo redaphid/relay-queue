@@ -38,7 +38,95 @@
     padding-top: calc(10px + env(safe-area-inset-top));
     background: var(--panel); border-bottom: 1px solid var(--line);
   }
-  header b { font-size: 16px; font-weight: 650; letter-spacing: .01em; }
+  header b {
+    font-size: 16px; font-weight: 650; letter-spacing: .01em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #menu {
+    position: relative; flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px; margin-left: -6px; padding: 0;
+    color: var(--fg); background: transparent;
+    border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #menu svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
+  /* Something happened in a conversation you are not looking at. */
+  #menudot {
+    display: none; position: absolute; top: 6px; right: 6px;
+    width: 8px; height: 8px; border-radius: 50%; background: var(--rec);
+  }
+  #menudot.show { display: block; }
+
+  /* ---- the conversation drawer ---- */
+  #drawer { position: fixed; inset: 0; z-index: 20; }
+  #drawer[hidden] { display: none; }
+  #scrim { position: absolute; inset: 0; background: rgba(0,0,0,.45); opacity: 0; transition: opacity .18s ease; }
+  #drawer.open #scrim { opacity: 1; }
+  #panel {
+    position: absolute; inset: 0 auto 0 0;
+    width: min(86vw, 340px);
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 10px calc(10px + env(safe-area-inset-bottom));
+    background: var(--panel); border-right: 1px solid var(--line);
+    transform: translateX(-100%); transition: transform .18s ease;
+    overflow-y: auto; overscroll-behavior: contain;
+  }
+  #drawer.open #panel { transform: translateX(0); }
+  @media (prefers-reduced-motion: reduce) {
+    #scrim, #panel { transition: none; }
+  }
+  .prow { display: flex; align-items: center; gap: 8px; padding: 4px 4px 10px; }
+  .prow b { font-size: 15px; }
+  #drawerclose {
+    margin-left: auto; flex: 0 0 auto;
+    width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent;
+    border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #newtitle {
+    flex: 1 1 auto; min-width: 0;
+    font-family: inherit; font-size: 16px;
+    min-height: 44px; padding: 8px 12px;
+    color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 12px;
+  }
+  #newconv {
+    flex: 0 0 auto; width: 44px; height: 44px;
+    font-family: inherit; font-size: 24px; line-height: 1;
+    color: #fff; background: var(--user-bg);
+    border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #newconv:disabled { opacity: .5; }
+  #converr {
+    display: none; margin: 0 4px 8px; padding: 8px 10px; font-size: 14px;
+    color: var(--err-fg); background: var(--err-bg); border-radius: 10px;
+  }
+  #converr.show { display: block; }
+  #convlist { display: flex; flex-direction: column; gap: 4px; }
+  .conv {
+    display: block; width: 100%; min-height: 48px;
+    padding: 10px 12px; margin: 0;
+    font: inherit; text-align: left; color: var(--fg);
+    background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .conv.active { background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); }
+  .convtop { display: flex; align-items: baseline; gap: 6px; }
+  .convname {
+    flex: 1 1 auto; min-width: 0; font-weight: 650; font-size: 15px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .conv.active .convname { color: var(--user-bg); }
+  .convwhen { flex: 0 0 auto; font-size: 12px; color: var(--muted); }
+  .convdot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--rec); }
+  .convsnip {
+    margin-top: 2px; font-size: 13px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .convmeta { margin-top: 3px; font-size: 12px; color: var(--off); }
   #conn { margin-left: auto; font-size: 13px; color: var(--off); display: none; }
   #conn.show { display: inline; }
   /* Speaker toggle: mutes spoken replies independently of the microphone. */
@@ -164,7 +252,11 @@
 </head>
 <body>
   <header>
-    <b>relay</b><span id="conn">offline &mdash; retrying</span>
+    <button id="menu" type="button" aria-label="Conversations" title="Conversations" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+      <i id="menudot" aria-hidden="true"></i>
+    </button>
+    <b id="title">relay</b><span id="conn">offline &mdash; retrying</span>
     <button id="spk" type="button" aria-label="Spoken replies are off" title="Spoken replies are off" aria-pressed="false">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4 4 0 0 0-2.5-3.7v7.4a4 4 0 0 0 2.5-3.7zM13 3.2v2.1a6.8 6.8 0 0 1 0 13.4v2.1a8.8 8.8 0 0 0 0-17.6z"/></svg>
     </button>
@@ -194,6 +286,23 @@
     <button id="send" type="button">Send</button>
   </div>
 
+  <div id="drawer" hidden>
+    <div id="scrim"></div>
+    <nav id="panel" aria-label="Conversations">
+      <div class="prow">
+        <b>Conversations</b>
+        <button id="drawerclose" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="prow">
+        <input id="newtitle" type="text" placeholder="New conversation&hellip;" maxlength="200"
+          autocomplete="off" autocapitalize="sentences" enterkeyhint="done">
+        <button id="newconv" type="button" aria-label="Create conversation">+</button>
+      </div>
+      <p id="converr"></p>
+      <div id="convlist"></div>
+    </nav>
+  </div>
+
 <script>
 (function () {
   'use strict';
@@ -221,6 +330,19 @@
   var stream = null, streamOk = false;
   var freshAgent = [];       // agent entries merged since the last speech harvest
   var booted = false;        // true once the first read has landed; see harvestSpeech()
+
+  /*
+   * Conversations. The thread on screen is always exactly one of them; every
+   * read, every send and every spoken reply is scoped to `activeConv`. The id
+   * is remembered across reloads so the phone comes back where it was left.
+   * `convNew` records conversations that changed while you were looking at a
+   * different one — that is what lights the dot on the hamburger.
+   */
+  var DEFAULT_CONV = 'main';
+  var activeConv = DEFAULT_CONV;
+  var convs = [];
+  var convNew = Object.create(null);
+  var convTimer = null;
 
   var STATUS = { pending: 'pending', claimed: 'claimed', done: 'answered' };
 
@@ -341,7 +463,10 @@
 
   // All requests are root-relative so the page works unchanged behind a reverse proxy.
   function poll(fullRead) {
-    var url = (!fullRead && cursorMs) ? '/thread?since=' + cursorMs : '/thread?limit=' + WINDOW;
+    var scope = 'conversation=' + encodeURIComponent(activeConv);
+    var url = (!fullRead && cursorMs)
+      ? '/thread?' + scope + '&since=' + cursorMs
+      : '/thread?' + scope + '&limit=' + WINDOW;
     return fetch(url, { headers: { accept: 'application/json' }, cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -368,7 +493,9 @@
   function tick() {
     if (document.hidden) { schedule(); return; }
     polls++;
-    poll(polls % FULL_EVERY === 0).then(schedule);
+    var full = polls % FULL_EVERY === 0;
+    if (full) loadConvs(); // the repair pass refreshes the menu too
+    poll(full).then(schedule);
   }
   function kick() { clearTimeout(timer); timer = setTimeout(tick, 0); }
 
@@ -389,15 +516,247 @@
     stream.onmessage = function (e) {
       var j;
       try { j = JSON.parse(e.data); } catch (err) { return; }
+      fails = 0; setConn(true);
+      // A conversation was created, renamed, reassigned or archived.
+      if (j && j.conversation) { loadConvs(); return; }
+      /*
+       * One stream carries every conversation, so a change to one you are not
+       * looking at must NOT be merged into the thread on screen — it is only
+       * flagged, which is what makes switching an informed choice rather than a
+       * guess. Scoping this server-side would have needed a second connection.
+       */
+      if (j && typeof j.conversationId === 'string' && j.conversationId !== activeConv) {
+        convNew[j.conversationId] = true;
+        markMenu();
+        queueConvRefresh();
+        return;
+      }
       var arr = (j && Array.isArray(j.entries)) ? j.entries : [];
       if (merge(arr)) render();
       harvestSpeech();
-      fails = 0; setConn(true);
+      queueConvRefresh(); // keep the menu's snippets and counts honest
     };
     stream.onerror = function () {
       // EventSource retries by itself; fall straight back to fast polling meanwhile.
       if (streamOk) { streamOk = false; kick(); }
     };
+  }
+
+  // ------------------------------------------------------------------ conversations
+  /*
+   * One queue, many threads. A conversation is just a label every task carries;
+   * the server derives the list, the counts and a snippet of the latest message
+   * from the same task records the thread comes from, so there is no second
+   * store and nothing to keep in sync.
+   *
+   * The menu deliberately shows *why* you might want to switch — what was said
+   * last, how long ago, how much is waiting, and which agent is meant to answer
+   * — because a list of bare titles tells you nothing on a phone.
+   */
+  var menuBtn = document.getElementById('menu');
+  var menuDot = document.getElementById('menudot');
+  var titleEl = document.getElementById('title');
+  var drawer = document.getElementById('drawer');
+  var scrim = document.getElementById('scrim');
+  var drawerClose = document.getElementById('drawerclose');
+  var newTitle = document.getElementById('newtitle');
+  var newConvBtn = document.getElementById('newconv');
+  var convErr = document.getElementById('converr');
+  var convList = document.getElementById('convlist');
+
+  function markMenu() {
+    var any = false;
+    for (var k in convNew) { if (k !== activeConv) { any = true; break; } }
+    if (menuDot) menuDot.className = any ? 'show' : '';
+  }
+
+  /** Coalesce list refreshes: a burst of pushes should cost one request. */
+  function queueConvRefresh() {
+    if (convTimer) return;
+    convTimer = setTimeout(function () { convTimer = null; loadConvs(); }, 400);
+  }
+
+  function loadConvs() {
+    return fetch('/conversations', { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (j && typeof j.defaultId === 'string') DEFAULT_CONV = j.defaultId;
+        convs = (j && Array.isArray(j.conversations)) ? j.conversations : [];
+        // The remembered conversation may have been archived or never existed.
+        var here = false;
+        for (var i = 0; i < convs.length; i++) if (convs[i].id === activeConv) here = true;
+        if (!here && convs.length) return switchConv(DEFAULT_CONV, true);
+        renderConvs();
+        setTitle();
+        return true;
+      })
+      .catch(function () { return false; });
+  }
+
+  function convById(id) {
+    for (var i = 0; i < convs.length; i++) if (convs[i].id === id) return convs[i];
+    return null;
+  }
+
+  function setTitle() {
+    if (!titleEl) return;
+    var c = convById(activeConv);
+    titleEl.textContent = (c && c.title) || 'relay';
+  }
+
+  function renderConvs() {
+    if (!convList) return;
+    convList.textContent = '';
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < convs.length; i++) frag.appendChild(convNode(convs[i]));
+    convList.appendChild(frag);
+    markMenu();
+  }
+
+  function convNode(c) {
+    var row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'conv' + (c.id === activeConv ? ' active' : '');
+    if (c.id === activeConv) row.setAttribute('aria-current', 'true');
+
+    var top = document.createElement('div');
+    top.className = 'convtop';
+    var name = document.createElement('span');
+    name.className = 'convname';
+    name.textContent = c.title || c.id;      // textContent only, like every other string here
+    top.appendChild(name);
+    if (convNew[c.id] && c.id !== activeConv) {
+      var dot = document.createElement('span');
+      dot.className = 'convdot';
+      top.appendChild(dot);
+    }
+    var when = document.createElement('span');
+    when.className = 'convwhen';
+    when.textContent = rel(c.lastTs || c.createdAt);
+    top.appendChild(when);
+
+    var snip = document.createElement('div');
+    snip.className = 'convsnip';
+    var counts = c.counts || {};
+    snip.textContent = c.lastText
+      ? (c.lastRole === 'agent' ? 'Reply: ' : '') + c.lastText
+      : 'No messages yet';
+
+    row.appendChild(top);
+    row.appendChild(snip);
+
+    var bits = [];
+    if (counts.pending) bits.push(counts.pending + (counts.pending === 1 ? ' waiting' : ' waiting'));
+    if (counts.claimed) bits.push(counts.claimed + ' in progress');
+    if (c.agent) bits.push(c.agent);
+    if (bits.length) {
+      var meta = document.createElement('div');
+      meta.className = 'convmeta';
+      meta.textContent = bits.join(' · ');
+      row.appendChild(meta);
+    }
+
+    row.addEventListener('click', function () { switchConv(c.id); });
+    return row;
+  }
+
+  /*
+   * Switching wipes the thread and re-reads from scratch. `booted` is dropped
+   * for the duration for the same reason it exists at boot: the incoming full
+   * read is history, and reading a conversation's backlog aloud on every switch
+   * would be intolerable. Dictation deliberately keeps running — switching must
+   * not strand a live microphone — and anything already captured still posts to
+   * the conversation it was spoken into.
+   */
+  function switchConv(id, quiet) {
+    if (!quiet && id === activeConv) { closeDrawer(); return Promise.resolve(true); }
+    activeConv = id;
+    pref('relay.conv', id);
+    delete convNew[id];
+    entries.clear(); sigs.clear();
+    cursorMs = 0; everRendered = false; fails = 0;
+    booted = false;
+    speakQueue = [];
+    render();
+    setTitle();
+    renderConvs();
+    closeDrawer();
+    clearTimeout(timer);
+    return poll(true).then(function () { booted = true; }).then(function () {
+      schedule();
+      scrollBottom();
+      return true;
+    });
+  }
+
+  /*
+   * `drawerOpen` is the truth, not the class name. The class is applied a tick
+   * late so the slide-in transition has a frame to start from — and a create-
+   * then-switch can close the drawer inside that tick, which would otherwise
+   * leave the deferred `open` to reopen a drawer nobody asked for.
+   */
+  var drawerOpen = false;
+
+  function openDrawer() {
+    if (!drawer || drawerOpen) return;
+    drawerOpen = true;
+    drawer.hidden = false;
+    setTimeout(function () { if (drawerOpen) drawer.className = 'open'; }, 0);
+    if (menuBtn) menuBtn.setAttribute('aria-expanded', 'true');
+    loadConvs();
+  }
+
+  function closeDrawer() {
+    if (!drawer || !drawerOpen) return;
+    drawerOpen = false;
+    drawer.className = '';
+    if (menuBtn) menuBtn.setAttribute('aria-expanded', 'false');
+    if (convErr) { convErr.className = ''; convErr.textContent = ''; }
+    setTimeout(function () { if (!drawerOpen) drawer.hidden = true; }, 200);
+  }
+
+  function createConv() {
+    var title = newTitle.value.trim();
+    if (!title) { newTitle.focus(); return; }
+    newConvBtn.disabled = true;
+    convErr.className = ''; convErr.textContent = '';
+    fetch('/conversations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: title })
+    }).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+        return j;
+      });
+    }).then(function (j) {
+      newTitle.value = '';
+      return loadConvs().then(function () { return switchConv(j.id); });
+    }).catch(function (err) {
+      convErr.textContent = 'Could not create — ' + ((err && err.message) || 'network error') + '.';
+      convErr.className = 'show';
+    }).then(function () { newConvBtn.disabled = false; });
+  }
+
+  function initConvs() {
+    var saved = pref('relay.conv');
+    if (saved) activeConv = saved;
+    if (menuBtn) menuBtn.addEventListener('click', function () {
+      if (drawerOpen) closeDrawer(); else openDrawer();
+    });
+    if (scrim) scrim.addEventListener('click', closeDrawer);
+    if (drawerClose) drawerClose.addEventListener('click', closeDrawer);
+    if (newConvBtn) newConvBtn.addEventListener('click', createConv);
+    if (newTitle) newTitle.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); createConv(); }
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeDrawer();
+    });
+    loadConvs();
   }
 
   function autosize() {
@@ -406,12 +765,17 @@
     input.style.height = Math.min(input.scrollHeight + 2, cap) + 'px';
   }
 
-  /** The one write path for a new message. Rejects with a readable Error. */
-  function postTask(text, from) {
+  /*
+   * The one write path for a new message. `conversationId` is passed explicitly
+   * rather than read from `activeConv` here, because a dictated utterance must
+   * land in the conversation that was open when it was *spoken* — not wherever
+   * the user has switched to while it was being transcribed.
+   */
+  function postTask(text, from, conversationId) {
     return fetch('/tasks', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: text, from: from })
+      body: JSON.stringify({ text: text, from: from, conversationId: conversationId || activeConv })
     }).then(function (r) {
       return r.json().catch(function () { return null; }).then(function (j) {
         if (!r.ok) throw new Error((j && j.error) || ('send failed (HTTP ' + r.status + ')'));
@@ -823,7 +1187,9 @@
       convQueue.shift(); // the engine is falling behind; the oldest is the least useful
       logClient('conv-queue-overflow', { depth: convQueue.length });
     }
-    convQueue.push(pcm);
+    // The conversation is captured HERE, when the words were spoken — switching
+    // threads while this is being transcribed must not misroute it.
+    convQueue.push({ pcm: pcm, conv: activeConv });
     convPump();
     idleStatus();
   }
@@ -1137,9 +1503,9 @@
   function convPump() {
     if (convBusy || !convQueue.length || !convOn) return;
     convBusy = true;
-    var pcm = convQueue.shift();
+    var job = convQueue.shift();
     idleStatus();
-    fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: pcm })
+    fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: job.pcm })
       .then(function (r) {
         return r.json().catch(function () { return null; }).then(function (j) {
           if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
@@ -1155,8 +1521,8 @@
           convNote(why === 'echo' ? 'Ignored my own voice.' : 'Didn’t catch that.');
           return;
         }
-        return postTask(text, 'voice-conversation')
-          .then(function () { return poll(false); })
+        return postTask(text, 'voice-conversation', job.conv)
+          .then(function () { return job.conv === activeConv ? poll(false) : loadConvs(); })
           .catch(function (err) {
             // Never lose words: they land in the composer, exactly as a failed
             // typed message does, and can be sent by hand.
@@ -1234,6 +1600,10 @@
       if (spoken[e.id]) continue;
       spoken[e.id] = true;
       if (!booted || !speakOn) continue;
+      // Only the conversation on screen is read aloud. Hearing an answer to
+      // something in a thread you are not looking at is disorienting, and the
+      // menu already flags that it arrived.
+      if (e.conversationId && e.conversationId !== activeConv) continue;
       var text = speakable(e.text);
       if (text) speakQueue.push(text);
     }
@@ -1469,6 +1839,7 @@
 
   // The queue UI boots first and does not depend on any of the audio code above.
   setInterval(refreshTimes, 30000);
+  initConvs();
   render();
   autosize();
   focusComposer();

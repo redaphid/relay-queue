@@ -37,17 +37,37 @@ function inlineScript() {
 function makeEl(tag) {
   const el = {
     tagName: String(tag || 'div').toUpperCase(),
-    className: '', textContent: '', title: '', value: '', placeholder: '',
+    className: '', title: '', value: '', placeholder: '',
     disabled: false, isContentEditable: false, focused: false,
     style: {}, attrs: {}, children: [], handlers: {},
     scrollHeight: 200, scrollTop: 0, clientHeight: 200,
     setAttribute(k, v) { this.attrs[k] = v; },
     getAttribute(k) { return this.attrs[k]; },
-    appendChild(c) { this.children.push(c); return c; },
+    // A real DOM *moves* a fragment's children in rather than nesting it, and
+    // the page relies on that: `list.children` must be the rendered rows.
+    appendChild(c) {
+      if (c && c.tagName === 'FRAGMENT') {
+        for (const kid of c.children) this.children.push(kid);
+        c.children = [];
+        return c;
+      }
+      this.children.push(c);
+      return c;
+    },
     querySelectorAll() { return []; },
     addEventListener(ev, fn) { (this.handlers[ev] = this.handlers[ev] || []).push(fn); },
     dispatch(ev, arg) { (this.handlers[ev] || []).forEach((f) => f.call(this, arg || {})); },
   };
+  // In a real DOM, assigning textContent REPLACES every child. `list.textContent
+  // = ''` is exactly how both renderers here clear themselves, so a plain
+  // property would let rows silently accumulate and hide re-render bugs.
+  let text = '';
+  Object.defineProperty(el, 'textContent', {
+    enumerable: true,
+    configurable: true,
+    get() { return text; },
+    set(v) { text = v === null || v === undefined ? '' : String(v); el.children = []; },
+  });
   return el;
 }
 
@@ -103,14 +123,24 @@ function workingMic(store) {
 }
 
 function makeEnv(opts) {
-  const ids = ['thread', 'list', 'empty', 'input', 'send', 'err', 'conn', 'mic', 'voice', 'vtext', 'convo', 'spk', 'vstop'];
+  const ids = ['thread', 'list', 'empty', 'input', 'send', 'err', 'conn', 'mic', 'voice', 'vtext',
+    'convo', 'spk', 'vstop', 'menu', 'menudot', 'title', 'drawer', 'scrim', 'drawerclose',
+    'newtitle', 'newconv', 'converr', 'convlist'];
   const els = {};
-  ids.forEach((id) => { els[id] = makeEl(id === 'input' ? 'textarea' : 'div'); });
+  ids.forEach((id) => { els[id] = makeEl(id === 'input' || id === 'newtitle' ? 'textarea' : 'div'); });
+  els.drawer.hidden = true;
   const meter = makeEl('i');
   const posted = [];
+  const conv = (id, title, extra) => Object.assign({
+    id, title, agent: null, createdAt: '2026-01-01T00:00:00.000Z', archived: false, archivedAt: null,
+    counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
+    messages: 0, lastTs: '2026-01-01T00:00:00.000Z', lastRole: 'user', lastText: '',
+  }, extra || {});
   const store = {
     ctxs: [], nodes: [], tracks: [], started: [], es: null,
     sttText: 'check the widget report', ttsFail: false, micError: null,
+    convs: [conv('main', 'Main', { lastText: 'the first thread' }),
+      conv('c2', 'Widget audit', { lastText: 'how many widgets', counts: { pending: 2, claimed: 0, done: 0, unrelayed: 0 } })],
   };
   const audio = makeAudio(store);
 
@@ -177,6 +207,14 @@ function makeEnv(opts) {
         });
       }
       if (url === '/tasks') return jsonRes({ id: 'new-task' }, 201);
+      if (url === '/conversations') {
+        if (init && init.method === 'POST') {
+          const made = conv('c-new', (body && body.title) || 'untitled', { lastText: '' });
+          store.convs.push(made);
+          return jsonRes(made, 201);
+        }
+        return jsonRes({ count: store.convs.length, defaultId: 'main', conversations: store.convs });
+      }
       return jsonRes({ entries: [], count: 0 });
     },
     isSecureContext: !!opts.secure,
@@ -239,8 +277,23 @@ function makeEnv(opts) {
   const sent = () => posted.filter((p) => p.url === '/tasks');
   const stt = () => posted.filter((p) => p.url === '/stt');
   const tts = () => posted.filter((p) => p.url === '/tts');
+  const reads = () => posted.filter((p) => String(p.url).indexOf('/thread') === 0);
+  /** Push an entry belonging to a specific conversation, as the server would. */
+  function convReply(conversationId, text, id) {
+    const ts = new Date().toISOString();
+    store.es.onmessage({
+      data: JSON.stringify({
+        conversationId,
+        entries: [{ id: id || 'e-' + Math.random(), role: 'agent', text, ts, rev: ts, status: 'done', conversationId }],
+      }),
+    });
+  }
 
-  return { sandbox, els, meter, posted, doc, store, feed, sayOneThing, agentReply, endPlayback, track, sent, stt, tts };
+  return {
+    sandbox, els, meter, posted, doc, store,
+    feed, sayOneThing, agentReply, endPlayback, convReply,
+    track, sent, stt, tts, reads,
+  };
 }
 
 // ---------------------------------------------------------------- assertions
@@ -252,6 +305,14 @@ function check(name, cond, detail) {
 }
 const settle = () => new Promise((r) => setTimeout(r, 25));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** All the text a stub element and its descendants would render. */
+function textOf(el) {
+  if (!el) return '';
+  let out = el.textContent || '';
+  for (const kid of el.children || []) out += ' ' + textOf(kid);
+  return out;
+}
 
 /*
  * A secure page with a working mic, speaker and live stream. The indirection
@@ -609,6 +670,128 @@ async function main() {
     check('the button is usable again', env.els.convo.disabled === false);
     check('permission denial is explained', /permission denied/i.test(env.els.err.textContent), env.els.err.textContent);
     check('one-shot dictation is not left locked out', env.els.mic.disabled === false);
+  }
+
+  // ================================================================ conversations
+  console.log('\nconversations — the menu');
+  {
+    const env = liveEnv();
+    await settle();
+    check('every thread read is scoped to a conversation',
+      env.reads().length > 0 && env.reads().every((p) => /conversation=main/.test(p.url)),
+      env.reads().map((p) => p.url).join(' '));
+    check('the header names the conversation you are in', env.els.title.textContent === 'Main',
+      env.els.title.textContent);
+    check('the menu lists both conversations', env.els.convlist.children.length === 2,
+      `${env.els.convlist.children.length} rows`);
+
+    check('a row shows its title', textOf(env.els.convlist.children[0]).indexOf('Main') > -1,
+      textOf(env.els.convlist.children[0]));
+    check('a row shows a hint of the last message',
+      textOf(env.els.convlist.children[0]).indexOf('the first thread') > -1);
+    check('the active one is marked', /active/.test(env.els.convlist.children[0].className),
+      env.els.convlist.children[0].className);
+    check('the other one is not', !/active/.test(env.els.convlist.children[1].className));
+    check('a conversation with waiting work says so',
+      textOf(env.els.convlist.children[1]).indexOf('2 waiting') > -1,
+      textOf(env.els.convlist.children[1]));
+
+    env.els.menu.dispatch('click');
+    await settle();
+    check('the drawer opens', env.els.drawer.hidden === false && env.els.drawer.className === 'open',
+      `hidden=${env.els.drawer.hidden} class=${env.els.drawer.className}`);
+    env.els.scrim.dispatch('click');
+    check('tapping the scrim closes it', env.els.drawer.className === '');
+  }
+
+  console.log('\nconversations — switching');
+  {
+    const env = liveEnv();
+    await settle();
+    const before = env.reads().length;
+    env.els.convlist.children[1].dispatch('click'); // switch to "Widget audit"
+    await settle();
+    check('the new conversation is read', env.reads().length > before
+      && /conversation=c2/.test(env.reads()[env.reads().length - 1].url),
+      env.reads()[env.reads().length - 1].url);
+    check('the header follows', env.els.title.textContent === 'Widget audit', env.els.title.textContent);
+    check('the drawer closes on switch', env.els.drawer.className === '');
+    check('the active marker moved', /active/.test(env.els.convlist.children[1].className)
+      && !/active/.test(env.els.convlist.children[0].className));
+
+    env.els.input.value = 'a typed message';
+    env.els.send.dispatch('click');
+    await settle();
+    check('a sent message goes to the conversation you are in',
+      env.sent()[0] && env.sent()[0].body.conversationId === 'c2', JSON.stringify(env.sent()[0] && env.sent()[0].body));
+  }
+
+  console.log('\nconversations — activity elsewhere is flagged, not merged');
+  {
+    const env = liveEnv();
+    env.els.spk.dispatch('click'); // speaker on, so we can prove it stays quiet
+    await settle();
+    const ttsBefore = env.tts().length;
+    env.convReply('c2', 'an answer in the other conversation', 'other-1');
+    await settle();
+    check('it is not merged into the thread on screen',
+      JSON.stringify(env.els.list.children).indexOf('an answer in the other') === -1);
+    check('the hamburger shows there is something to see', env.els.menudot.className === 'show',
+      env.els.menudot.className);
+    check('a reply in another conversation is NOT read aloud', env.tts().length === ttsBefore,
+      `${env.tts().length - ttsBefore} spoken`);
+
+    env.agentReply('an answer in the one I am looking at', 'mine-1');
+    await settle();
+    check('but a reply in the active conversation still is', env.tts().length === ttsBefore + 1);
+  }
+
+  console.log('\nconversations — creating one');
+  {
+    const env = liveEnv();
+    await settle();
+    env.els.menu.dispatch('click');
+    env.els.newtitle.value = 'Deploy notes';
+    env.els.newconv.dispatch('click');
+    await settle();
+    await settle();
+    const made = env.posted.filter((p) => p.url === '/conversations' && p.body && p.body.title);
+    check('it is created on the server', made.length === 1 && made[0].body.title === 'Deploy notes',
+      JSON.stringify(made.map((p) => p.body)));
+    check('and switched into', env.els.title.textContent === 'Deploy notes', env.els.title.textContent);
+    check('the input is cleared', env.els.newtitle.value === '', env.els.newtitle.value);
+    check('the drawer closed', env.els.drawer.className === '');
+  }
+
+  console.log('\nconversations — a transcript cannot be misrouted by switching');
+  {
+    const env = liveEnv();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const realFetch = env.sandbox.fetch;
+    env.sandbox.fetch = (url, init) => (url === '/stt' ? gate.then(() => realFetch(url, init)) : realFetch(url, init));
+    await startConv(env);
+    check('the conversation starts in Main', env.els.title.textContent === 'Main');
+
+    env.sayOneThing();                       // spoken while "Main" is open
+    await settle();
+    env.els.convlist.children[1].dispatch('click'); // ...user switches away mid-transcription
+    await settle();
+    check('the switch happened', env.els.title.textContent === 'Widget audit', env.els.title.textContent);
+    check('the live microphone was not stranded by the switch', env.track().stopped === false);
+
+    release();
+    await settle();
+    await settle();
+    check('*** the utterance posts to the conversation it was SPOKEN into ***',
+      env.sent().length === 1 && env.sent()[0].body.conversationId === 'main',
+      JSON.stringify(env.sent().map((p) => p.body.conversationId)));
+
+    env.sayOneThing();                       // said after the switch
+    await settle();
+    check('and a later utterance posts to the new one',
+      env.sent().length === 2 && env.sent()[1].body.conversationId === 'c2',
+      JSON.stringify(env.sent().map((p) => p.body.conversationId)));
   }
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
