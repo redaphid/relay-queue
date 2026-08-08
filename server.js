@@ -62,6 +62,45 @@ const STARTED_AT = Date.now();
 const STATUSES = ['pending', 'claimed', 'done'];
 const DEFAULT_ROLE = 'user'; // records written before roles existed are the human's messages
 
+/*
+ * AGENT MESSAGES AND THE INTERNAL CHANNEL.
+ *
+ * `POST /tasks` sets `role` itself and always to "user", so an agent had no way
+ * to say anything unprompted: it had to post a task *as the human* and then
+ * answer itself, putting both halves in his thread. 36 of the 312 messages on
+ * the night of 2026-08-07 were that workaround, and 19 of them were agents
+ * talking to each other, routed through his phone because there was nowhere
+ * else to put it.
+ *
+ * `POST /messages` is that missing route. A message is an ordinary task record
+ * in the one append-only log — no second store, no second write path — with
+ * `role: "agent"` and, critically, `status: "done"`: it is a statement, not a
+ * request, so it must never sit `pending` where it would trip the poster's own
+ * watcher and read as work waiting.
+ *
+ * `visibility: "internal"` is the agent-to-agent channel. The rule for it is
+ * exclusion by default, everywhere: an internal message is filtered out of
+ * every pre-existing read path — the thread, the task list, the conversation
+ * summaries, the counts, the status feed, the live stream — and is visible only
+ * to a caller that asks for it by channel. That direction matters. If a new
+ * filter is ever missed, the failure is that agents cannot see their own
+ * traffic, not that it lands on the user's phone.
+ */
+const DEFAULT_CHANNEL = 'agents';
+const MAX_CHANNEL = 100;
+const MAX_AUTHOR = 200;
+/*
+ * An internal message still carries a conversationId, because every projection
+ * in this file reads one. It is `#<channel>`, and the `#` is what makes it safe:
+ * real ids are either the literal "main" or a generated base36 pair, so a
+ * `#`-prefixed id can never name a real conversation, and `POST /tasks` refuses
+ * it for the same reason it refuses any unknown conversation. Belt and braces —
+ * the visibility filters are the actual guarantee.
+ */
+const INTERNAL_PREFIX = '#';
+const isInternal = (t) => t.visibility === 'internal';
+const channelOf = (t) => (typeof t.channel === 'string' && t.channel ? t.channel : DEFAULT_CHANNEL);
+
 // ---------------------------------------------------------------- event log
 /** @type {Map<string, object>} id -> task (insertion order == creation order) */
 const tasks = new Map();
@@ -222,6 +261,17 @@ const truthyParam = (v) => v !== null && v !== 'false' && v !== '0';
 
 /** Applies status / unread / since / limit query filters. Throws {code,message}. */
 function applyFilters(list, q) {
+  // Internal agent-to-agent traffic is invisible to every query that does not
+  // name a channel. This is first, so no later filter can accidentally let one
+  // through, and it is why every call written before channels existed returns
+  // exactly what it always did.
+  const channel = q.get('channel');
+  if (channel !== null && channel !== '') {
+    list = list.filter((t) => isInternal(t) && channelOf(t) === channel);
+  } else if (!truthyParam(q.get('internal'))) {
+    list = list.filter((t) => !isInternal(t));
+  }
+
   // `conversation` is the canonical name; `conversationId` is accepted too, since
   // that is what the record field is called and both are natural to reach for.
   const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
@@ -261,6 +311,7 @@ function applyFilters(list, q) {
 const counts = () => {
   const c = { pending: 0, claimed: 0, done: 0, unrelayed: 0 };
   for (const t of tasks.values()) {
+    if (isInternal(t)) continue; // agent chatter is not queue depth
     c[t.status]++;
     if (!t.relayed) c.unrelayed++;
   }
@@ -287,7 +338,7 @@ function entriesOf(t) {
   const createdMs = msOf(t.ts);
   const revMs = Math.max(createdMs, msOf(t.claimedAt), msOf(t.resultTs));
   const conversationId = convIdOf(t);
-  const out = [{
+  const first = {
     id: t.id,
     role: t.role === 'agent' ? 'agent' : 'user',
     text: asText(t.instruction),
@@ -295,7 +346,11 @@ function entriesOf(t) {
     status: t.status,
     rev: new Date(revMs).toISOString(),
     conversationId,
-  }];
+  };
+  // Only ever added, never removed: an entry without an author is exactly the
+  // shape every client was already written against.
+  if (t.author) first.author = t.author;
+  const out = [first];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
     out.push({
@@ -318,6 +373,7 @@ const convIdOf = (t) => (typeof t.conversationId === 'string' && t.conversationI
 function threadEntries(conversationId) {
   const out = [];
   for (const t of tasks.values()) {
+    if (isInternal(t)) continue; // never, under any filter: this is the human's view
     if (conversationId && convIdOf(t) !== conversationId) continue;
     out.push(...entriesOf(t));
   }
@@ -377,6 +433,7 @@ function conversationSummaries() {
     });
   }
   for (const t of tasks.values()) {
+    if (isInternal(t)) continue; // no counts, no preview text, and no stray "#agents" row
     const id = convIdOf(t);
     let a = acc.get(id);
     if (!a) {
@@ -392,8 +449,9 @@ function conversationSummaries() {
     if (!t.relayed) a.counts.unrelayed++;
     a.messages++;
     // Both halves of a turn count as activity — a conversation where the agent
-    // is answering is busy, not idle.
-    for (const at of [t.claimedAt, t.resultTs]) {
+    // is answering is busy, not idle. An agent posting a message of its own is
+    // acting too: it can only have come from inside a turn.
+    for (const at of [t.claimedAt, t.resultTs, t.role === 'agent' ? t.ts : null]) {
       if (at && (!a.lastActedAt || msOf(at) > msOf(a.lastActedAt))) a.lastActedAt = at;
     }
     if (t.status !== 'done' && (!a.oldestWaitingTs || msOf(t.ts) < msOf(a.oldestWaitingTs))) {
@@ -496,6 +554,9 @@ function broadcast(taskId) {
   if (streams.size === 0) return;
   const task = tasks.get(taskId);
   if (!task) return;
+  // The stream feeds open pages, so internal traffic must never enter it. An
+  // agent reads its channel by polling; it does not get a push.
+  if (isInternal(task)) return;
   push({ now: nowIso(), conversationId: convIdOf(task), entries: entriesOf(task) });
 }
 
@@ -935,6 +996,7 @@ function derivedStatus() {
   let lastResultAt = null;
 
   for (const t of tasks.values()) {
+    if (isInternal(t)) continue; // the status page is his too
     const conversationId = convIdOf(t);
     const snippet = (v) => asText(v).replace(/\s+/g, ' ').trim().slice(0, 120);
 
@@ -1066,6 +1128,7 @@ function stuckClaims() {
   const now = Date.now();
   const out = [];
   for (const t of tasks.values()) {
+    if (isInternal(t)) continue;
     if (t.status !== 'claimed') continue;
     if (t.result !== null && t.result !== undefined) continue;
     const since = msOf(t.claimedAt || t.ts);
@@ -1618,6 +1681,120 @@ function leaseOf(task) {
   return { expired: leftMs <= 0, leftSec: Math.max(0, Math.round(leftMs / 1000)) };
 }
 
+/*
+ * POST /messages — an agent speaking, rather than answering.
+ *
+ * Purely additive: `POST /tasks` is untouched, still sets `role: "user"`, and
+ * every existing client behaves exactly as before. The record is an ordinary
+ * task in the same event log, so the thread projection, the replay and the live
+ * stream all handle it with no special case.
+ *
+ * It is born `done`. That is the whole point: a statement is not a request, so
+ * it must not sit `pending`, must not appear in another agent's work poll, and
+ * must not count as a backlog on the status page. `relayed: true` for the same
+ * reason — there is nothing outstanding to deliver.
+ */
+const CHANNEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function readString(raw, label, max) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw !== 'string') return new Error(`${label} must be a string`);
+  const v = raw.trim();
+  if (!v) return null;
+  if (v.length > max) return new Error(`${label} too long: ${v.length} chars, max ${max}`);
+  return v;
+}
+
+function createMessage(res, body) {
+  const text = typeof body.text === 'string' ? body.text : body.instruction;
+  if (typeof text !== 'string' || !text.trim()) {
+    return fail(res, 400, 'text (alias: instruction) is required and must be a non-empty string');
+  }
+  if (text.length > MAX_TEXT) {
+    return fail(res, 400, `message too long: ${text.length} chars, max ${MAX_TEXT}`);
+  }
+
+  // Who is speaking. `agent` matches the field a conversation already uses for
+  // this; `author` and `by` are accepted because both are natural to reach for.
+  const authorRaw = body.agent !== undefined ? body.agent
+    : (body.author !== undefined ? body.author : body.by);
+  const author = readString(authorRaw, 'agent', MAX_AUTHOR);
+  if (author instanceof Error) return fail(res, 400, author.message);
+  const to = readString(body.to, 'to', MAX_AUTHOR);
+  if (to instanceof Error) return fail(res, 400, to.message);
+
+  const channelRaw = readString(body.channel, 'channel', MAX_CHANNEL);
+  if (channelRaw instanceof Error) return fail(res, 400, channelRaw.message);
+  const internal = body.internal === true || channelRaw !== null;
+
+  const ts = nowIso();
+  const task = {
+    id: newId(),
+    role: 'agent', // server-set, as on /tasks — the difference is the route, not the client
+    instruction: text,
+    from: typeof body.from === 'string' && body.from ? body.from : 'agent',
+    author,
+    ts,
+    status: 'done',
+    claimedBy: null,
+    claimedAt: null,
+    result: null,
+    resultTs: null,
+    relayed: true,
+    relayedAt: ts,
+  };
+  if (to) task.to = to;
+
+  if (internal) {
+    const channel = channelRaw === null ? DEFAULT_CHANNEL : channelRaw;
+    if (!CHANNEL_RE.test(channel)) {
+      return fail(res, 400, `invalid channel "${channel}": letters, digits, dot, dash and underscore only`);
+    }
+    task.visibility = 'internal';
+    task.channel = channel;
+    task.conversationId = INTERNAL_PREFIX + channel;
+  } else {
+    const conversationId = typeof body.conversationId === 'string' && body.conversationId
+      ? body.conversationId
+      : (typeof body.conversation === 'string' && body.conversation ? body.conversation : DEFAULT_CONV);
+    if (!conversations.has(conversationId)) {
+      return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
+    }
+    task.visibility = 'conversation';
+    task.conversationId = conversationId;
+  }
+
+  appendEvent({ t: 'create', task });
+  send(res, 201, task);
+}
+
+/** The channel's own view of a message: no queue machinery, because there is none. */
+const messageView = (t) => ({
+  id: t.id,
+  channel: channelOf(t),
+  author: t.author || null,
+  to: t.to || null,
+  text: asText(t.instruction),
+  ts: t.ts,
+});
+
+function channelSummaries() {
+  const acc = new Map();
+  for (const t of tasks.values()) {
+    if (!isInternal(t)) continue;
+    const ch = channelOf(t);
+    let a = acc.get(ch);
+    if (!a) { a = { channel: ch, messages: 0, lastTs: null, lastAuthor: null, lastText: '' }; acc.set(ch, a); }
+    a.messages++;
+    if (!a.lastTs || msOf(t.ts) >= msOf(a.lastTs)) {
+      a.lastTs = t.ts;
+      a.lastAuthor = t.author || null;
+      a.lastText = asText(t.instruction).replace(/\s+/g, ' ').trim().slice(0, 140);
+    }
+  }
+  return [...acc.values()].sort((a, b) => msOf(b.lastTs) - msOf(a.lastTs));
+}
+
 function claimTask(res, id, body) {
   const task = tasks.get(id);
   if (!task) return fail(res, 404, `no task with id "${id}"`);
@@ -1894,10 +2071,44 @@ async function route(req, res) {
     return ttsRoute(req, res);
   }
 
+  // /messages — an agent speaking for itself, and the agent-to-agent channel
+  if (seg.length === 1 && seg[0] === 'messages') {
+    if (m === 'POST') return createMessage(res, await readBody(req));
+    if (m === 'GET') {
+      // Reading is by channel; there is no "all messages" view, because the
+      // human's thread is already that and this is deliberately not in it.
+      const channel = q.get('channel') || DEFAULT_CHANNEL;
+      let list = [...tasks.values()].filter((t) => isInternal(t) && channelOf(t) === channel);
+      const since = q.get('since');
+      if (since !== null) {
+        const ms = parseSince(since);
+        if (ms === null) throw httpErr(400, `invalid since "${since}" (want ISO 8601 or epoch ms)`);
+        list = list.filter((t) => Date.parse(t.ts) > ms);
+      }
+      const limit = q.get('limit');
+      if (limit !== null) {
+        const n = Number(limit);
+        if (!Number.isInteger(n) || n < 0) throw httpErr(400, `invalid limit "${limit}"`);
+        list = n === 0 ? [] : list.slice(-n); // most recent N — a channel reads from the end
+      }
+      return send(res, 200, { count: list.length, channel, messages: list.map(messageView) });
+    }
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /channels — which internal channels exist, so one is discoverable at all
+  if (seg.length === 1 && seg[0] === 'channels') {
+    if (!need('GET')) return;
+    const list = channelSummaries();
+    return send(res, 200, { count: list.length, defaultChannel: DEFAULT_CHANNEL, channels: list });
+  }
+
   // /results
   if (seg.length === 1 && seg[0] === 'results') {
     if (!need('GET')) return;
-    const done = [...tasks.values()].filter((t) => t.status === 'done');
+    // Answers, not merely finished records. An agent's own message is `done` the
+    // moment it is posted and has no result, so it does not belong here.
+    const done = [...tasks.values()].filter((t) => t.status === 'done' && t.result !== null && t.result !== undefined);
     const list = applyFilters(done, q);
     return send(res, 200, { count: list.length, tasks: list });
   }

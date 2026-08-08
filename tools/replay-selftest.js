@@ -389,10 +389,10 @@ async function stuckChecks() {
 }
 
 /*
- * The protocol guarantees added after the 2026-08-07 retrospective, each one
- * written against the failure that produced it rather than against the feature
- * that fixes it. Own server, own scratch dir, so queue state is exactly known
- * and nothing here can be explained away by leftovers from another phase.
+ * The three protocol guarantees added after the 2026-08-07 retrospective, each
+ * one written against the failure that produced it rather than against the
+ * feature that fixes it. Own server, own scratch dir, so queue state is exactly
+ * known and nothing here can be explained away by leftovers from another phase.
  */
 async function protocolChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-protocol-'));
@@ -498,6 +498,77 @@ async function protocolChecks() {
     const done = await p_(`/tasks/${held.body.id}/claim`, { by: 'someone-else' });
     check('an ANSWERED task is never reclaimable, however old', done.status === 409, `HTTP ${done.status}`);
 
+    /*
+     * §5 / 4. 36 of the night's 312 messages were an agent talking with no way to
+     * be attributed to itself, and 19 of those were agents talking to each other
+     * through the human's phone.
+     */
+    console.log('\nmessages — an agent can speak as itself, and out of his earshot');
+    const before = await g('/thread?conversation=main');
+    const spoke = await p_('/messages', { text: 'the sync finished', agent: 'vega' });
+    check('an agent can post a message unprompted', spoke.status === 201, `HTTP ${spoke.status}`);
+    check('...attributed to itself, not to the human', spoke.body.role === 'agent', spoke.body.role);
+    check('...naming which agent said it', spoke.body.author === 'vega', spoke.body.author);
+    check('*** it does NOT sit pending, so it cannot trip an agent\'s own watcher ***',
+      spoke.body.status === 'done', spoke.body.status);
+    check('...and it is not counted as unread work', spoke.body.relayed === true, `relayed=${spoke.body.relayed}`);
+    check('...it needs no self-answer, so only ONE entry reaches the thread',
+      (await g('/thread?conversation=main')).count === before.count + 1,
+      `${before.count} -> ${(await g('/thread?conversation=main')).count}`);
+    const said = (await g('/thread?conversation=main')).entries.slice(-1)[0];
+    check('...and it renders as the agent speaking', said.role === 'agent' && said.text === 'the sync finished',
+      JSON.stringify(said));
+    check('...with no phantom pending message under it',
+      !(await g('/tasks?status=pending')).tasks.some((t) => t.instruction === 'the sync finished'));
+    check('an agent message still cannot be marked relayed into an empty answer',
+      (await p_(`/tasks/${spoke.body.id}/result`, { result: 'x' })).status === 409,
+      'a spoken message is already done');
+
+    const t0 = await g('/thread?conversation=main');
+    const h0 = await g('/health');
+    const intern = await p_('/messages', { text: 'taking the mindmeld repo, hands off', agent: 'vega', to: 'zora', channel: 'agents' });
+    check('an agent can post to an internal channel', intern.status === 201, `HTTP ${intern.status}`);
+    check('...addressed to another agent', intern.body.to === 'zora', intern.body.to);
+    // Two independent mechanisms keep this out of his thread, and each is worth
+    // pinning: the visibility filters, and a conversation id that no real
+    // conversation can ever have. Removing either one alone is caught below.
+    check('...filed under an id that cannot collide with a real conversation',
+      intern.body.conversationId === '#agents', intern.body.conversationId);
+    check('*** internal traffic NEVER reaches the human\'s thread ***',
+      (await g('/thread?conversation=main')).count === t0.count,
+      `thread grew ${t0.count} -> ${(await g('/thread?conversation=main')).count}`);
+    check('...nor the unfiltered thread', !(await g('/thread')).entries.some((e) => /hands off/.test(e.text)));
+    check('...nor an existing agent\'s pending poll',
+      !(await g('/tasks?status=pending')).tasks.some((t) => /hands off/.test(t.instruction || '')));
+    check('...nor the default /tasks listing at all',
+      !(await g('/tasks')).tasks.some((t) => /hands off/.test(t.instruction || '')));
+    check('...nor /results', !(await g('/results')).tasks.some((t) => /hands off/.test(t.instruction || '')));
+    const h1 = await g('/health');
+    check('...nor the queue counts the status page reads',
+      h1.counts.done === h0.counts.done && h1.counts.pending === h0.counts.pending,
+      `${JSON.stringify(h0.counts)} -> ${JSON.stringify(h1.counts)}`);
+    const convAfter = (await g('/conversations')).conversations;
+    check('...nor his conversation list, as a message or as a stray conversation',
+      !convAfter.some((c) => /hands off/.test(c.lastText || '')) && !convAfter.some((c) => c.id === '#agents'),
+      JSON.stringify(convAfter.map((c) => c.id)));
+    check('...nor the status page activity feed',
+      !JSON.stringify(await g('/status?engines=0')).includes('hands off'));
+
+    const feed = await g('/messages?channel=agents');
+    check('but the agent it was meant for CAN read it', feed.count === 1 && feed.messages[0].text === 'taking the mindmeld repo, hands off',
+      JSON.stringify(feed).slice(0, 160));
+    check('...with the sender and addressee intact',
+      feed.messages[0].author === 'vega' && feed.messages[0].to === 'zora', JSON.stringify(feed.messages[0]));
+    check('...and channels are separate from each other',
+      (await g('/messages?channel=other')).count === 0);
+    check('...and discoverable', (await g('/channels')).channels.some((c) => c.channel === 'agents'));
+    check('an internal channel cannot be used as a conversation by an ordinary post',
+      (await p_('/tasks', { text: 'sneaking in', conversationId: '#agents' })).status === 400);
+    check('a message to a conversation that does not exist is refused',
+      (await p_('/messages', { text: 'x', conversationId: 'nope' })).status === 400);
+    check('an empty message is refused', (await p_('/messages', { text: '   ' })).status === 400);
+    check('a bad channel name is refused', (await p_('/messages', { text: 'x', channel: 'has spaces' })).status === 400);
+
     console.log('\nit all survives a restart, because it is only ever the event log');
     await stop(proc);
     const proc2 = spawn(process.execPath, [SERVER], {
@@ -508,6 +579,12 @@ async function protocolChecks() {
     proc2.stderr.on('data', () => {});
     try {
       await waitForBoot(proc2, base);
+      check('the agent\'s own message replayed as the agent\'s',
+        (await g('/thread?conversation=main')).entries.some((e) => e.role === 'agent' && e.text === 'the sync finished'));
+      check('*** internal traffic is STILL invisible after a replay ***',
+        !(await g('/thread')).entries.some((e) => /hands off/.test(e.text))
+        && !(await g('/conversations')).conversations.some((c) => c.id === '#agents'));
+      check('...and still readable on its channel', (await g('/messages?channel=agents')).count === 1);
       check('the takeover survived', (await g(`/tasks/${held.body.id}`)).takenOverFrom === 'romeo');
       check('the relayed guard still holds after a replay',
         (await p_(`/tasks/${(await p_('/tasks', { text: 'fresh' })).body.id}/relayed`, {})).status === 409);
