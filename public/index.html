@@ -12,14 +12,14 @@
     --bg:#f4f6f8; --fg:#14161a; --muted:#667085; --line:#dfe3e8; --panel:#ffffff;
     --user-bg:#2f6fed; --user-fg:#ffffff;
     --agent-bg:#ffffff; --agent-fg:#14161a;
-    --err-fg:#8a2018; --err-bg:#fdeceb; --off:#c2410c;
+    --err-fg:#8a2018; --err-bg:#fdeceb; --off:#c2410c; --rec:#c0271d;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg:#0e1116; --fg:#e6e8ec; --muted:#98a2b3; --line:#242a35; --panel:#141922;
       --user-bg:#2f6fed; --user-fg:#ffffff;
       --agent-bg:#1a202b; --agent-fg:#e6e8ec;
-      --err-fg:#ffb4ab; --err-bg:#3a1714; --off:#fdba74;
+      --err-fg:#ffb4ab; --err-bg:#3a1714; --off:#fdba74; --rec:#e5484d;
     }
   }
   * { box-sizing: border-box; }
@@ -63,11 +63,38 @@
   }
   #err.show { display: block; }
 
+  /* Voice dictation: status line + live input level, shown only while listening. */
+  #voice {
+    display: none; flex: 0 0 auto; align-items: center; gap: 10px;
+    margin: 0; padding: 8px 14px; font-size: 14px; color: var(--muted);
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  #voice.show { display: flex; }
+  #meter {
+    flex: 0 0 auto; width: 72px; height: 6px; border-radius: 3px;
+    background: var(--line); overflow: hidden;
+  }
+  #meter i { display: block; height: 100%; width: 0%; background: var(--user-bg); border-radius: 3px; }
+  #voice.hearing { color: var(--fg); }
+  #voice.hearing #meter i { background: var(--rec); }
+
   #composer {
     flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end;
     padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom));
     background: var(--panel); border-top: 1px solid var(--line);
   }
+  #mic {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 48px; height: 48px; padding: 0;
+    color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 15px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #mic svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
+  #mic:disabled { opacity: .5; }
+  #mic.on { color: #fff; background: var(--rec); border-color: var(--rec); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .62; } }
+  @media (prefers-reduced-motion: reduce) { #mic.on { animation: none; } }
   #input {
     flex: 1 1 auto; min-width: 0;
     font-family: inherit; font-size: 16px; line-height: 1.4;
@@ -96,9 +123,14 @@
 
   <p id="err"></p>
 
+  <div id="voice" aria-live="polite"><span id="meter" aria-hidden="true"><i></i></span><span id="vtext"></span></div>
+
   <div id="composer">
+    <button id="mic" type="button" aria-label="Dictate a message" title="Dictate a message">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
+    </button>
     <textarea id="input" rows="1" placeholder="Message&hellip;" maxlength="8000"
-      autocapitalize="sentences" autocomplete="off" spellcheck="true" enterkeyhint="enter"></textarea>
+      autocapitalize="sentences" autocomplete="off" spellcheck="true" enterkeyhint="send"></textarea>
     <button id="send" type="button">Send</button>
   </div>
 
@@ -106,7 +138,8 @@
 (function () {
   'use strict';
 
-  var POLL_MS = 3000;        // normal poll interval
+  var POLL_MS = 3000;        // poll interval when the live stream is not up
+  var STREAM_POLL_MS = 30000;// slow repair poll while the live stream is carrying updates
   var MAX_BACKOFF = 20000;   // slowest retry when the server is unreachable
   var MAX_CHARS = 8000;      // must match the server-side cap
   var FULL_EVERY = 20;       // every Nth poll re-reads the whole thread as a repair pass
@@ -125,6 +158,7 @@
   var cursorMs = 0;          // newest rev seen; drives incremental polling
   var fails = 0, polls = 0, timer = null, errTimer = null;
   var everRendered = false, sending = false;
+  var stream = null, streamOk = false;
 
   var STATUS = { pending: 'pending', claimed: 'claimed', done: 'answered' };
 
@@ -237,13 +271,44 @@
 
   function schedule() {
     clearTimeout(timer);
-    var delay = fails ? Math.min(POLL_MS * Math.pow(2, Math.min(fails, 4)), MAX_BACKOFF) : POLL_MS;
+    // Backing off on failure is what keeps a dead server from being hammered; the
+    // live stream only ever makes the *healthy* interval longer, never the retry.
+    var delay = fails ? Math.min(POLL_MS * Math.pow(2, Math.min(fails, 4)), MAX_BACKOFF)
+      : (streamOk ? STREAM_POLL_MS : POLL_MS);
     timer = setTimeout(tick, delay);
   }
   function tick() {
     if (document.hidden) { schedule(); return; }
     polls++;
     poll(polls % FULL_EVERY === 0).then(schedule);
+  }
+  function kick() { clearTimeout(timer); timer = setTimeout(tick, 0); }
+
+  /*
+   * Live updates. The server pushes every change over SSE, so another device's
+   * message lands here immediately. Polling above stays exactly as it was and
+   * takes over whenever the stream is not running — EventSource reconnects on
+   * its own, and if it never succeeds the page is simply the poller it used to be.
+   */
+  function openStream() {
+    if (!window.EventSource || stream) return;
+    try { stream = new EventSource('/events'); } catch (e) { return; }
+    stream.onopen = function () {
+      streamOk = true;
+      // Catch up on anything that changed while the stream was down.
+      poll(false).then(schedule);
+    };
+    stream.onmessage = function (e) {
+      var j;
+      try { j = JSON.parse(e.data); } catch (err) { return; }
+      var arr = (j && Array.isArray(j.entries)) ? j.entries : [];
+      if (merge(arr)) render();
+      fails = 0; setConn(true);
+    };
+    stream.onerror = function () {
+      // EventSource retries by itself; fall straight back to fast polling meanwhile.
+      if (streamOk) { streamOk = false; kick(); }
+    };
   }
 
   function autosize() {
@@ -252,19 +317,21 @@
     input.style.height = Math.min(input.scrollHeight + 2, cap) + 'px';
   }
 
-  function doSend() {
-    if (sending) return;
+  // `from` marks the origin of the message: 'web' when typed, 'voice' when dictated.
+  function doSend(from) {
+    if (sending) return Promise.resolve(false);
     var text = input.value;
-    if (!text.trim()) { input.focus(); return; }
+    if (!text.trim()) { input.focus(); return Promise.resolve(false); }
     if (text.length > MAX_CHARS) {
       showErr('Too long — ' + text.length + ' of ' + MAX_CHARS + ' characters.');
-      return;
+      return Promise.resolve(false);
     }
+    var ok = true;
     sending = true; sendBtn.disabled = true; clearErr();
-    fetch('/tasks', {
+    return fetch('/tasks', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: text, from: 'web' })
+      body: JSON.stringify({ text: text, from: from === 'voice' ? 'voice' : 'web' })
     }).then(function (r) {
       return r.json().catch(function () { return null; }).then(function (j) {
         if (!r.ok) throw new Error((j && j.error) || ('send failed (HTTP ' + r.status + ')'));
@@ -278,26 +345,289 @@
       scrollBottom();
     }).catch(function (err) {
       // Draft is left untouched so nothing typed is ever lost.
+      ok = false;
       showErr('Not sent — ' + ((err && err.message) || 'network error') + '. Your text is still here.');
     }).then(function () {
       sending = false; sendBtn.disabled = false;
+      return ok;
     });
   }
 
-  sendBtn.addEventListener('click', doSend);
+  sendBtn.addEventListener('click', function () { doSend('web'); });
   input.addEventListener('input', autosize);
   input.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSend(); }
+    if (e.key !== 'Enter' || e.isComposing) return;
+    // Enter sends; Shift+Enter is a newline. Ctrl/Cmd+Enter still sends too.
+    if (e.shiftKey) return;
+    e.preventDefault();
+    doSend('web');
   });
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) { clearTimeout(timer); fails = 0; tick(); }
   });
   window.addEventListener('resize', function () { if (nearBottom()) scrollBottom(); });
 
+  // ------------------------------------------------------------------ voice dictation
+  /*
+   * Tap the mic, talk, stop talking — the message sends itself.
+   *
+   * Mic audio is captured as raw PCM, watched frame by frame for loudness, and
+   * ended automatically after SILENCE_MS of quiet. The speech is then downsampled
+   * to 16 kHz mono int16 and POSTed to /stt, which relays it to a whisper engine
+   * on this machine and returns the text. The transcript goes into the composer
+   * and is sent through the normal send path, so a failed send leaves the words
+   * in the box exactly like a typed message. Nothing leaves the machine, and the
+   * request is root-relative like every other one — so it works unchanged behind
+   * an HTTPS reverse proxy.
+   *
+   * The thresholds below are the knobs worth turning if endpointing feels wrong:
+   * raise SILENCE_MS if it cuts you off mid-thought, raise NOISE_MULT/RMS_FLOOR
+   * if a noisy room keeps it from ever hearing silence.
+   */
+  var V = {
+    RATE: 16000,         // sample rate the engine wants
+    FRAME: 512,          // samples per analysis frame (~32 ms at 16 kHz)
+    CALIB_MS: 400,       // ambient noise is measured for this long before listening
+    NOISE_MULT: 2.2,     // speech must be this many times louder than the room
+    RMS_FLOOR: 0.010,    // ...and at least this loud outright
+    START_MS: 120,       // sustained loud audio before it counts as speech
+    SILENCE_MS: 1200,    // trailing silence that ends the utterance
+    NO_SPEECH_MS: 8000,  // give up if nothing is ever said
+    MAX_MS: 60000,       // hard cap on one dictation
+    MIN_SPEECH_MS: 250,  // shorter than this is a cough, not a message
+    PRE_ROLL_MS: 250,    // audio kept from just before speech was detected
+    TAIL_MS: 300         // audio kept after speech stopped
+  };
+
+  // Runs on the audio thread; batches 128-sample quanta into FRAME-sized frames.
+  var WORKLET = 'class P extends AudioWorkletProcessor{' +
+    'constructor(o){super();this.n=o.processorOptions.n;this.b=new Float32Array(this.n);this.i=0;}' +
+    'process(ins){var c=ins[0]&&ins[0][0];if(!c)return true;' +
+    'for(var k=0;k<c.length;k++){this.b[this.i++]=c[k];' +
+    'if(this.i===this.n){this.port.postMessage(this.b);this.b=new Float32Array(this.n);this.i=0;}}' +
+    'return true;}}' +
+    'registerProcessor("pcm",P);';
+
+  var micBtn = document.getElementById('mic');
+  var voiceBar = document.getElementById('voice');
+  var vtext = document.getElementById('vtext');
+  var meter = document.querySelector('#meter i');
+  var vox = null; // the live dictation session, or null
+
+  function vStatus(msg, hearing) {
+    vtext.textContent = msg;
+    voiceBar.className = 'show' + (hearing ? ' hearing' : '');
+  }
+  function vHide() { voiceBar.className = ''; vtext.textContent = ''; meter.style.width = '0%'; }
+
+  function resample(x, inRate, outRate) {
+    if (inRate === outRate) return x;
+    // Box average rather than plain picking: downsampling without it aliases badly.
+    var ratio = inRate / outRate;
+    var out = new Float32Array(Math.floor(x.length / ratio));
+    for (var i = 0; i < out.length; i++) {
+      var a = Math.floor(i * ratio);
+      var b = Math.min(Math.max(Math.floor((i + 1) * ratio), a + 1), x.length);
+      var sum = 0;
+      for (var j = a; j < b; j++) sum += x[j];
+      out[i] = sum / (b - a);
+    }
+    return out;
+  }
+
+  function toInt16(f) {
+    var dv = new DataView(new ArrayBuffer(f.length * 2));
+    for (var i = 0; i < f.length; i++) {
+      var v = f[i] < -1 ? -1 : f[i] > 1 ? 1 : f[i];
+      dv.setInt16(i * 2, Math.round(v < 0 ? v * 32768 : v * 32767), true); // little-endian
+    }
+    return dv.buffer;
+  }
+
+  /** Concatenates the captured frames, keeping only samples in [from, to). */
+  function flatten(blocks, from, to) {
+    var out = new Float32Array(Math.max(0, to - from));
+    var w = 0, base = 0;
+    for (var i = 0; i < blocks.length && w < out.length; i++) {
+      var b = blocks[i];
+      var s = Math.max(from, base), e = Math.min(to, base + b.length);
+      for (var j = s; j < e; j++) out[w++] = b[j - base];
+      base += b.length;
+    }
+    return out;
+  }
+
+  function teardown(s) {
+    [s.node, s.source, s.sink].forEach(function (n) { try { if (n) n.disconnect(); } catch (e) {} });
+    try { s.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}   // releases the mic light
+    try { s.ctx.close(); } catch (e) {}
+  }
+
+  function stopVoice(reason) {
+    var s = vox;
+    if (!s) return;
+    vox = null;
+    micBtn.className = '';
+    teardown(s);
+    if (reason === 'cancel') { vHide(); return; }
+    if (reason === 'nospeech') { vHide(); showErr('Nothing heard — tap the mic and speak.'); return; }
+    transcribeAndSend(s);
+  }
+
+  function transcribeAndSend(s) {
+    var from = Math.max(0, Math.floor(((s.speechStartMs - V.PRE_ROLL_MS) / 1000) * s.rate));
+    var to = Math.min(s.length, Math.ceil(((s.lastLoudMs + V.TAIL_MS) / 1000) * s.rate));
+    if (s.lastLoudMs - s.speechStartMs < V.MIN_SPEECH_MS) {
+      vHide(); showErr('That was too short to make out — try again.'); return;
+    }
+    var pcm = toInt16(resample(flatten(s.blocks, from, to), s.rate, V.RATE));
+    vStatus('Transcribing…', false);
+    micBtn.disabled = true;
+    fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: pcm })
+      .then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+          if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+          return j;
+        });
+      })
+      .then(function (j) {
+        var text = ((j && j.text) || '').trim();
+        if (!text) { vHide(); showErr('No words in that — try again.'); return; }
+        // Appended, never overwriting: a half-typed draft survives a dictation.
+        var draft = input.value.replace(/\s+$/, '');
+        input.value = draft ? draft + ' ' + text : text;
+        autosize();
+        vHide();
+        return doSend('voice').then(function (ok) { if (ok) scrollBottom(); });
+      })
+      .catch(function (err) {
+        vHide();
+        showErr('Dictation failed — ' + ((err && err.message) || 'network error') + '.');
+      })
+      .then(function () { micBtn.disabled = false; });
+  }
+
+  function onFrame(block) {
+    var s = vox;
+    if (!s) return;
+    s.blocks.push(block);
+    s.length += block.length;
+
+    var sum = 0;
+    for (var i = 0; i < block.length; i++) sum += block[i] * block[i];
+    var rms = Math.sqrt(sum / block.length);
+    s.elapsedMs += (block.length / s.rate) * 1000;
+
+    if (s.phase === 'calib') {
+      s.noiseSum += rms; s.noiseN++;
+      if (s.elapsedMs >= V.CALIB_MS) {
+        s.threshold = Math.max(V.RMS_FLOOR, (s.noiseSum / s.noiseN) * V.NOISE_MULT);
+        s.phase = 'wait';
+        vStatus('Listening — go ahead.', false);
+      }
+      return;
+    }
+
+    meter.style.width = Math.min(100, Math.round((rms / (s.threshold * 3)) * 100)) + '%';
+
+    if (rms > s.threshold) {
+      s.lastLoudMs = s.elapsedMs;
+      s.loudRunMs += (block.length / s.rate) * 1000;
+      if (s.phase === 'wait' && s.loudRunMs >= V.START_MS) {
+        s.phase = 'speak';
+        s.speechStartMs = s.elapsedMs - s.loudRunMs;
+        vStatus('Listening…', true);
+      }
+    } else {
+      s.loudRunMs = 0;
+      if (s.phase === 'speak' && s.elapsedMs - s.lastLoudMs >= V.SILENCE_MS) return stopVoice('done');
+      if (s.phase === 'wait' && s.elapsedMs >= V.NO_SPEECH_MS) return stopVoice('nospeech');
+    }
+    if (s.elapsedMs >= V.MAX_MS) stopVoice(s.phase === 'speak' ? 'done' : 'nospeech');
+  }
+
+  // A muted sink keeps the graph pulled without anything being audible.
+  function attach(s) {
+    var ctx = s.ctx;
+    s.sink = ctx.createGain();
+    s.sink.gain.value = 0;
+    s.sink.connect(ctx.destination);
+
+    function legacy() {
+      if (!ctx.createScriptProcessor) return Promise.reject(new Error('no audio capture API'));
+      var node = ctx.createScriptProcessor(4096, 1, 1);
+      node.onaudioprocess = function (e) {
+        var inp = e.inputBuffer.getChannelData(0);
+        for (var off = 0; off < inp.length; off += V.FRAME) {
+          onFrame(new Float32Array(inp.subarray(off, Math.min(off + V.FRAME, inp.length))));
+        }
+      };
+      s.source.connect(node); node.connect(s.sink); s.node = node;
+      return Promise.resolve();
+    }
+
+    if (!ctx.audioWorklet || !window.Blob || !window.URL || !URL.createObjectURL) return legacy();
+    // Built from a Blob so the page stays a single file; CSP allows blob: scripts.
+    var url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+    return ctx.audioWorklet.addModule(url).then(function () {
+      URL.revokeObjectURL(url);
+      var node = new AudioWorkletNode(ctx, 'pcm', { numberOfInputs: 1, outputChannelCount: [1], processorOptions: { n: V.FRAME } });
+      node.port.onmessage = function (e) { onFrame(e.data); };
+      s.source.connect(node); node.connect(s.sink); s.node = node;
+    }).catch(function () { URL.revokeObjectURL(url); return legacy(); });
+  }
+
+  function startVoice() {
+    if (vox) { stopVoice(vox.phase === 'speak' ? 'done' : 'cancel'); return; } // tap again to stop
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!window.isSecureContext) {
+      showErr('The microphone needs a secure page — open this over https, or as http://localhost:3901 on this computer.');
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
+      showErr('This browser will not give the page a microphone.');
+      return;
+    }
+    micBtn.disabled = true;
+    clearErr();
+    vStatus('Starting…', false);
+    navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (stream) {
+      var ctx;
+      // Ask for 16 kHz outright — the browser resamples better than we can. If it
+      // refuses, we get its native rate and resample in resample() instead.
+      try { ctx = new AC({ sampleRate: V.RATE }); } catch (e) { ctx = new AC(); }
+      var s = {
+        stream: stream, ctx: ctx, rate: ctx.sampleRate, source: null, node: null, sink: null,
+        blocks: [], length: 0, elapsedMs: 0, loudRunMs: 0, lastLoudMs: 0, speechStartMs: 0,
+        noiseSum: 0, noiseN: 0, threshold: V.RMS_FLOOR, phase: 'calib'
+      };
+      s.source = ctx.createMediaStreamSource(stream);
+      return attach(s).then(function () {
+        vox = s;
+        micBtn.className = 'on';
+        micBtn.disabled = false;
+        vStatus('Getting the room level…', false);
+        if (ctx.state === 'suspended') ctx.resume();
+      }).catch(function (err) { teardown(s); throw err; });
+    }).catch(function (err) {
+      micBtn.disabled = false;
+      vHide();
+      var name = err && err.name;
+      showErr(name === 'NotAllowedError' ? 'Microphone permission denied — allow it in your browser settings, then tap the mic again.'
+        : name === 'NotFoundError' ? 'No microphone found on this device.'
+        : 'Microphone unavailable — ' + ((err && err.message) || name || 'unknown error') + '.');
+    });
+  }
+
+  micBtn.addEventListener('click', startVoice);
+
   setInterval(refreshTimes, 30000);
   render();
   autosize();
   poll(true).then(schedule);
+  openStream();
 })();
 </script>
 </body>

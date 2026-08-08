@@ -6,18 +6,27 @@ services:
     working_dir: /app
     command: ["node", "server.js"]
     environment:
-      # Inside the container we must bind all interfaces so the published port
-      # can reach us. The service stays local-only because the host side of the
-      # mapping below is pinned to 127.0.0.1.
       HOST: "0.0.0.0"
       PORT: "3901"
+      # POST /stt relays audio to the wyoming-whisper engine, which listens on the
+      # *host* (published 10300). From in here loopback is the container itself, so
+      # go out through Docker Desktop's host alias.
+      STT_HOST: "host.docker.internal"
+      STT_PORT: "10300"
     ports:
-      - "127.0.0.1:3901:3901"
+      # All interfaces: reachable from LAN and Tailscale. The page has no auth
+      # yet — anyone on those networks can read/post. Revisit when the
+      # Access-gated relay.hypnodroid.com exposure lands.
+      - "3901:3901"
     volumes:
-      # Source is mounted read-only; only data/ is writable.
-      - D:/projects/relay-queue/server.js:/app/server.js:ro
-      - D:/projects/relay-queue/package.json:/app/package.json:ro
-      # Durable store, shared with the bare-node fallback.
+      # The whole working tree, read-only. Mounting the *directory* rather than
+      # individual files is load-bearing: git replaces a file by writing a new one
+      # and renaming it over the old, and a single-file bind mount stays pinned to
+      # the original inode — the container would never see a pulled change.
+      # server.js and public/index.html are both served straight from here, so a
+      # git pull is the whole deploy. (This retired the data/ui/index.html copy.)
+      - D:/projects/relay-queue:/app:ro
+      # ...except data/, the writable durable store, shared with the bare-node fallback.
       - D:/projects/relay-queue/data:/app/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3901/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -25,3 +34,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  # Pulls origin/main into the checkout every minute so the page this machine
+  # serves is always the latest merged code. server.js watches its own source and
+  # exits when it changes, so a pull deploys itself. Needs no Docker socket.
+  # Until the repo is published this idles quietly — there is no origin to fetch.
+  relay-queue-sync:
+    image: alpine/git:latest
+    container_name: relay-queue-sync
+    restart: unless-stopped
+    working_dir: /repo
+    entrypoint: ["/bin/sh"]
+    command: ["/repo/tools/sync-repo.sh"]
+    environment:
+      SYNC_INTERVAL: "60"
+      SYNC_BRANCH: "main"
+    volumes:
+      # Writable: this one is here to update the working tree.
+      - D:/projects/relay-queue:/repo
