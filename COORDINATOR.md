@@ -52,12 +52,60 @@ a container.
 **Serialize agents that share files.** Two agents editing one file will lose
 each other's work. Route follow-ups to the agent already in that code.
 
+**Before merging any UI change, run `node tools/mobile-selftest.js`.** It drives
+a real browser at 390×844 and asserts *geometry* — on screen, not clipped, not
+covered — because the stub suite asserts elements *exist*, and 173 of them
+passed while the user's chat input and menu were off the bottom of his phone.
+It needs playwright, which this zero-dependency project deliberately does not
+carry: `npm i --no-save playwright && npx playwright install firefox`. That
+install step is why it will quietly stop being run — a test that looks like
+coverage but never executes is how the last breakage reached the user. Run it
+anyway.
+
+**Always work in a worktree.** Never edit a repo's main checkout directly —
+branch into a git worktree, work there, and merge. This is the user's standing
+instruction and it is what makes parallel agents safe: a worktree cannot lose
+another agent's uncommitted work, and it cannot leave the running checkout in a
+half-edited state. Note that on this machine the relay-queue checkout *is* the
+deployment (the server watches its own source and restarts on change), so
+editing it in place deploys unreviewed work-in-progress to the user's live page.
+
+**Declare what you hold.** Put `holds: <path>` (or `holds: nothing`) in your
+heartbeat `note`, so `/status` doubles as a noticeboard of who is in which repo.
+Advisory, not a lock — it will not stop a collision, but it lets a cold-started
+router see ownership instead of having to remember it.
+
+**Answer the human before you build anything.** Check your thread at the *start*
+of every turn, not when you finish what you are doing. A coordinator once spent
+six minutes editing files — taking turns the whole time, visibly alive — while a
+request sat unanswered in its tab. It was not blocked; it simply never looked.
+Infrastructure work always feels more urgent than it is. His queue first.
+
+**Arm a watcher on your own conversation, immediately, before other setup.**
+You only see messages while you are mid-turn; once you go idle waiting on input,
+a message from his phone sits there indefinitely and reads as being ignored.
+A background poll that echoes pending ids wakes you the same way a tool result
+does — that is the whole difference between responsive and dead-looking.
+Filter it by your `conversationId`, and never heartbeat from it.
+
 **Own one conversation.** Never claim, answer, or mark relayed a task outside
 it. The queue accepts one result per task, so a cross-conversation claim does
 not double-answer — it silently steals another agent's message.
 
-**Demand short reports from workers.** Detail belongs in files and commits, not
-in your context or the user's thread.
+**Be brief. Demand brevity from workers.** The user's standing instruction
+(2026-08-08): *"I need the agents to be more brief and to the point."* Lead with
+what changed and what needs them. No process narrative, no reasoning account, no
+recap of what you were asked. Detail belongs in files and commits, not in your
+context or the user's thread.
+
+**Speak only what matters.** `POST http://127.0.0.1:12020/speak` `{"text":"..."}`
+— unauthenticated loopback, plays on the Echo Studio, needs no session. It is
+the only channel that reaches the user with no page open, which is exactly why
+it must not be spent on noise: it interrupts a room, not a screen. Speak
+completions, blockers, failures, and anything needing their hands. Never speak
+queue status, progress, or acknowledgements — the user asked for this
+specifically after I over-used it. Write for the ear: expand paths phonetically,
+one or two sentences (~40 words is ~13 s of playback, already long out loud).
 
 **Write down what you learned, especially the traps.** Your context ends when
 you do. What you wrote down is what survives. If you find a note that turned out
