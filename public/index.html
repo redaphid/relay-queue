@@ -37,6 +37,7 @@
     --user-bg: var(--accent); --user-fg:#ffffff;
     --agent-bg:#ffffff; --agent-fg:#14161a;
     --err-fg:#8a2018; --err-bg:#fdeceb; --off:#c2410c; --rec:#c0271d;
+    --warn-bg:#a5540a; --warn-fg:#ffffff; --alarm-bg:#a81c14; --alarm-fg:#ffffff;
     /* Lifecycle pills: dark text on a light fill in both themes, so contrast
        never depends on which one is active. */
     --pend-bg:#fde68a; --pend-fg:#5c3d00;
@@ -52,6 +53,7 @@
       --user-bg: var(--accent); --user-fg:#08111f;
       --agent-bg:#1a202b; --agent-fg:#e6e8ec;
       --err-fg:#ffb4ab; --err-bg:#3a1714; --off:#fdba74; --rec:#e5484d;
+      --warn-bg:#6f3f04; --warn-fg:#ffe6c4; --alarm-bg:#8c1d18; --alarm-fg:#ffdad6;
       --pend-bg:#facc15; --pend-fg:#3a2800;
       --claim-bg:#c4b5fd; --claim-fg:#2a1157;
       --done-bg:#6ee7b7; --done-fg:#04301f;
@@ -240,6 +242,10 @@
   }
   .scard h2 { margin: 0 0 8px; font-size: 13px; font-weight: 650; color: var(--muted);
     text-transform: uppercase; letter-spacing: .04em; }
+  /* Abandoned claims: the one card that must not blend in with the reassuring ones. */
+  .scard.bad { border-color: var(--alarm-bg); border-left-width: 4px; }
+  .scard.bad h2 { color: var(--alarm-bg); }
+  @media (prefers-color-scheme: dark) { .scard.bad h2 { color: var(--alarm-fg); } }
   .srow { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 15px; }
   .srow .k { flex: 1 1 auto; min-width: 0; color: var(--muted); }
   .srow .v { flex: 0 0 auto; text-align: right; }
@@ -306,6 +312,21 @@
   .msg.user.st-claimed { box-shadow: inset -4px 0 0 var(--claim-bg); }
   .msg.user.st-done    { box-shadow: inset -4px 0 0 var(--done-bg); }
   .msg.agent { margin-right: auto; background: var(--agent-bg); color: var(--agent-fg); border: 1px solid var(--line); border-bottom-left-radius: 6px; }
+
+  /*
+   * THE DEADMAN BANNER. Sits directly under the header and above the thread,
+   * because the thread is exactly what looks normal while this is true. It is
+   * the one element on the page allowed to shout, and it is not dismissible —
+   * it goes away when an agent acts, and only then.
+   */
+  #watch {
+    flex: 0 0 auto; margin: 0; padding: 11px 14px;
+    font-size: 15px; font-weight: 640; line-height: 1.35;
+    color: var(--alarm-fg); background: var(--alarm-bg);
+  }
+  #watch[hidden] { display: none; }
+  #watch.warn { color: var(--warn-fg); background: var(--warn-bg); }
+  #watch .wsub { display: block; margin-top: 3px; font-size: 13px; font-weight: 450; opacity: .88; }
 
   #err {
     display: none; flex: 0 0 auto;
@@ -410,6 +431,8 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4 4 0 0 0-2.5-3.7v7.4a4 4 0 0 0 2.5-3.7zM13 3.2v2.1a6.8 6.8 0 0 1 0 13.4v2.1a8.8 8.8 0 0 0 0-17.6z"/></svg>
     </button>
   </header>
+
+  <div id="watch" hidden role="status" aria-live="polite"></div>
 
   <main id="thread">
     <div id="list"></div>
@@ -691,6 +714,81 @@
    * takes over whenever the stream is not running — EventSource reconnects on
    * its own, and if it never succeeds the page is simply the poller it used to be.
    */
+  // ------------------------------------------------------------------ deadman banner
+  /*
+   * The server decides whether work is stranded — it is the only part of this
+   * system that is always running. This half just makes sure the verdict cannot
+   * be missed.
+   *
+   * It states what is actually wrong ("2 messages waiting, and nothing has
+   * happened for 7 min") rather than showing a warning colour, because a colour
+   * asks the user to go and work out the difference themselves, and that manual
+   * diff is the exact failure this exists to fix: twice, the information already
+   * existed and nothing put it in front of them.
+   *
+   * There is no dismiss button on purpose. It clears when an agent acts.
+   */
+  var watchBar = document.getElementById('watch');
+  var watchBad = false; // currently showing trouble — gates the one-shot announcement
+  var WATCH_POLL_MS = 20000;
+  var watchPolls = 0;
+
+  function renderWatch(w) {
+    if (!watchBar || !w) return;
+    if (!w.bad) {
+      // Recovered — or never broken. Idle must look exactly like this.
+      watchBar.hidden = true;
+      watchBar.textContent = '';
+      watchBad = false; // re-arm: the next transition into trouble announces again
+      return;
+    }
+    watchBar.hidden = false;
+    watchBar.className = w.level === 'warn' ? 'warn' : '';
+    watchBar.textContent = w.text;
+    var sub = document.createElement('span');
+    sub.className = 'wsub';
+    sub.textContent = 'Nothing is watching this but you. It clears itself as soon as an agent acts.';
+    watchBar.appendChild(sub);
+
+    if (!watchBad) {
+      watchBad = true;
+      announceWatch(w.text);
+    }
+  }
+
+  /*
+   * Optional and quiet by default. Gated behind the same mute control as spoken
+   * replies, silent until a tap has unlocked audio, skipped while dictating so it
+   * cannot cut into an utterance — and fired once per transition into trouble,
+   * never once per poll. An alarm that repeats is an alarm that gets muted.
+   */
+  function announceWatch(text) {
+    if (!speakOn || !audioUnlocked || vox) return;
+    var say = speakable(text);
+    if (!say) return;
+    speakQueue.push(say);
+    speakPump();
+  }
+
+  /*
+   * Fallback for when the stream is down, in the same shape as the thread poll:
+   * fast when there is no stream, a slow repair pass when there is. /watch is a
+   * deliberately cheap endpoint — it does no engine probing, unlike /status.
+   */
+  function pollWatch() {
+    return fetch('/watch', { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (w) { renderWatch(w); })
+      .catch(function () { /* the offline indicator already says the server is gone */ });
+  }
+
+  setInterval(function () {
+    if (document.hidden) return;
+    watchPolls++;
+    if (streamOk && watchPolls % 3) return; // stream carries it; this is just repair
+    pollWatch();
+  }, WATCH_POLL_MS);
+
   function openStream() {
     if (!window.EventSource || stream) return;
     try { stream = new EventSource('/events'); } catch (e) { return; }
@@ -703,6 +801,9 @@
       var j;
       try { j = JSON.parse(e.data); } catch (err) { return; }
       fails = 0; setConn(true);
+      // The deadman verdict. Carried on the same stream so it arrives whether or
+      // not anything in the queue changed — which is the entire point of it.
+      if (j && j.watch) { renderWatch(j.watch); return; }
       // A conversation was created, renamed, reassigned or archived.
       if (j && j.conversation) { loadConvs(); return; }
       /*
@@ -1141,6 +1242,31 @@
     srow(wait, 'Waiting / in progress / answered',
       (c.pending || 0) + ' / ' + (c.claimed || 0) + ' / ' + (c.done || 0));
     frag.appendChild(wait);
+
+    /*
+     * --- abandoned ---
+     * Its own card, above everything else that could reassure you, because this
+     * failure hides from every other panel: a claimed task is not "waiting", so
+     * the counts above look fine, and any other agent working recently makes the
+     * activity panel look fine too. Nothing will ever retry these on its own.
+     */
+    var stuck = (s.stuck && s.stuck.length) ? s.stuck : null;
+    if (stuck) {
+      var ab = scard('Abandoned — claimed but never answered');
+      ab.className = 'scard bad';
+      for (var si = 0; si < stuck.length; si++) {
+        var st = stuck[si];
+        var sl = el('div', 'sline');
+        sl.appendChild(el('div', 't', st.text || '(no text)'));
+        sl.appendChild(el('div', 'w',
+          (st.claimedBy || 'an agent') + ' took this ' + ago(st.stuckForSec) + ' and never came back'));
+        ab.appendChild(sl);
+      }
+      ab.appendChild(el('p', 'snote',
+        'Nothing will pick these up again by itself — a claimed task is invisible to an agent polling for pending work. '
+        + 'Post a result to close one, or have an agent claim the conversation afresh.'));
+      frag.appendChild(ab);
+    }
 
     // --- responsiveness ---
     var r = s.responsiveness || {};

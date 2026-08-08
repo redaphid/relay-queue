@@ -1,8 +1,51 @@
 # Work log — agent system
 
+## Restarting after a reboot or a dead session — read this first
+
+**Everything durable survives on its own.** Docker containers all carry
+`restart: unless-stopped`, so relay-queue, vikunja, mindmeld, the mcp-hub, and
+the Cloudflare tunnel come back with the machine. The queue's message history is
+an append-only log on disk and replays on boot. `speak-mcp` returns via its
+Scheduled Task. The public endpoints (`relay.hypnodroid.com`,
+`mcp.hypnodroid.com/mcp`) keep working without anyone present.
+
+**What dies is the agents, and only the agents.** No coordinator survives a
+session ending. Nothing on disk is lost when they do — that is the whole point
+of this file.
+
+To come back, open Claude Code in `D:\projects` and say roughly:
+
+> Read D:\projects\relay-queue\WORK-LOG.md and COORDINATOR.md. You are the
+> Communicator (Zora) — own the `main` conversation on the relay queue at
+> http://127.0.0.1:3901, answer my messages there, and poke any other
+> conversation's coordinator when it has pending work.
+
+That is sufficient. Auto-memory loads on its own and carries the traps and
+decisions; this file carries the state. Then, if wanted, spawn a coordinator per
+non-`main` conversation using `COORDINATOR.md` as its brief.
+
+**Check it came back** with `GET /status`: agents should appear with fresh
+`last acted` times. If every agent is stale while messages sit pending, nothing
+is listening — that is the signal to restart the session.
+
+
 Durable state for the relay/agent work, so a dead session loses momentum but not
 knowledge. Update this when something lands, unblocks, or turns out to be wrong.
 Last updated 2026-08-08, ~03:45.
+
+## Decided — do not re-raise
+
+**LAN exposure is accepted.** relay-queue (:3901), hue (:3100), nanoleaf, and
+spotify all publish on `0.0.0.0` with no authentication. The user decided
+2026-08-08: *"fine with them being exposed to the LAN. I live alone. We'll fix
+it at some point."* That is a deliberate risk acceptance, not an oversight —
+stop flagging it. `authenticate-the-queue.md` stays as a draft for when they
+want it.
+
+One nuance recorded once, not to be repeated: "LAN" here includes Tailscale, so
+the surface is every device on the tailnet, not only the house. The public
+hostnames (`relay.`, `hue.`, `metamcp.`, `mindmeld.`) are all correctly gated
+behind Cloudflare Access — verified.
 
 ## Blocked on the human
 

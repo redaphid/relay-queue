@@ -125,6 +125,9 @@ function appendEvent(ev) {
   // Push to live pages, post-durability.
   if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
+  // An agent acting is what clears the deadman banner, and it must clear at once
+  // rather than up to a tick later — recovery has to feel immediate to be trusted.
+  pushWatch();
 }
 
 function replay() {
@@ -507,6 +510,11 @@ function sseRoute(req, res) {
   res.write(`retry: ${SSE_RETRY_MS}\n\n`);
   res.write(`: connected ${nowIso()}\n\n`);
   streams.add(res);
+  // A page opening into an already-stranded state must see it immediately, not
+  // on the next tick. Reconnects land here too, so a dropped stream self-heals.
+  try {
+    res.write(`data: ${JSON.stringify({ now: nowIso(), watch: watchSnapshot() })}\n\n`);
+  } catch { /* the close handler below will evict it */ }
 
   const ping = setInterval(() => {
     try { res.write(': ping\n\n'); } catch { /* closing */ }
@@ -832,8 +840,28 @@ const SILENT_MS = 10 * 60 * 1000; // ...and this stale means nothing is
  * quiet for a minute with an unanswered message in front of it is not. Fixed
  * silence thresholds get this exactly backwards and cry wolf at idle.
  */
-const WAITING_GRACE_MS = 60 * 1000; // normal latency: work this fresh is not a problem
-const WAITING_ALARM_MS = 5 * 60 * 1000; // work stalled this long is an alarm, not a warning
+// Tunable: "too long to wait" is a property of how you work, not a constant. The
+// selftest also leans on these to exercise the transitions in seconds.
+const WAITING_GRACE_MS = Number(process.env.WAITING_GRACE_MS || 60 * 1000); // normal latency: work this fresh is not a problem
+const WAITING_ALARM_MS = Number(process.env.WAITING_ALARM_MS || 5 * 60 * 1000); // work stalled this long is an alarm, not a warning
+/*
+ * ORPHANED CLAIMS. A task claimed and never answered is the worst kind of
+ * failure here, because it is invisible from every angle: a pending-only poll
+ * skips it, so no agent will ever pick it up again, and the stall check above
+ * misses it too whenever some *other* agent is busy — recent activity makes the
+ * queue look healthy while that one task sits abandoned forever. It therefore
+ * gets its own trigger rather than relying on the general staleness path.
+ */
+const STUCK_CLAIM_MS = Number(process.env.STUCK_CLAIM_MS || 15 * 60 * 1000);
+const STUCK_ALARM_MS = Number(process.env.STUCK_ALARM_MS || 60 * 60 * 1000);
+/*
+ * Heartbeats live in memory only, so a restart wipes the whole roster — and this
+ * server restarts itself whenever server.js changes, which during development is
+ * constantly. For the first minute after boot, "nobody is watching" is far more
+ * likely to mean "we just rebooted" than "every agent died", and an alarm that
+ * fires every time you save a file is one people train themselves to ignore.
+ */
+const STARTUP_GRACE_MS = Number(process.env.STARTUP_GRACE_MS || 60 * 1000);
 const RECENT_N = 25; // activity rows returned
 const SAMPLE_N = 25; // most recent messages used for the timing sample
 
@@ -993,7 +1021,35 @@ const humanAgo = (sec) => (sec === null || sec === undefined ? 'never' : `${huma
  * not checking in is not yet a problem, and crying wolf at 3am is how a status
  * page teaches you to ignore it.
  */
-function headline(c, watch, derived) {
+/*
+ * Claimed, unanswered, and older than the threshold. Deliberately NOT part of
+ * derivedStatus(): that is memoised on the mutation counter, and a task becomes
+ * stuck purely by the passage of time, with nothing mutating. Memoising it would
+ * mean the orphan is only noticed when something *else* happens — which is
+ * exactly the blind spot this is here to close.
+ */
+function stuckClaims() {
+  const now = Date.now();
+  const out = [];
+  for (const t of tasks.values()) {
+    if (t.status !== 'claimed') continue;
+    if (t.result !== null && t.result !== undefined) continue;
+    const since = msOf(t.claimedAt || t.ts);
+    const forSec = Math.round((now - since) / 1000);
+    if (forSec * 1000 < STUCK_CLAIM_MS) continue;
+    out.push({
+      id: t.id,
+      conversationId: convIdOf(t),
+      claimedBy: t.claimedBy || null,
+      claimedAt: t.claimedAt || null,
+      stuckForSec: forSec,
+      text: asText(t.instruction).slice(0, 120),
+    });
+  }
+  return out.sort((a, b) => b.stuckForSec - a.stuckForSec);
+}
+
+function headline(c, watch, derived, stuck) {
   const waiting = c.pending + c.claimed;
   const oldestSec = derived.oldestWaiting ? secSince(derived.oldestWaiting.ts) : null;
   const actedAgo = watch.lastActedAgoSec;
@@ -1008,6 +1064,23 @@ function headline(c, watch, derived) {
     }
     if (beating) return { level: 'ok', text: 'All caught up, and an agent is checking in.' };
     return { level: 'idle', text: 'Nothing is waiting.' };
+  }
+
+  /*
+   * An orphaned claim outranks the general staleness check, and must be tested
+   * BEFORE it: the grace window and the "has anything happened lately" test both
+   * pass happily while another agent works, and the abandoned task stays hidden
+   * behind that healthy-looking activity.
+   */
+  const orphans = stuck || [];
+  if (orphans.length) {
+    const worst = orphans[0];
+    return {
+      level: worst.stuckForSec * 1000 >= STUCK_ALARM_MS ? 'alarm' : 'warn',
+      text: `${plural(orphans.length, 'message', 'messages')} claimed but never answered — `
+        + `${worst.claimedBy || 'an agent'} took one ${humanAgo(worst.stuckForSec)} and never came back. `
+        + `Nothing will pick it up again on its own.`,
+    };
   }
 
   const what = c.pending
@@ -1038,9 +1111,99 @@ function headline(c, watch, derived) {
     };
   }
   if (watch.evidence === 'none') {
-    return { level, text: `${what}, and no agent has ever checked in.` };
+    // Still say how long. "No agent has ever checked in" is alarming without a
+    // duration attached, and the duration is what tells you whether to act.
+    return { level, text: `${what} for ${humanFor(stalled)}, and no agent has ever checked in.` };
   }
   return { level, text: `${what}, and nothing has happened for ${humanFor(stalled)}.` };
+}
+
+/*
+ * THE DEADMAN.
+ *
+ * Every other liveness mechanism in this system shares a fate with the thing it
+ * watches. A heartbeat loop dies with its agent — one kept reporting "alive"
+ * through eight minutes of the agent being asleep. A monitor cannot start a
+ * turn, so it cannot wake anything. A session-scoped schedule dies exactly when
+ * it would be needed. This process shares a fate with none of them: it is
+ * `restart: unless-stopped`, it comes back with Docker, and it runs whether or
+ * not any agent exists.
+ *
+ * The detection has always been here — `headline()` above already knows that
+ * work is stranded. What was missing is that it never said so unprompted; it
+ * only ever answered when asked. Both times this failed in practice, the user
+ * was staring at a thread that looked completely normal. Telling them to go and
+ * check a status page asks them to run the diff by hand, which is the same
+ * failure as a heartbeat that beats when nobody is home: the information existed
+ * and nothing surfaced it.
+ *
+ * The TIMER is the point. Going stale is the *absence* of events, so a push
+ * driven by mutations can never detect it — nothing happening is precisely the
+ * signal. So we re-evaluate on a clock and push the verdict at pages.
+ *
+ * Honest limit: if no page is open, this cannot tell anyone. A real push needs
+ * something else. But the page is where the user types, so it covers the case
+ * that actually happened.
+ */
+// How often the verdict is re-evaluated. This is the worst-case delay between
+// work going stale and the banner saying so, so it wants to be well under the
+// grace window. Tunable mostly so the selftest can drive it in milliseconds.
+const WATCH_TICK_MS = Number(process.env.WATCH_TICK_MS || 15000);
+let lastWatchLevel = null;
+
+function watchSnapshot() {
+  const c = counts();
+  const derived = derivedStatus();
+  const watch = watchState(derived);
+  const stuck = stuckClaims();
+  const h = headline(c, watch, derived, stuck);
+  /*
+   * Never alarm out of a fresh boot. Heartbeats are in-memory and a restart wipes
+   * the roster, and this process restarts itself on every source change — so a
+   * young uptime makes "nobody is watching" unreliable in exactly the situation
+   * where it would fire most often. Note this suppresses the BANNER only:
+   * /status still reports the unvarnished headline.
+   */
+  const starting = Date.now() - STARTED_AT < STARTUP_GRACE_MS;
+  return {
+    level: h.level,
+    text: h.text,
+    starting,
+    /*
+     * Judged on what an agent DID, never on heartbeats — `stalled` in headline()
+     * is derived from lastClaimAt/lastResultAt, which are replayed from the event
+     * log and therefore survive a restart. Heartbeats do not survive one, and a
+     * heartbeat proves only that something is running, not that it is working.
+     */
+    stuck: stuck.slice(0, 5),
+    stuckCount: stuck.length,
+    /*
+     * `bad` is the entire contract, and it is deliberately derived from
+     * headline() rather than recomputed: idle and broken must never look the
+     * same, and headline() already guarantees an empty queue can never reach
+     * warn/alarm. Crying wolf at a quiet queue is how a banner teaches you to
+     * ignore it, which would cost more than it ever saved.
+     */
+    bad: !starting && (h.level === 'warn' || h.level === 'alarm'),
+    waiting: c.pending + c.claimed,
+    // What an agent DID. Heartbeats deliberately do not count as acting.
+    lastActedAgoSec: watch.lastActedAgoSec,
+    at: nowIso(),
+  };
+}
+
+function pushWatch() {
+  if (streams.size === 0) return;
+  const snap = watchSnapshot();
+  const changed = snap.level !== lastWatchLevel;
+  lastWatchLevel = snap.level;
+  /*
+   * Healthy and unchanged: say nothing. A quiet system should produce a quiet
+   * stream. While it is bad we re-push every tick so the wording stays true —
+   * "nothing has happened for 7 min" must not still say 7 at twenty.
+   */
+  if (!changed && !snap.bad) return;
+  push({ now: snap.at, watch: snap });
 }
 
 /*
@@ -1076,10 +1239,14 @@ async function statusRoute(req, res, q) {
   const c = counts();
   const derived = derivedStatus();
   const watch = watchState(derived);
+  const stuck = stuckClaims();
   const body = {
     now: nowIso(),
-    headline: headline(c, watch, derived),
+    headline: headline(c, watch, derived, stuck),
     watch,
+    // Claimed and abandoned. Its own list because it is its own failure: these
+    // are invisible to a pending-only poll and nothing will ever retry them.
+    stuck,
     counts: c,
     server: {
       name: NAME,
@@ -1372,6 +1539,13 @@ async function route(req, res) {
     return heartbeatRoute(res, await readBody(req));
   }
 
+  // /watch — just the deadman verdict. Deliberately separate from /status: this
+  // one is polled as a fallback and must stay cheap, with no engine probes.
+  if (seg.length === 1 && seg[0] === 'watch') {
+    if (!need('GET')) return;
+    return send(res, 200, watchSnapshot());
+  }
+
   // /client-log — one diagnostic line from the browser into the container log
   if (seg.length === 1 && seg[0] === 'client-log') {
     if (!need('POST')) return;
@@ -1470,6 +1644,10 @@ server.listen(PORT, HOST, () => {
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);
   console.log(`tasks: ${tasks.size} total — ${c.pending} pending, ${c.claimed} claimed, ${c.done} done, ${c.unrelayed} unrelayed`);
 });
+
+// The deadman's clock. Stale work is the absence of events, so only a timer can
+// find it. unref'd: it must never be the reason the process stays up.
+setInterval(pushWatch, WATCH_TICK_MS).unref();
 
 // Every write is already fsynced, so shutdown just needs to stop accepting.
 let stopping = false;
