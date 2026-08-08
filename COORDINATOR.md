@@ -349,14 +349,18 @@ LAN can post to. **Before writing a feature, grep `main` for it, read the commit
 that added it, and assume any odd-looking implementation is load-bearing until
 the commit message says otherwise.**
 
-**A test that CI does not run is not coverage, it is a story about coverage.**
-`tools/ui-selftest.js` asserts elements *exist* and is what CI enforces;
-`tools/mobile-selftest.js` asserts *geometry* and is not. That gap has let the
-same bug — his composer off the bottom of his phone — reach him three separate
-times, twice after being "fixed". It also drives only 390×844, so a break at any
-other width passes silently. When you add a UI assertion, put it in the geometry
-suite *and* confirm the enforced entry point actually reaches it. Ask "what runs
-in CI?", never "what tests exist?"
+**A test that nothing runs is not coverage, it is a story about coverage.**
+Correcting an earlier version of this very paragraph, which said CI enforces
+`tools/ui-selftest.js`: **there is no CI in this repo at all.** No `.github/`,
+no `test` script in `package.json`. The entire enforcement mechanism for the
+geometry suite is one sentence in this file asking you to run it — and the suite
+needs `npm i --no-save playwright && npx playwright install firefox` first,
+which is precisely why it gets skipped. That gap let the same bug, his composer
+off the bottom of his phone, reach him three separate times, twice after being
+"fixed": `ui-selftest.js` asserts elements *exist*, and its 173 green checks
+were telling the truth about the wrong number. Ask **"what actually runs?"**,
+never "what tests exist?" — and note how the wrong version of this note read
+perfectly plausibly for hours. A stale note is worse than no note.
 
 **Assume the notification default is wrong until you have read `classify()`.**
 `server.js:1877` returned `'done'` for every `result` *and* every `message`, so
