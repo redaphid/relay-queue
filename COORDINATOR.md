@@ -504,8 +504,17 @@ tested before plain bullets, so a task line never degrades into a bullet.
 `Checked off: "<item text>"`, or `Un-checked: "..."`. No polling. Three things
 follow from how it works:
 
-- **Items are identified by their TEXT, not an id.** Rewording an item breaks
-  the link to it, so keep item text stable once posted.
+- **There IS a stable id — use it, not the text.** A checkbox is addressed by
+  `(entryId, index)`, stable for life: the log is append-only, a message is
+  never rewritten to record a tick, and a corrected list is a *new* message.
+  Only the prose notification drops the id, so match on `(entryId, index)` via
+  `GET /tasks/<entryId>/checks` rather than string-matching the item text.
+  (An earlier version of this note said items are identified by text — true of
+  the notification wording, false of the model, and it would have pushed agents
+  into fragile string matching with a durable key sitting right there.)
+- **A tick conflict is structurally impossible** against a boolean shadow: if
+  both sides differ from one shadow, both equal `!shadow`, so they already
+  agree. Echo suppression therefore needs no separate flag.
 - **A check and an uncheck ~0.5 s apart is him testing the button**, not
   changing his mind. Debounce; an agent that acts on the first message acts
   wrongly.
@@ -515,7 +524,11 @@ follow from how it works:
   the browser calling it. The invitation is a plain English sentence inside the
   notification asking an agent to do it by hand. Two hand-kept lists drift
   apart and then neither is trustworthy, so decline and offer to wire them
-  together properly.
+  together properly. If you *are* the one wiring it: **Vikunja's
+  `POST /tasks/<id>` replaces the task rather than patching it** — a partial
+  `{id, done}` came back with the description wiped. Every write must be
+  read-modify-write. Assume PATCH semantics and you will silently destroy his
+  data.
 
 **Durability — ticks are per-device and fragile.** They live in the browser's
 `localStorage`, not on the server; they are absent from the event log, so only

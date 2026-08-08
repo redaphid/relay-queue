@@ -913,7 +913,14 @@ text>"`, or `Un-checked: "..."`. It is an ordinary pending task, so it reaches
 an idle agent through SSE and the work poll like anything else. Four things
 follow:
 
-- **Items are matched by TEXT, not an id.** Rewording an item breaks the link.
+- **A checkbox has a stable id: `(entryId, index)`.** It is stable for life —
+  the log is append-only, a message is never rewritten to record a tick, and a
+  corrected list is a *new* message. Only the prose notification omits it, so
+  read state from `GET /tasks/<entryId>/checks` and match on the id rather than
+  string-matching item text.
+- **A tick conflict is structurally impossible** against a boolean shadow: both
+  sides differing from one shadow means both equal `!shadow`, so they agree.
+  Echo suppression needs no separate flag.
 - **Ticks live in per-device `localStorage`, not on the server.** They are
   absent from the event log; only the message replays. So a tick does not follow
   him to another device, and **re-posting a list wipes its ticks**. Post once,
