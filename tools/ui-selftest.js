@@ -250,11 +250,20 @@ function makeEnv(opts) {
       node.port.onmessage({ data: b });
     }
   }
-  /** Calibrate, then say something, then go quiet long enough to end the utterance. */
+  /*
+   * Calibrate, then say something, then go quiet long enough to end the
+   * utterance. The trailing silence must clear V.CONV_SILENCE_MS (3 s) — the
+   * window is deliberately long, because 1.2 s cut real speakers off mid-thought.
+   */
   function sayOneThing() {
     feed(450, false);  // room level
     feed(600, true);   // speech
-    feed(1300, false); // trailing silence past SILENCE_MS
+    feed(3200, false); // trailing silence past CONV_SILENCE_MS
+  }
+  /** One more utterance on an already-calibrated session. */
+  function sayAgain() {
+    feed(600, true);
+    feed(3200, false);
   }
   /** Fire the agent-reply push the page would get over SSE. */
   function agentReply(text, id) {
@@ -291,7 +300,7 @@ function makeEnv(opts) {
 
   return {
     sandbox, els, meter, posted, doc, store,
-    feed, sayOneThing, agentReply, endPlayback, convReply,
+    feed, sayOneThing, sayAgain, agentReply, endPlayback, convReply,
     track, sent, stt, tts, reads,
   };
 }
@@ -425,6 +434,7 @@ async function main() {
     env.sayOneThing();
     await settle();
     check('the utterance was sent for transcription', env.stt().length === 1, `${env.stt().length} /stt calls`);
+    await wait(2400); // the message-level debounce; see the fragmentation tests
     check('the transcript was posted as a message', env.sent().length === 1, `${env.sent().length} /tasks calls`);
     check('it is tagged as conversational voice',
       env.sent()[0] && env.sent()[0].body.from === 'voice-conversation', JSON.stringify(env.sent()[0] && env.sent()[0].body));
@@ -432,7 +442,7 @@ async function main() {
     check('and it is still listening', /show/.test(env.els.voice.className) && env.track().enabled === true);
 
     env.sayOneThing();
-    await settle();
+    await wait(2400);
     check('a second utterance posts a second message', env.sent().length === 2, `${env.sent().length} sent`);
   }
 
@@ -458,12 +468,12 @@ async function main() {
 
     env.store.sttText = 'okay';
     env.sayOneThing();
-    await settle();
+    await wait(2400);
     check('but a real short answer IS posted', env.sent().length === 1, `${env.sent().length} sent`);
 
     env.feed(450, false);
     env.feed(120, true);  // a cough: under MIN_SPEECH_MS
-    env.feed(1300, false);
+    env.feed(3200, false);
     await settle();
     check('a cough never even reaches the engine', env.stt().length === 4, `${env.stt().length} /stt calls`);
   }
@@ -493,7 +503,12 @@ async function main() {
     await settle();
     await settle();
     check('all three are transcribed once the queue drains', env.stt().length === 3, `${env.stt().length} /stt calls`);
-    check('all three reach the queue', env.sent().length === 3, `${env.sent().length} sent`);
+    await wait(2400);
+    // Three utterances said back to back are ONE message by design now — the
+    // point of this test is that none of them were dropped.
+    check('nothing said while transcribing was lost',
+      env.sent().length === 1 && /one two three|check the widget report/.test(env.sent()[0].body.text),
+      JSON.stringify(env.sent().map((p) => p.body.text)));
   }
 
   // ================================================================ THE ECHO LOOP
@@ -550,7 +565,7 @@ async function main() {
     // ...but a genuine reply still gets through.
     env.store.sttText = 'now check the inventory again please';
     env.sayOneThing();
-    await settle();
+    await wait(2400);
     check('a genuine utterance after a reply still posts', env.sent().length === sentBefore + 1,
       `${env.sent().length - sentBefore} posted`);
   }
@@ -672,6 +687,147 @@ async function main() {
     check('one-shot dictation is not left locked out', env.els.mic.disabled === false);
   }
 
+  // ============================================ fragmentation (the reported bug)
+  /*
+   * Real symptom: one person talking continuously came out as four queue
+   * entries — "First, I..." / "It's a surprise, it's a good surprise." /
+   * "Jesus, Jesus, Jesus, Jesus." / "We have it, so...". Transcription was fine;
+   * the timing was wrong. These are the tests that keep it fixed.
+   */
+  console.log('\nfragmentation — one train of thought is one message');
+  {
+    const env = liveEnv();
+    await startConv(env);
+
+    env.store.sttText = 'First, I';
+    env.sayOneThing();
+    await settle();
+    check('a finished transcript is NOT posted immediately', env.sent().length === 0,
+      `${env.sent().length} posted too early`);
+    check('the pending words are shown in the composer', env.els.input.value === 'First, I',
+      JSON.stringify(env.els.input.value));
+
+    env.store.sttText = 'it is a surprise';
+    env.sayAgain();
+    await settle();
+    env.store.sttText = 'we have it, so';
+    env.sayAgain();
+    await settle();
+    check('still nothing posted while they are talking', env.sent().length === 0,
+      `${env.sent().length} posted mid-thought`);
+    check('the fragments accumulate visibly',
+      env.els.input.value === 'First, I it is a surprise we have it, so', JSON.stringify(env.els.input.value));
+
+    await wait(2400); // past STITCH_MS with no further speech
+    check('*** three fragments become ONE message ***', env.sent().length === 1,
+      `${env.sent().length} messages`);
+    check('and it is the whole sentence',
+      env.sent()[0] && env.sent()[0].body.text === 'First, I it is a surprise we have it, so',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body.text));
+    check('the composer is left clean afterwards', env.els.input.value === '',
+      JSON.stringify(env.els.input.value));
+  }
+
+  console.log('\nfragmentation — a genuine pause still makes two messages');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.store.sttText = 'first question';
+    env.sayOneThing();
+    await wait(2400); // they genuinely stopped
+    check('the first message posts on its own', env.sent().length === 1, `${env.sent().length}`);
+
+    env.store.sttText = 'second question';
+    env.sayAgain();
+    await wait(2400);
+    check('a later utterance is a separate message', env.sent().length === 2, `${env.sent().length}`);
+    check('...with its own text',
+      env.sent()[1] && env.sent()[1].body.text === 'second question',
+      JSON.stringify(env.sent()[1] && env.sent()[1].body.text));
+  }
+
+  console.log('\nfragmentation — the debounce waits for slow transcription');
+  {
+    const env = liveEnv();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const realFetch = env.sandbox.fetch;
+    let n = 0;
+    env.sandbox.fetch = (url, init) => {
+      if (url !== '/stt' || n++ === 0) return realFetch(url, init);
+      return gate.then(() => realFetch(url, init)); // the SECOND one hangs
+    };
+    await startConv(env);
+    env.store.sttText = 'part one';
+    env.sayOneThing();
+    await settle();
+    env.store.sttText = 'part two';
+    env.sayAgain();
+    await settle();
+    await wait(2400); // the debounce would have fired by now
+    check('it does not post while a transcription is still in flight', env.sent().length === 0,
+      `${env.sent().length} posted early`);
+    release();
+    await settle();
+    await wait(2400);
+    check('and both parts land as one message', env.sent().length === 1, `${env.sent().length}`);
+    check('...joined together',
+      env.sent()[0] && env.sent()[0].body.text === 'part one part two',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body.text));
+  }
+
+  console.log('\nfragmentation — Send cuts it short, and stopping never loses words');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.store.sttText = 'send this now';
+    env.sayOneThing();
+    await settle();
+    env.els.send.dispatch('click');
+    await settle();
+    check('Send posts the pending words immediately', env.sent().length === 1, `${env.sent().length}`);
+    check('it is tagged as conversational voice',
+      env.sent()[0] && env.sent()[0].body.from === 'voice-conversation',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body.from));
+    await wait(2400);
+    check('the debounce does not post it a second time', env.sent().length === 1, `${env.sent().length}`);
+
+    const env2 = liveEnv();
+    await startConv(env2);
+    env2.store.sttText = 'half a thought';
+    env2.sayOneThing();
+    await settle();
+    env2.els.convo.dispatch('click'); // stop mid-thought
+    await settle();
+    check('stopping posts nothing', env2.sent().length === 0, `${env2.sent().length}`);
+    check('but the words are kept in the composer', env2.els.input.value === 'half a thought',
+      JSON.stringify(env2.els.input.value));
+    await wait(2400);
+    check('and still nothing is posted after stopping', env2.sent().length === 0, `${env2.sent().length}`);
+  }
+
+  console.log('\nfragmentation — a filler word mid-thought is kept, alone is dropped');
+  {
+    const env = liveEnv();
+    await startConv(env);
+    env.store.sttText = 'so';
+    env.sayOneThing();
+    await wait(2400);
+    check('a lone filler word never becomes a message', env.sent().length === 0, `${env.sent().length}`);
+
+    env.store.sttText = 'check the widgets';
+    env.sayAgain();
+    await settle();
+    env.store.sttText = 'so';
+    env.sayAgain();
+    await settle();
+    await wait(2400);
+    check('but the same word continuing a sentence is kept', env.sent().length === 1, `${env.sent().length}`);
+    check('...as part of the text',
+      env.sent()[0] && env.sent()[0].body.text === 'check the widgets so',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body.text));
+  }
+
   // ================================================================ conversations
   console.log('\nconversations — the menu');
   {
@@ -782,13 +938,13 @@ async function main() {
 
     release();
     await settle();
-    await settle();
+    await wait(2400);
     check('*** the utterance posts to the conversation it was SPOKEN into ***',
       env.sent().length === 1 && env.sent()[0].body.conversationId === 'main',
       JSON.stringify(env.sent().map((p) => p.body.conversationId)));
 
     env.sayOneThing();                       // said after the switch
-    await settle();
+    await wait(2400);
     check('and a later utterance posts to the new one',
       env.sent().length === 2 && env.sent()[1].body.conversationId === 'c2',
       JSON.stringify(env.sent().map((p) => p.body.conversationId)));

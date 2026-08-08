@@ -127,6 +127,57 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .convmeta { margin-top: 3px; font-size: 12px; color: var(--off); }
+  #statusopen {
+    margin-top: 12px; width: 100%; min-height: 48px;
+    font: inherit; font-size: 15px; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+
+  /* ---- the status view ---- */
+  #statusview {
+    position: fixed; inset: 0; z-index: 30;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #statusview[hidden] { display: none; }
+  #statusclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  /* The headline answers "is it alive?" without scrolling or interpretation. */
+  .shead {
+    padding: 16px; margin-bottom: 12px;
+    font-size: 19px; line-height: 1.35; font-weight: 650;
+    border-radius: 14px; border: 1px solid var(--line); background: var(--panel);
+  }
+  .shead.ok    { color: #1a7f4b; border-color: #1a7f4b55; background: #1a7f4b12; }
+  .shead.idle  { color: var(--muted); }
+  .shead.warn  { color: var(--off); border-color: currentColor; background: #c2410c12; }
+  .shead.alarm { color: var(--rec); border-color: currentColor; background: #c0271d14; }
+  .ssub { margin-top: 6px; font-size: 14px; font-weight: 400; opacity: .85; }
+  @media (prefers-color-scheme: dark) { .shead.ok { color: #4ade80; border-color: #4ade8055; } }
+
+  .scard {
+    padding: 12px 14px; margin-bottom: 10px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  }
+  .scard h2 { margin: 0 0 8px; font-size: 13px; font-weight: 650; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .04em; }
+  .srow { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 15px; }
+  .srow .k { flex: 1 1 auto; min-width: 0; color: var(--muted); }
+  .srow .v { flex: 0 0 auto; text-align: right; }
+  .srow .v.bad { color: var(--rec); }
+  .srow .v.good { color: #1a7f4b; }
+  @media (prefers-color-scheme: dark) { .srow .v.good { color: #4ade80; } }
+  .sline { padding: 6px 0; font-size: 14px; border-top: 1px solid var(--line); }
+  .sline:first-of-type { border-top: 0; }
+  .sline .w { color: var(--muted); font-size: 12px; }
+  .sline .t { overflow-wrap: anywhere; }
+  .snote { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
+  .sempty { font-size: 15px; color: var(--muted); }
   #conn { margin-left: auto; font-size: 13px; color: var(--off); display: none; }
   #conn.show { display: inline; }
   /* Speaker toggle: mutes spoken replies independently of the microphone. */
@@ -300,8 +351,17 @@
       </div>
       <p id="converr"></p>
       <div id="convlist"></div>
+      <button id="statusopen" type="button">Status &mdash; is anything listening?</button>
     </nav>
   </div>
+
+  <section id="statusview" hidden aria-label="Status">
+    <div class="prow">
+      <b>Status</b>
+      <button id="statusclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="statusbody"></div>
+  </section>
 
 <script>
 (function () {
@@ -759,6 +819,219 @@
     loadConvs();
   }
 
+  // ------------------------------------------------------------------ status view
+  /*
+   * "Is anything actually listening, or am I typing into a void?"
+   *
+   * That is what this page is for, and it is a question about trust rather than
+   * statistics — so the headline comes first, in plain words, and answers it
+   * without scrolling or interpretation. Counts are further down where they
+   * belong: on their own they are reassurance theatre.
+   *
+   * The one rule that matters: **quiet must never look broken.** An empty queue
+   * with nobody checking in reads "Nothing is waiting", not an alarm. The server
+   * decides the level; this only renders it.
+   */
+  var statusView = document.getElementById('statusview');
+  var statusBody = document.getElementById('statusbody');
+  var statusOpen = document.getElementById('statusopen');
+  var statusClose = document.getElementById('statusclose');
+  var statusTimer = null;
+  var statusOn = false;
+  var lastBootAt = null;
+  var sawRestart = false;
+
+  var STATUS_MS = 5000;
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  function srow(parent, label, value, tone) {
+    var r = el('div', 'srow');
+    r.appendChild(el('span', 'k', label));
+    r.appendChild(el('span', 'v' + (tone ? ' ' + tone : ''), value));
+    parent.appendChild(r);
+    return r;
+  }
+  function scard(title) {
+    var c = el('div', 'scard');
+    if (title) c.appendChild(el('h2', null, title));
+    return c;
+  }
+  function ago(sec) {
+    if (sec === null || sec === undefined) return 'never';
+    if (sec < 60) return sec + 's ago';
+    if (sec < 3600) return Math.round(sec / 60) + ' min ago';
+    if (sec < 86400) return Math.round(sec / 3600) + 'h ago';
+    return Math.round(sec / 86400) + 'd ago';
+  }
+  function dur(sec) {
+    if (sec === null || sec === undefined) return '—';
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.round(sec / 60) + ' min';
+    if (sec < 86400) return Math.round(sec / 3600) + 'h';
+    return Math.round(sec / 86400) + 'd';
+  }
+
+  function renderStatus(s) {
+    statusBody.textContent = '';
+    var frag = document.createDocumentFragment();
+
+    // --- the headline ---
+    var head = el('div', 'shead ' + ((s.headline && s.headline.level) || 'idle'));
+    head.appendChild(el('div', null, (s.headline && s.headline.text) || 'Status unavailable.'));
+    var w = s.watch || {};
+    var sub;
+    if (w.source === 'heartbeat') {
+      sub = w.agent + ' checked in ' + ago(w.agoSec) + '.';
+    } else if (w.source === 'inferred') {
+      sub = 'No agent reports in, but one was working ' + ago(w.agoSec) + '.';
+    } else {
+      sub = 'No agent has ever reported in here.';
+    }
+    head.appendChild(el('div', 'ssub', sub));
+    frag.appendChild(head);
+
+    if (sawRestart) {
+      var note = scard(null);
+      note.appendChild(el('div', 'snote',
+        'The server restarted while you were watching. That is normal — it updates itself when the code changes, and nothing in the queue is lost.'));
+      frag.appendChild(note);
+    }
+
+    // --- waiting ---
+    var wait = scard('Waiting');
+    var ow = s.responsiveness && s.responsiveness.oldestWaiting;
+    if (ow) {
+      srow(wait, 'Oldest unanswered', dur(ow.waitingSec), ow.waitingSec > 600 ? 'bad' : '');
+      var q = el('div', 'sline');
+      q.appendChild(el('div', 't', ow.text || '(no text)'));
+      q.appendChild(el('div', 'w', ow.status === 'claimed' ? 'an agent has picked this up' : 'nobody has picked this up yet'));
+      wait.appendChild(q);
+    } else {
+      wait.appendChild(el('div', 'sempty', 'Nothing is waiting — every message has been answered.'));
+    }
+    var c = s.counts || {};
+    srow(wait, 'Waiting / in progress / answered',
+      (c.pending || 0) + ' / ' + (c.claimed || 0) + ' / ' + (c.done || 0));
+    frag.appendChild(wait);
+
+    // --- responsiveness ---
+    var r = s.responsiveness || {};
+    var speed = scard('How fast, recently');
+    if ((r.timeToClaimSec && r.timeToClaimSec.samples) || (r.timeToAnswerSec && r.timeToAnswerSec.samples)) {
+      if (r.timeToClaimSec) {
+        srow(speed, 'Picked up, typically', dur(r.timeToClaimSec.median));
+        srow(speed, 'Slowest to pick up', dur(r.timeToClaimSec.worst));
+      }
+      if (r.timeToAnswerSec) {
+        srow(speed, 'Answered, typically', dur(r.timeToAnswerSec.median));
+        srow(speed, 'Slowest to answer', dur(r.timeToAnswerSec.worst));
+      }
+      speed.appendChild(el('p', 'snote', 'Over the last '
+        + Math.max((r.timeToClaimSec && r.timeToClaimSec.samples) || 0,
+          (r.timeToAnswerSec && r.timeToAnswerSec.samples) || 0) + ' messages.'));
+    } else {
+      speed.appendChild(el('div', 'sempty', 'Nothing has been answered yet, so there is nothing to measure.'));
+    }
+    frag.appendChild(speed);
+
+    // --- recent activity ---
+    var act = scard('Recent activity');
+    var rows = (s.recent || []);
+    if (!rows.length) {
+      act.appendChild(el('div', 'sempty', 'No messages yet.'));
+    } else {
+      for (var i = 0; i < rows.length && i < 12; i++) {
+        var ev = rows[i];
+        var line = el('div', 'sline');
+        var verb = ev.kind === 'message' ? 'Message in'
+          : ev.kind === 'claimed' ? 'Picked up' + (ev.who ? ' by ' + ev.who : '')
+            : 'Answered' + (ev.who ? ' by ' + ev.who : '');
+        line.appendChild(el('div', 'w', verb + ' · ' + rel(ev.at)));
+        line.appendChild(el('div', 't', ev.text || ''));
+        act.appendChild(line);
+      }
+    }
+    frag.appendChild(act);
+
+    // --- plumbing ---
+    var sv = s.server || {};
+    var plumb = scard('Under the hood');
+    srow(plumb, 'Live updates', streamOk ? 'pushed instantly' : 'polling every 3s',
+      streamOk ? 'good' : '');
+    srow(plumb, 'Conversations', String(sv.conversations === undefined ? '—' : sv.conversations));
+    srow(plumb, 'Messages stored', String(sv.tasks === undefined ? '—' : sv.tasks));
+    srow(plumb, 'Running for', dur(sv.uptimeSec));
+    srow(plumb, 'Version', String(sv.version || '—'));
+    var e = s.engines;
+    if (e) {
+      srow(plumb, 'Speech to text', e.stt && e.stt.ok ? 'answering' : 'not answering',
+        e.stt && e.stt.ok ? 'good' : 'bad');
+      srow(plumb, 'Text to speech', e.tts && e.tts.ok ? 'answering' : 'not answering',
+        e.tts && e.tts.ok ? 'good' : 'bad');
+    }
+    plumb.appendChild(el('p', 'snote',
+      'Restarts are normal here: the server watches its own source and restarts itself when the code changes. Nothing in the queue is lost when it does.'));
+    frag.appendChild(plumb);
+
+    statusBody.appendChild(frag);
+  }
+
+  function loadStatus() {
+    return fetch('/status', { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (s) {
+        var boot = s.server && s.server.startedAt;
+        if (lastBootAt && boot && boot !== lastBootAt) sawRestart = true;
+        if (boot) lastBootAt = boot;
+        if (statusOn) renderStatus(s);
+        return true;
+      })
+      .catch(function (err) {
+        if (!statusOn) return false;
+        statusBody.textContent = '';
+        var head = el('div', 'shead alarm', 'Cannot reach the relay server.');
+        head.appendChild(el('div', 'ssub',
+          'The page could not load its status — ' + ((err && err.message) || 'network error') +
+          '. Your messages are safe; nothing can be sent until it is back.'));
+        statusBody.appendChild(head);
+        return false;
+      });
+  }
+
+  function showStatus() {
+    if (!statusView) return;
+    statusOn = true;
+    statusView.hidden = false;
+    closeDrawer();
+    statusBody.textContent = '';
+    statusBody.appendChild(el('div', 'sempty', 'Checking…'));
+    loadStatus();
+    clearInterval(statusTimer);
+    statusTimer = setInterval(function () { if (statusOn && !document.hidden) loadStatus(); }, STATUS_MS);
+  }
+
+  function hideStatus() {
+    if (!statusView || !statusOn) return;
+    statusOn = false;
+    statusView.hidden = true;
+    clearInterval(statusTimer);
+    statusTimer = null;
+  }
+
+  function initStatus() {
+    if (statusOpen) statusOpen.addEventListener('click', showStatus);
+    if (statusClose) statusClose.addEventListener('click', hideStatus);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideStatus(); });
+  }
+
   function autosize() {
     input.style.height = 'auto';
     var cap = Math.round(window.innerHeight * 0.4);
@@ -787,6 +1060,9 @@
   // `from` marks the origin of the message: 'web' when typed, 'voice' when dictated.
   function doSend(from) {
     if (sending) return Promise.resolve(false);
+    // Send pre-empts the stitch debounce: the words are already in the box, and
+    // letting the timer fire too would post them twice.
+    if (pendingInBox) { from = 'voice-conversation'; clearStitch(true); }
     var text = input.value;
     if (!text.trim()) { input.focus(); return Promise.resolve(false); }
     if (text.length > MAX_CHARS) {
@@ -795,7 +1071,8 @@
     }
     var ok = true;
     sending = true; sendBtn.disabled = true; clearErr();
-    return postTask(text, from === 'voice' ? 'voice' : 'web').then(function () {
+    var origin = from === 'voice' || from === 'voice-conversation' ? from : 'web';
+    return postTask(text, origin).then(function () {
       input.value = '';            // cleared only after the POST succeeded
       autosize();
       return poll(false);
@@ -890,7 +1167,12 @@
     NOISE_MULT: 2.2,     // speech must be this many times louder than the room
     RMS_FLOOR: 0.010,    // ...and at least this loud outright
     START_MS: 120,       // sustained loud audio before it counts as speech
-    SILENCE_MS: 1200,    // trailing silence that ends the utterance
+    SILENCE_MS: 1200,    // trailing silence that ends a one-shot dictation
+    // Continuous speech pauses to think, and 1.2 s cuts people off mid-sentence —
+    // right before "so…", "and…", "first, I…". Conversation mode gets a much
+    // longer window; one-shot dictation keeps the short one, where the user is
+    // deliberately saying one thing and wants it to end promptly.
+    CONV_SILENCE_MS: 3000,
     NO_SPEECH_MS: 8000,  // give up if nothing is ever said
     MAX_MS: 60000,       // hard cap on one dictation
     MIN_SPEECH_MS: 250,  // shorter than this is a cough, not a message
@@ -931,7 +1213,16 @@
     MIN_SPEECH_MS: 350,      // stricter than one-shot: nothing here is confirmed before posting
     IDLE_RECALIB_MS: 10000,  // re-measure the room after this long hearing nothing
     MAX_QUEUE: 4,            // utterances allowed to pile up behind transcription
-    MAX_SPEAK: 900           // characters sent to /tts; the rest stays on screen
+    MAX_SPEAK: 900,          // characters sent to /tts; the rest stays on screen
+    /*
+     * A trailing-edge debounce on the MESSAGE, not the audio. Even with a long
+     * silence window, one train of thought still arrives as several utterances —
+     * so a finished transcript waits this long before being posted, and anything
+     * that arrives meanwhile is appended to it instead of becoming its own
+     * message. The wait re-arms while speech is in progress or a transcription is
+     * still in flight, so it only ever fires once the user has genuinely stopped.
+     */
+    STITCH_MS: 1800
   };
 
   var convOn = false;        // conversation mode engaged
@@ -1155,7 +1446,8 @@
       }
     } else {
       s.loudRunMs = 0;
-      if (s.phase === 'speak' && s.elapsedMs - s.lastLoudMs >= V.SILENCE_MS) return endUtterance(s);
+      var window = s.mode === 'conv' ? V.CONV_SILENCE_MS : V.SILENCE_MS;
+      if (s.phase === 'speak' && s.elapsedMs - s.lastLoudMs >= window) return endUtterance(s);
       // A conversation is allowed to sit in silence indefinitely — that is the
       // whole point of it. One-shot dictation still gives up.
       if (s.phase === 'wait' && s.elapsedMs >= V.NO_SPEECH_MS) {
@@ -1368,7 +1660,14 @@
     if (Date.now() < noteUntil) return; // ...and a note gets its moment to be read
     if (!convOn) { vStatus('Listening — go ahead.', ''); return; }
     var waiting = convQueue.length + (convBusy ? 1 : 0);
-    vStatus(waiting ? 'Listening — ' + waiting + ' still transcribing…' : 'Listening — go ahead.', '');
+    if (waiting) { vStatus('Listening — ' + waiting + ' still transcribing…', ''); return; }
+    // Say what is about to be sent, so the pause before it posts is visible
+    // rather than feeling like the app has stopped paying attention.
+    if (pendingText) {
+      vStatus('Still listening — sending: ' + pendingText.slice(-70), '');
+      return;
+    }
+    vStatus('Listening — go ahead.', '');
   }
   /*
    * A short-lived message ("didn't catch that") that decays back to idle. The
@@ -1437,6 +1736,15 @@
     stopSpeaking();
     micGated = false;
     clearTimeout(noteTimer);
+    // Words captured but not yet posted are never thrown away — stopping puts
+    // them in the composer, exactly like a failed send, so they can be sent by
+    // hand. Nothing is posted after a stop.
+    if (pendingText && !pendingInBox) {
+      var kept = input.value.replace(/\s+$/, '');
+      input.value = kept ? kept + ' ' + pendingText : pendingText;
+      autosize();
+    }
+    clearStitch(true);
     var s = vox;
     vox = null;
     if (s) teardown(s);
@@ -1486,13 +1794,97 @@
     return hits / heard.length >= C.ECHO_OVERLAP;
   }
 
-  /** Why this transcript must not become a message, or null if it may. */
-  function rejectReason(text) {
+  /*
+   * Why this transcript must not become a message, or null if it may.
+   *
+   * `continuing` means there is already a pending message this would be appended
+   * to. The filler-word filter is skipped in that case: "so" on its own is
+   * almost always a hallucination, but "so" arriving mid-thought is a real part
+   * of the sentence being built and dropping it would mangle the text.
+   */
+  function rejectReason(text, continuing) {
     if (!text) return 'empty';
     if (!/[a-z0-9]/i.test(text)) return 'punctuation'; // a lone "." or "?"
-    if (isNoisePhrase(text)) return 'noise';
+    if (!continuing && isNoisePhrase(text)) return 'noise';
     if (looksLikeEcho(text)) return 'echo';
     return null;
+  }
+
+  // ---- message stitching -------------------------------------------------
+  var pendingText = '';    // transcript waiting to be posted, still growing
+  var pendingConv = null;  // ...and the conversation it was spoken into
+  var stitchTimer = null;
+  var pendingInBox = false; // the composer is showing it, so Send can pre-empt us
+
+  /** True while the user is evidently not finished. The debounce waits this out. */
+  function stillTalking() {
+    if (micGated || convBusy || convQueue.length) return true;
+    return !!(vox && vox.mode === 'conv' && vox.phase === 'speak');
+  }
+
+  function armStitch() {
+    clearTimeout(stitchTimer);
+    stitchTimer = setTimeout(function () {
+      // Re-arm rather than post: they are mid-sentence or mid-transcription.
+      if (stillTalking()) { armStitch(); return; }
+      flushPending();
+    }, C.STITCH_MS);
+  }
+
+  /*
+   * Show what is about to be sent. Guessing at timing invisibly is what made
+   * this feel broken, so the words appear in the composer as they accumulate —
+   * the user can see it is still listening, and can hit Send to cut it short.
+   * A half-typed draft is never touched: if the box has anything in it, the
+   * preview stays in the status line only.
+   */
+  function showPending() {
+    if (!pendingText) return;
+    if (!pendingInBox && input.value.trim()) return; // leave a real draft alone
+    input.value = pendingText;
+    pendingInBox = true;
+    autosize();
+  }
+
+  function clearStitch(keepBox) {
+    clearTimeout(stitchTimer);
+    stitchTimer = null;
+    pendingText = '';
+    pendingConv = null;
+    if (pendingInBox && !keepBox) { input.value = ''; autosize(); }
+    pendingInBox = false;
+  }
+
+  function stitchIn(text, conv) {
+    // Switching conversation mid-thought posts what was said in the old one.
+    if (pendingText && pendingConv !== conv) flushPending();
+    pendingText = pendingText ? pendingText + ' ' + text : text;
+    pendingConv = conv;
+    showPending();
+    armStitch();
+    idleStatus();
+  }
+
+  function flushPending() {
+    var text = (pendingText || '').trim();
+    var conv = pendingConv;
+    clearStitch(false);
+    if (!text || !convOn) return;
+    var why = rejectReason(text, false);
+    if (why) {
+      logClient('conv-dropped', { why: why, text: text.slice(0, 80) });
+      convNote(why === 'echo' ? 'Ignored my own voice.' : 'Didn’t catch that.');
+      return;
+    }
+    postTask(text, 'voice-conversation', conv)
+      .then(function () { return conv === activeConv ? poll(false) : loadConvs(); })
+      .catch(function (err) {
+        var draft = input.value.replace(/\s+$/, '');
+        input.value = draft ? draft + ' ' + text : text;
+        autosize();
+        showErr('Not sent — ' + ((err && err.message) || 'network error') + '. The words are in the box.');
+      })
+      .then(idleStatus);
   }
 
   /*
@@ -1515,22 +1907,15 @@
       .then(function (j) {
         if (!convOn) return; // stopped while this was in flight
         var text = ((j && j.text) || '').trim();
-        var why = rejectReason(text);
+        var why = rejectReason(text, !!pendingText);
         if (why) {
           logClient('conv-dropped', { why: why, text: text.slice(0, 80) });
           convNote(why === 'echo' ? 'Ignored my own voice.' : 'Didn’t catch that.');
           return;
         }
-        return postTask(text, 'voice-conversation', job.conv)
-          .then(function () { return job.conv === activeConv ? poll(false) : loadConvs(); })
-          .catch(function (err) {
-            // Never lose words: they land in the composer, exactly as a failed
-            // typed message does, and can be sent by hand.
-            var draft = input.value.replace(/\s+$/, '');
-            input.value = draft ? draft + ' ' + text : text;
-            autosize();
-            showErr('Not sent — ' + ((err && err.message) || 'network error') + '. The words are in the box.');
-          });
+        // Not posted here: handed to the debounce, which decides when the user
+        // has actually finished talking. See stitchIn().
+        stitchIn(text, job.conv);
       })
       .catch(function (err) {
         showErr('Transcription failed — ' + ((err && err.message) || 'the server could not be reached') + '.');
