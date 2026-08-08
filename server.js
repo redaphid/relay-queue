@@ -1928,6 +1928,40 @@ function probeEngine(name, host, port) {
   });
 }
 
+/*
+ * Every conversation that has, or recently had, an agent — plus the ones that
+ * were asked to stop and never answered, which are the whole reason this exists.
+ * A conversation nobody was ever assigned to is left out; it is not a
+ * coordinator and would only pad the list.
+ */
+function coordinatorRoster() {
+  const rows = [];
+  for (const c of conversationsWithLiveness()) {
+    if (!c.agent && !c.stopRequested && !c.stopAck) continue;
+    rows.push({
+      id: c.id,
+      title: c.title,
+      agent: c.agent,
+      archived: c.archived,
+      lifecycle: c.agentState.lifecycle,
+      lastActedAt: c.lastActedAt,
+      actedAgoSec: c.agentState.actedAgoSec,
+      stop: c.agentState.stop,
+      activity: c.activity,
+    });
+  }
+  // Anything mid-stop first: those are the rows a human is waiting on.
+  const rank = (r) => (r.lifecycle === 'stop-requested' ? 0 : r.lifecycle === 'stopping' ? 1 : 2);
+  rows.sort((a, b) => rank(a) - rank(b) || msOf(b.lastActedAt) - msOf(a.lastActedAt));
+  return {
+    count: rows.length,
+    awaitingStop: rows.filter((r) => r.lifecycle === 'stop-requested' || r.lifecycle === 'stopping').length,
+    // Archived, agent never confirmed stopped: invisible in the UI, possibly alive.
+    ghosts: rows.filter((r) => r.archived && r.agent && r.stop.ack !== 'stopped').length,
+    rows,
+  };
+}
+
 async function statusRoute(req, res, q) {
   const c = counts();
   const derived = derivedStatus();
@@ -1966,6 +2000,17 @@ async function statusRoute(req, res, q) {
         : null,
     },
     recent: derived.recent,
+    /*
+     * The coordinator roster. Here as well as on /conversations so a status page
+     * can render the whole lifecycle — including who has been asked to stop and
+     * has not answered — without a second request per conversation.
+     *
+     * Archived conversations are INCLUDED, unlike the conversation list, and
+     * that is the point: an archived row with a running agent is exactly the
+     * ghost worth showing, and hiding it here would hide the only evidence left.
+     */
+    coordinators: coordinatorRoster(),
+    forceKill: FORCE_KILL_NOTE,
   };
   // Probing costs a socket to each engine, so it is opt-out for callers that
   // only want the cheap half.
@@ -3134,7 +3179,31 @@ function updateConversation(res, id, body) {
   if (patch.stopRequested === true) {
     return send(res, 200, { ...conv, stopRequestEffect: stopRequestEffect(conv) });
   }
+  /*
+   * Filing away a conversation whose agent never stood down leaves a process
+   * running that nothing on screen can see any more. That is a legitimate
+   * choice — sometimes you just want the row gone — but it has to be a CHOSEN
+   * one, so the reply always names the cost. Silence here is how a ghost gets
+   * made by accident.
+   */
+  if (patch.archived === true) {
+    return send(res, 200, { ...conv, ghost: ghostWarning(conv) });
+  }
   send(res, 200, conv);
+}
+
+/** null when there is genuinely nothing left running; otherwise, the bad news. */
+function ghostWarning(conv) {
+  if (!conv.agent || conv.stopAck === 'stopped') return null;
+  return {
+    agentStillAssigned: conv.agent,
+    stopped: false,
+    summary: `Archived, but "${conv.agent}" was never confirmed stopped.`,
+    detail: 'Archiving hides the conversation. It does not stop the agent, which may still '
+      + 'be running, still holding git worktrees, and still able to post here — where you '
+      + 'will no longer see it. Ask it to stop first if you want it wound down.',
+    forceKill: FORCE_KILL_NOTE,
+  };
 }
 
 /*
@@ -3426,6 +3495,27 @@ async function route(req, res) {
     }
     if (m === 'POST') return updateConversation(res, seg[1], await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /conversations/:id/stop-ack — the agent, and only the agent, answering a
+  // stop request. /conversations/:id/activity — what it is doing meanwhile.
+  if (seg.length === 3 && seg[0] === 'conversations') {
+    if (seg[2] === 'stop-ack') {
+      if (!need('POST')) return;
+      return stopAckRoute(res, seg[1], await readBody(req));
+    }
+    if (seg[2] === 'activity') {
+      if (m === 'POST') return activityRoute(res, seg[1], await readBody(req));
+      if (m === 'GET') {
+        if (!conversations.has(seg[1])) return fail(res, 404, `no conversation with id "${seg[1]}"`);
+        const a = activityOf(seg[1]);
+        const limit = Math.max(1, Math.min(Number(q.get('limit')) || ACTIVITY_CAP, ACTIVITY_CAP));
+        // Newest first: a panel opens on what just happened, not on history.
+        return send(res, 200, { ...a, entries: a.entries.slice(-limit).reverse() });
+      }
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
+    return fail(res, 404, `no such conversation route "${seg[2]}"`, { known: ['stop-ack', 'activity'] });
   }
 
   // /status — is anything actually listening?
