@@ -206,7 +206,8 @@ every request it makes is root-relative, so the whole feature works unchanged be
 The body is **raw 16 kHz mono signed-16-bit little-endian PCM** — no WAV header, no container. The
 format can be declared with `?rate=`, `?width=` and `?channels=`, though only 16-bit mono is accepted
 today; the default is `rate=16000&width=2&channels=1`. Audio is capped at 8 MiB (~4 minutes). The
-response is `{ text, audioMs, tookMs }`.
+response is `{ text, raw, corrections, audioMs, tookMs }` — see
+[Fixing what the engine mishears](#fixing-what-the-engine-mishears) for the last two.
 
 ```bash
 # transcribe a 16 kHz mono WAV by skipping its 44-byte header
@@ -221,6 +222,68 @@ zero-dependency rule survives. Audio is sent as `transcribe` → `audio-start` �
 
 > **Why Whisper and not Ollama?** Ollama serves text and vision models only — it has no
 > speech-to-text models, so it cannot do this job at all. Whisper is the local engine for it.
+
+### Fixing what the engine mishears
+
+The small Whisper model mangles this system's own vocabulary relentlessly. Real output from one
+evening of dictating: **Claude** came back as *cloud*, as *quad*, and — when spelled out letter by
+letter in frustration — as *C-L-O-U-D-E-U*. **mindmeld** became *mind about* and *mine mall*.
+**Alexa** became *a Lexus*. **coordinator** became *coordinate or*. Three consecutive messages were
+lost trying to say one word.
+
+So `/stt` repairs the transcript before returning it, and tells you what it changed:
+
+```json
+{ "text": "ask Claude about mindmeld",
+  "raw":  "ask cloud about mind about",
+  "corrections": [ { "from": "cloud", "to": "Claude", "how": "known mishearing" },
+                   { "from": "mind about", "to": "mindmeld", "how": "known mishearing" } ] }
+```
+
+The page puts the corrected text in the composer, shows *Corrected "cloud" → Claude*, and — because
+this only happens when it actually rewrote your words — waits about four seconds with an **Undo**
+button before sending. Undo restores exactly what you said and cancels the send, leaving it in the
+composer. A clean transcript is never delayed.
+
+**The dictionary is a plain file: `stt-terms.json`.** Add a term, save it, done — the server re-reads
+it when the mtime changes, so no restart and no code change:
+
+```json
+{ "term": "Kubernetes", "heard": ["cooper netties", "kubernetties"] }
+```
+
+`heard` entries may span several words, which is the whole point: the engine breaks words in the
+wrong *places*, so `a Lexus` has to be matched as one thing to become `Alexa`. Longer phrases are
+matched first, so `cloud flare` becomes `Cloudflare` rather than `Claude flare`.
+
+Anything not listed can still be caught by **sound-alike matching** — a compact Metaphone
+implementation, so `coordinate or` and `coordinator` reduce to the same sounds (`KRTNTR`) even though
+no edit-distance check would connect them.
+
+**It is deliberately conservative, and that matters more than the coverage.** A wrong correction is
+worse than a missed one: this text becomes instructions an agent acts on, and silently rewriting a
+word you actually said is the kind of thing you only get to do once. So:
+
+- Sound-alike matching only fires on pronunciations long enough to be distinctive. `Claude`, `cold`,
+  `called` and `clot` are all `KLT` — far too collision-prone — so short terms are corrected **only**
+  from the explicit list.
+- A `protect` list of ordinary words and phrases is never rewritten, and it claims whole phrases
+  first, so `cloud nine`, `the cloud` and `never mind about the meeting` survive intact even though
+  `cloud` and `mind about` are both listed corrections.
+- Anything already spelled correctly is left alone.
+- Variants that are ordinary English were tried and removed: `clawed`, `cloudy` and `coordinate her`
+  all matched real sentences (*"he clawed at the door"*, *"coordinate her schedule"*) and were cut.
+
+Agent names need no entries — round-tripping them through piper into the same Whisper model showed
+the NATO-derived set (Victor, Oscar, Juliet, Romeo, Charlie, Mike, plus Juno, Pike, Marlow) survives
+intact. Only *Odette* was destroyed, absorbed into the preceding word.
+
+```bash
+node tools/terms-selftest.js   # the real failures as fixtures, plus ordinary English
+```
+
+That test is worth reading before changing the dictionary. Its second half is the one that matters:
+sixty-odd ordinary sentences that must come through byte-for-byte untouched.
 
 **Testing it without a microphone** — `tools/stt-selftest.js` asks the local **wyoming-piper** TTS
 container to speak a sentence, saves it as a WAV, pipes it through `/stt`, and checks the transcript
@@ -245,6 +308,15 @@ node tools/ui-selftest.js
 It now also drives the conversation menu, switching, and conversation mode end to end — utterance capture, the transcription queue, the
 noise filter, spoken replies, and the echo gate described in
 [Why it cannot hear itself](#why-it-cannot-hear-itself).
+
+**The full set**, none of which need a browser, a microphone or the running container:
+
+```bash
+node tools/ui-selftest.js       # the page, against a stub DOM
+node tools/terms-selftest.js    # transcript repair, real mishearings vs ordinary English
+node tools/watch-selftest.js    # the deadman: fires, clears, and stays quiet when idle
+node tools/stt-selftest.js      # speech in, text out, using piper as the voice
+```
 
 ---
 

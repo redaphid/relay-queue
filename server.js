@@ -764,9 +764,14 @@ async function sttRoute(req, res, q) {
   if (pcm.length % frame) return fail(res, 400, `audio is not a whole number of ${frame}-byte frames`);
 
   const startedAt = Date.now();
-  const text = await transcribe(pcm, fmt);
+  const heard = (await transcribe(pcm, fmt)).trim();
+  // Repaired here rather than in the page, so every caller of /stt gets it — and
+  // `raw` is returned alongside so the composer can offer a one-tap undo.
+  const fixed = repairTranscript(heard);
   send(res, 200, {
-    text: text.trim(),
+    text: fixed.text,
+    raw: heard,
+    corrections: fixed.corrections,
     audioMs: Math.round((pcm.length / frame / fmt.rate) * 1000),
     tookMs: Date.now() - startedAt,
   });
@@ -1286,6 +1291,232 @@ async function statusRoute(req, res, q) {
   send(res, 200, body);
 }
 
+// ---------------------------------------------------------------- transcript repair
+/*
+ * The small Whisper model mangles this system's own vocabulary relentlessly.
+ * Observed, all from one evening: "Claude" came out as "cloud", as "quad", and —
+ * when spelled out letter by letter in frustration — as "C-L-O-U-D-E-U".
+ * "mindmeld" became "mind about" and "mine mall". "Alexa" became "a Lexus".
+ * "coordinator" became "coordinate or". Three consecutive messages were lost
+ * trying to say one word.
+ *
+ * So transcripts get a repair pass before they become a message. Two things make
+ * this safe enough to do at all:
+ *
+ * 1. IT IS CONSERVATIVE BY CONSTRUCTION. A wrong correction is worse than a
+ *    missed one — this text becomes instructions an agent acts on, and silently
+ *    rewriting a word the user actually said is a trust problem you only get to
+ *    cause once. Corrections come primarily from an explicit list of things
+ *    actually heard (stt-terms.json); sound-alike matching only fires when the
+ *    pronunciation is long enough to be distinctive, and never over a protected
+ *    ordinary word. "cold", "called" and "clot" are all phonetically identical to
+ *    "Claude", which is exactly why short terms are never matched by sound.
+ * 2. IT IS VISIBLE. The page shows what was changed and offers one tap to undo,
+ *    so a bad correction is caught by the user in the composer rather than
+ *    discovered later in something an agent already acted on.
+ *
+ * The dictionary is data, not code: add a term, save, done — the file is
+ * re-read when its mtime changes.
+ */
+const TERMS_FILE = process.env.STT_TERMS_FILE || path.join(__dirname, 'stt-terms.json');
+const MAX_SPAN_WORDS = 4; // longest multi-word misfire we will try to match
+
+/*
+ * Metaphone, trimmed to what this needs. Maps a word to how it SOUNDS, so
+ * "a Lexus" and "Alexa" collide on ALKS and "coordinate or" lands on the same
+ * key as "coordinator". Edit distance alone cannot see either of those, because
+ * the engine's errors are acoustic, not typographical.
+ */
+function metaphone(word) {
+  let w = String(word).toUpperCase().replace(/[^A-Z]/g, '');
+  if (!w) return '';
+  w = w.replace(/([^C])\1+/g, '$1'); // collapse doubles, CC excepted
+  if (/^(AE|GN|KN|PN|WR)/.test(w)) w = w.slice(1);
+  else if (w[0] === 'X') w = 'S' + w.slice(1);
+  else if (/^WH/.test(w)) w = 'W' + w.slice(1);
+
+  const V = 'AEIOU';
+  let out = '';
+  for (let i = 0; i < w.length; i++) {
+    const c = w[i];
+    const prev = w[i - 1] || '';
+    const next = w[i + 1] || '';
+    const after = w[i + 2] || '';
+    if (V.includes(c)) { if (i === 0) out += c; continue; } // vowels count only first
+    switch (c) {
+      case 'B': if (!(i === w.length - 1 && prev === 'M')) out += 'B'; break;
+      case 'C':
+        if (next === 'H') { out += 'X'; i++; }
+        else if (next === 'I' && after === 'A') out += 'X';
+        else if ('IEY'.includes(next)) out += 'S';
+        else out += 'K';
+        break;
+      case 'D':
+        if (next === 'G' && 'IEY'.includes(after)) { out += 'J'; i++; } else out += 'T';
+        break;
+      case 'G':
+        if (next === 'H') { if (i + 2 >= w.length || V.includes(after)) out += 'K'; i++; }
+        else if (next === 'N') { /* silent */ }
+        else if ('IEY'.includes(next)) out += 'J';
+        else out += 'K';
+        break;
+      case 'H': if (!(V.includes(prev) && !V.includes(next))) out += 'H'; break;
+      case 'K': if (prev !== 'C') out += 'K'; break;
+      case 'P': if (next === 'H') { out += 'F'; i++; } else out += 'P'; break;
+      case 'Q': out += 'K'; break;
+      case 'S':
+        if (next === 'H') { out += 'X'; i++; }
+        else if (next === 'I' && 'OA'.includes(after)) out += 'X';
+        else out += 'S';
+        break;
+      case 'T':
+        if (next === 'H') { out += '0'; i++; }
+        else if (next === 'I' && 'OA'.includes(after)) out += 'X';
+        else out += 'T';
+        break;
+      case 'V': out += 'F'; break;
+      case 'W': case 'Y': if (V.includes(next)) out += c; break;
+      case 'X': out += 'KS'; break;
+      case 'Z': out += 'S'; break;
+      default: out += c; // F J L M N R
+    }
+  }
+  return out.replace(/(.)\1+/g, '$1');
+}
+
+const normTerm = (s) => String(s).toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim();
+/*
+ * "c l o u d e u" and "cloudeu" must reach the same key: when the engine hears a
+ * word being spelled out it emits single letters, and joining them back up is
+ * what lets the phonetic pass recognise the attempt.
+ */
+const joinLetters = (s) => s.replace(/\b(?:[a-z]\s+){2,}[a-z]\b/g, (m) => m.replace(/\s+/g, ''));
+const phoneticOf = (s) => metaphone(joinLetters(normTerm(s)).replace(/\s+/g, ''));
+
+let termsCache = { mtimeMs: -1, index: null };
+
+function loadTerms() {
+  let stat = null;
+  try { stat = fs.statSync(TERMS_FILE); } catch { /* no dictionary: repair is a no-op */ }
+  if (!stat) return null;
+  if (termsCache.mtimeMs === stat.mtimeMs) return termsCache.index;
+
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(TERMS_FILE, 'utf8'));
+  } catch (err) {
+    // A typo in the dictionary must never take transcription down with it.
+    console.log(`[terms] ${TERMS_FILE} is not valid JSON — transcript repair disabled: ${err.message}`);
+    termsCache = { mtimeMs: stat.mtimeMs, index: null };
+    return null;
+  }
+
+  const exact = new Map(); // normalised heard phrase -> canonical
+  const phonetic = new Map(); // distinctive sound -> canonical
+  const canonical = new Set(); // already-correct spellings, never touched
+  const minLen = Number(raw.minPhoneticLength) || 5;
+  const protect = new Set((raw.protect || []).map(normTerm));
+  let maxWords = 1;
+
+  for (const entry of raw.terms || []) {
+    if (!entry || typeof entry.term !== 'string') continue;
+    const term = entry.term.trim();
+    if (!term) continue;
+    canonical.add(normTerm(term));
+    const forms = [term, ...(Array.isArray(entry.heard) ? entry.heard : [])];
+    for (const form of forms) {
+      const n = normTerm(form);
+      if (!n) continue;
+      maxWords = Math.max(maxWords, n.split(' ').length);
+      // Listed forms are ground truth: they win, and they bypass `protect`.
+      if (n !== normTerm(term)) exact.set(n, term);
+      const key = phoneticOf(form);
+      // Only distinctive sounds may match something that was never listed.
+      if (key.length >= minLen && !phonetic.has(key)) phonetic.set(key, term);
+    }
+  }
+
+  const index = { exact, phonetic, canonical, protect, minLen, maxWords: Math.min(maxWords, MAX_SPAN_WORDS) };
+  termsCache = { mtimeMs: stat.mtimeMs, index };
+  console.log(`[terms] ${raw.terms ? raw.terms.length : 0} terms, ${exact.size} known mishearings`);
+  return index;
+}
+
+/** Splits into words, keeping the punctuation around each so it can be rebuilt. */
+function splitWords(text) {
+  const out = [];
+  const re = /\S+/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const piece = m[0];
+    const core = piece.match(/^[^\p{L}\p{N}]*(.*?)[^\p{L}\p{N}]*$/u);
+    const body = core ? core[1] : piece;
+    const lead = piece.slice(0, piece.indexOf(body));
+    out.push({ raw: piece, lead, body, tail: piece.slice(lead.length + body.length), norm: normTerm(body) });
+  }
+  return out;
+}
+
+/**
+ * Repairs known vocabulary in a transcript.
+ * Returns { text, corrections:[{from,to,how}] } and never throws.
+ */
+function repairTranscript(text) {
+  const idx = loadTerms();
+  if (!idx || typeof text !== 'string' || !text.trim()) return { text, corrections: [] };
+
+  const words = splitWords(text);
+  const corrections = [];
+  const out = [];
+
+  for (let i = 0; i < words.length;) {
+    let hit = null;
+    let keep = 0; // words to emit untouched, because a longer phrase claimed them
+    // Longest span first: "cloud flare" must become Cloudflare, not "Claude flare".
+    for (let n = Math.min(idx.maxWords, words.length - i); n >= 1; n--) {
+      const span = words.slice(i, i + n);
+      const phrase = span.map((w) => w.norm).filter(Boolean).join(' ');
+      if (!phrase) continue;
+      /*
+       * Tested before any correction, and it claims the WHOLE span. An ordinary
+       * phrase that merely contains a known mishearing has to survive intact:
+       * "cloud nine" must not become "Claude nine" just because "cloud" is
+       * listed. Same for anything already spelled correctly.
+       */
+      if (idx.canonical.has(phrase) || idx.protect.has(phrase)) { keep = n; break; }
+
+      const listed = idx.exact.get(phrase);
+      if (listed) { hit = { term: listed, n, how: 'known mishearing' }; break; }
+
+      // Sound-alike: only for pronunciations distinctive enough to be safe.
+      // "cold", "called" and "clot" all sound exactly like "Claude", so anything
+      // this short is corrected from the explicit list or not at all.
+      const key = phoneticOf(phrase);
+      if (key.length < idx.minLen) continue;
+      const sounds = idx.phonetic.get(key);
+      if (sounds && normTerm(sounds) !== phrase) { hit = { term: sounds, n, how: 'sounds identical' }; break; }
+    }
+
+    if (keep) {
+      for (let k = 0; k < keep; k++) out.push(words[i + k].raw);
+      i += keep;
+      continue;
+    }
+    if (!hit) { out.push(words[i].raw); i++; continue; }
+
+    const span = words.slice(i, i + hit.n);
+    corrections.push({
+      from: span.map((w) => w.body).join(' '),
+      to: hit.term,
+      how: hit.how,
+    });
+    out.push(span[0].lead + hit.term + span[span.length - 1].tail);
+    i += hit.n;
+  }
+
+  return { text: out.join(' '), corrections };
+}
+
 // ---------------------------------------------------------------- client log
 /*
  * POST /client-log — write one line to stdout, visible in `docker logs relay-queue`.
@@ -1632,6 +1863,16 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------------------------------------------------------------- boot
+/*
+ * Pure helpers are exported so they can be unit-tested without standing a server
+ * up. Everything with a side effect below is behind the `require.main` guard, so
+ * `require('./server.js')` gives you the functions and nothing else — no port
+ * bound, no data directory touched, no timers running.
+ */
+module.exports = { repairTranscript, metaphone, headline, stuckClaims };
+
+if (require.main !== module) return;
+
 fs.mkdirSync(DATA_DIR, { recursive: true });
 ensureDefaultConv(); // before replay, so a rename of it replays onto something
 const replayed = replay();

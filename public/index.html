@@ -328,6 +328,27 @@
   #watch.warn { color: var(--warn-fg); background: var(--warn-bg); }
   #watch .wsub { display: block; margin-top: 3px; font-size: 13px; font-weight: 450; opacity: .88; }
 
+  /*
+   * Transcript repair, shown rather than done behind your back. Anything that
+   * edits the user's own words has to be visible and reversible, because this
+   * text becomes instructions an agent acts on.
+   */
+  #fix {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+    margin: 0; padding: 8px 10px 8px 14px; font-size: 14px;
+    color: var(--fg); background: var(--panel); border-top: 1px solid var(--line);
+  }
+  #fix[hidden] { display: none; }
+  #fixtext { flex: 1 1 auto; min-width: 0; }
+  #fixundo {
+    flex: 0 0 auto; font: inherit; font-weight: 650;
+    min-height: 36px; padding: 0 14px;
+    color: var(--user-fg); background: var(--user-bg);
+    border: 0; border-radius: 11px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #fixundo[hidden] { display: none; }
+
   #err {
     display: none; flex: 0 0 auto;
     margin: 0; padding: 9px 14px; font-size: 14px;
@@ -440,6 +461,8 @@
   </main>
 
   <p id="err"></p>
+
+  <div id="fix" hidden><span id="fixtext"></span><button id="fixundo" type="button">Undo</button></div>
 
   <div id="voice" aria-live="polite">
     <span id="meter" aria-hidden="true"><i></i></span><span id="vtext"></span>
@@ -1719,6 +1742,77 @@
     transcribeAndSend(s);
   }
 
+  /*
+   * The speech engine mangles this system's own vocabulary constantly — "Claude"
+   * comes back as "cloud" or "quad", "mindmeld" as "mind about". The server
+   * repairs those before handing the text back (see stt-terms.json), and this is
+   * the part that keeps the repair honest: it says what it changed, and gives you
+   * one tap to put your own words back.
+   *
+   * The delay only exists when something was actually changed, which is rare. A
+   * clean transcript still sends the instant it arrives.
+   */
+  var FIX_REVIEW_MS = 4000;
+  var fixBar = document.getElementById('fix');
+  var fixText = document.getElementById('fixtext');
+  var fixUndo = document.getElementById('fixundo');
+  var fixTimer = null;
+  var fixOnUndo = null;
+
+  function fixSummary(list) {
+    var parts = [];
+    for (var i = 0; i < list.length && i < 3; i++) parts.push('“' + list[i].from + '” → ' + list[i].to);
+    if (list.length > 3) parts.push('and ' + (list.length - 3) + ' more');
+    return parts.join(', ');
+  }
+
+  function hideFix() {
+    clearTimeout(fixTimer);
+    fixTimer = null;
+    fixOnUndo = null;
+    fixBar.hidden = true;
+    fixText.textContent = '';
+  }
+
+  /** `undo` omitted = purely informational, and it clears itself. */
+  function showFix(list, undo) {
+    if (!fixBar || !list || !list.length) return;
+    clearTimeout(fixTimer);
+    fixText.textContent = 'Corrected ' + fixSummary(list);
+    fixOnUndo = undo || null;
+    fixUndo.hidden = !undo;
+    fixBar.hidden = false;
+    if (!undo) fixTimer = setTimeout(hideFix, 6000);
+  }
+
+  if (fixUndo) fixUndo.addEventListener('click', function () { if (fixOnUndo) fixOnUndo(); });
+
+  /** Holds a corrected transcript briefly so it can be taken back before it sends. */
+  function reviewThenSend(fixes, draft, raw) {
+    return new Promise(function (resolve) {
+      var done = false;
+      showFix(fixes, function () {
+        if (done) return;
+        done = true;
+        // Put back exactly what was heard and stop the send. It stays in the
+        // composer, so nothing is lost and it can be fixed by hand.
+        input.value = draft ? draft + ' ' + raw : raw;
+        autosize();
+        hideFix();
+        input.focus();
+        showErr('Put your own words back — nothing was sent. Edit it and press Send.', true);
+        logClient('stt-correction-undone', { fixes: fixes.length });
+        resolve();
+      });
+      fixTimer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        hideFix();
+        doSend('voice').then(function (ok) { if (ok) scrollBottom(); resolve(); });
+      }, FIX_REVIEW_MS);
+    });
+  }
+
   function transcribeAndSend(s) {
     if (s.lastLoudMs - s.speechStartMs < V.MIN_SPEECH_MS) {
       vHide(); showErr('That was too short to make out — try again.'); return;
@@ -1746,6 +1840,10 @@
         input.value = draft ? draft + ' ' + text : text;
         autosize();
         vHide();
+        var fixes = (j && j.corrections) || [];
+        // Only pause when the server actually rewrote something. A clean
+        // transcript is not made slower by a feature that had nothing to do.
+        if (fixes.length) return reviewThenSend(fixes, draft, ((j && j.raw) || text).trim());
         return doSend('voice').then(function (ok) { if (ok) scrollBottom(); });
       })
       .catch(function (err) {
@@ -2262,6 +2360,10 @@
           convNote(why === 'echo' ? 'Ignored my own voice.' : 'Didn’t catch that.');
           return;
         }
+        // Hands-free: no undo button, because the debounce below is already the
+        // pause and a second one would defeat the point. Still shown, so a wrong
+        // correction is visible while the text is still sitting unsent.
+        if (j && j.corrections && j.corrections.length) showFix(j.corrections);
         // Not posted here: handed to the debounce, which decides when the user
         // has actually finished talking. See stitchIn().
         stitchIn(text, job.conv);

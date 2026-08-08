@@ -1,0 +1,135 @@
+{
+  "_readme": [
+    "Vocabulary the speech engine gets wrong, and what it should have said.",
+    "",
+    "HOW TO ADD A TERM: add an object to `terms` with the canonical spelling and",
+    "the wrong things you have actually heard it produce. Save the file — the",
+    "server re-reads it when the mtime changes, so no restart is needed.",
+    "",
+    "  { \"term\": \"Kubernetes\", \"heard\": [\"cooper netties\", \"kubernetties\"] }",
+    "",
+    "`heard` entries are matched literally (case- and punctuation-insensitive) and",
+    "may span several words, which is the point: the engine breaks words in the",
+    "wrong places, so 'a Lexus' has to be matched as one thing to become 'Alexa'.",
+    "",
+    "Anything NOT listed can still be caught by sound-alike matching, but only when",
+    "the pronunciation is distinctive enough to be safe (see `minPhoneticLength` in",
+    "server.js). Short words collide far too easily — 'cold', 'called' and 'clot'",
+    "all sound exactly like 'Claude' to the matcher — so short terms are corrected",
+    "ONLY from this list. That is deliberate: a wrong correction is worse than a",
+    "missed one, because this text becomes instructions an agent acts on.",
+    "",
+    "`protect` is the last line of defence: ordinary words that must never be",
+    "rewritten by sound-alike matching, whatever it thinks."
+  ],
+
+  "terms": [
+    {
+      "term": "Claude",
+      "heard": [
+        "cloud", "claud", "cloude", "clode", "quad", "quaad",
+        "cloud e u", "cloudeu", "c l o u d e u", "cloud eu"
+      ],
+      "note": "The worst offender — three messages in a row failed on this one, including a spelled-out attempt. 'cloud' is listed knowingly: this user says 'Claude' constantly and bare 'cloud' almost never; the common collocations ('the cloud', 'cloud storage', 'cloud nine') are protected below, and the longer 'Cloudflare' wins the match ahead of it. 'clawed', 'cloudy' and 'clod' were tried and REMOVED — they are ordinary words, and rewriting 'he clawed at the door' is exactly the kind of mistake that costs more trust than the fix is worth. If bare 'cloud' ever bites, delete it from this list."
+    },
+    {
+      "term": "Cloudflare",
+      "heard": ["cloud flare", "cloudflair", "cloud fair", "cloud flair", "clout flare"],
+      "note": "Longer spans are matched first, so this beats 'cloud' -> 'Claude'."
+    },
+    {
+      "term": "mindmeld",
+      "heard": ["mind about", "mine mall", "mind meld", "mind mall", "mine meld", "mind melt", "mind mel", "mined meld"],
+      "note": "Broken across a word boundary every time, and never phonetically close enough to catch by sound alone."
+    },
+    {
+      "term": "Vikunja",
+      "heard": ["vikunya", "vicuna", "vic una", "vikuna", "the kunja", "vi kunja", "become ya"]
+    },
+    {
+      "term": "MetaMCP",
+      "heard": ["meta mcp", "meta m c p", "meta ncp", "metam cp", "meta em see pee"]
+    },
+    {
+      "term": "MCP",
+      "heard": ["m c p", "em see pee", "mcp", "ncp"],
+      "note": "Lowercase 'mcp' is corrected for capitalisation only."
+    },
+    {
+      "term": "Alexa",
+      "heard": ["a lexus", "alexus", "a lexa", "elexa", "alexei", "a lex a"]
+    },
+    {
+      "term": "Echo",
+      "heard": [],
+      "note": "Deliberately empty. The device name is indistinguishable from the ordinary word, and rewriting 'echo' would be wrong far more often than right. Listed so the decision is visible rather than forgotten."
+    },
+    {
+      "term": "coordinator",
+      "heard": ["coordinate or", "co ordinator", "coordinater", "corridor nator"],
+      "note": "'coordinate her' was deliberately NOT listed — 'coordinate her schedule' is a perfectly ordinary sentence."
+    },
+    {
+      "term": "communicator",
+      "heard": ["communicate or", "communicater"]
+    },
+    {
+      "term": "voice recognition",
+      "heard": ["worst recognition", "voice cognition", "boys recognition"]
+    },
+    {
+      "term": "Tailscale",
+      "heard": ["tail scale", "tailscale", "till scale", "tale scale", "tail skill"]
+    },
+    {
+      "term": "GitHub",
+      "heard": ["git hub", "github", "get hub", "git hub"]
+    },
+    {
+      "term": "Docker",
+      "heard": ["docker"],
+      "note": "Capitalisation only. 'doctor' is NOT listed — it is a common word and the cost of getting it wrong is far higher than the cost of fixing it by hand."
+    },
+    {
+      "term": "ollama",
+      "heard": ["olama", "oh lama", "a llama", "ollam", "oh llama", "olamma"]
+    },
+    {
+      "term": "Whisper",
+      "heard": [],
+      "note": "Empty on purpose: 'whisper' is an ordinary English word and the engine gets it right anyway."
+    },
+    {
+      "term": "piper",
+      "heard": ["pipa", "peiper"]
+    },
+    {
+      "term": "relay queue",
+      "heard": ["relay q", "relay cue", "really queue", "relay coup"]
+    },
+    {
+      "term": "Wyoming",
+      "heard": ["why oming", "wyoming"],
+      "note": "The speech protocol, capitalised like the project."
+    }
+  ],
+
+  "protect": [
+    "cold", "called", "could", "would", "should", "clot", "clout", "collide",
+    "code", "cord", "card", "cared", "curd",
+    "cloud nine", "the cloud", "cloud storage", "cloud computing", "cloud provider",
+    "in the cloud", "cloud native", "cloud services", "cloud cover", "point cloud",
+    "clawed", "cloudy", "clod", "clawing",
+    "mind", "mine", "mines", "melt", "meld", "mall", "mail",
+    "never mind about", "mind about that", "mind about it", "mind about the",
+    "coordinate her", "communicate her", "coordinate the", "coordinate with",
+    "about", "around", "record", "market", "matter", "meta",
+    "voice", "worst", "worse", "first", "recognise", "recognize",
+    "tail", "tale", "scale", "skill", "get", "git",
+    "echo", "relay", "pipe", "piper's", "whisper", "doctor", "docker's",
+    "a", "an", "the", "and", "or", "but", "if", "is", "it", "to", "of", "in",
+    "on", "at", "for", "with", "that", "this", "there", "here", "what", "when"
+  ],
+
+  "minPhoneticLength": 5
+}
