@@ -385,7 +385,7 @@ curl -s 'http://127.0.0.1:3901/status?engines=0'   # skip the STT/TTS probes
 | Field | What it is |
 | ----- | ---------- |
 | `headline` | `{level, text}` — `ok` / `idle` / `warn` / `alarm`, and the sentence to show |
-| `watch` | who is checking in, how long ago, and whether that is a heartbeat or an inference |
+| `watch` | `lastActedAt` (strong evidence) and `lastSeenAt` (weak) side by side, plus `evidence` — see [below](#two-kinds-of-evidence-and-they-are-not-equal) |
 | `counts` | pending / claimed / done / unrelayed |
 | `responsiveness` | median and worst time-to-claim and time-to-answer over the last 25 messages, plus the oldest unanswered message and how long it has waited |
 | `recent` | the last 25 things that happened — message in, claimed by X, answered |
@@ -405,22 +405,49 @@ curl -s -X POST http://127.0.0.1:3901/heartbeat \
   -d '{"agent":"coordinator-2","note":"polling"}'
 ```
 
-Call it on every poll. `agent` should match the `agent` field on the conversation you own, which is
-what ties liveness to a conversation in the menu. Thresholds:
+`agent` should match the `agent` field on the conversation you own, which is what ties liveness to a
+conversation in the menu.
 
-| Since last heartbeat | State |
-| -------------------- | ----- |
-| under 60 s | **watching** — an agent is there |
-| 60 s to 10 min | **stale** — quiet for a bit; only worrying once work is waiting for more than 4 min |
-| over 10 min | **silent** — treated as nothing responding |
+> ### Ping it from inside a turn where you act — never from a background loop
+>
+> **A heartbeat must be emitted by the agent itself, next to the claim or the result.** If you put
+> it in a background shell poll loop, the beat proves the *loop* is ticking and says nothing about
+> whether the agent is awake.
+>
+> This is not hypothetical. A coordinator hung for eight minutes while `/status` showed it alive at
+> "0s ago" the whole time, because its heartbeat came from a poll loop. **Liveness read healthiest
+> exactly when it was most stuck.**
+
+### Two kinds of evidence, and they are not equal
+
+| Evidence | Strength | Why |
+| -------- | -------- | --- |
+| `acted` — a claim or a result (`lastActedAt`) | **strong** | only an agent that genuinely ran can produce one |
+| `heartbeat` — a POST (`lastSeenAt`) | **weak** | anything with a socket can produce one |
+
+`/status` reports both, always, and **never treats a fresh heartbeat as proof of health**. The state
+worth naming is `looks stuck`: still checking in, but nothing actually done, while a message sits
+unanswered. That is the shape of a hung agent, and it is called out in the headline and shown as
+**STUCK** on the conversation in the menu.
+
+### Health is judged by waiting work, not by silence
+
+Fixed silence thresholds are the wrong shape: an agent quiet for an hour with an empty conversation
+is perfectly healthy, and an agent quiet for a minute with an unanswered message in front of it is
+not. So the measure is **how long nothing has happened while work is waiting** — the smaller of "how
+long the oldest message has waited" and "how long since any agent did anything":
+
+| Stalled for | Level |
+| ----------- | ----- |
+| under 60 s | **ok** — normal latency |
+| 60 s to 5 min | **warn** |
+| over 5 min | **alarm** |
+
+With **nothing waiting**, none of this applies and the page can never show worse than `idle`.
 
 **Heartbeats are held in memory and are never written to `events.jsonl`.** They are ephemeral
 liveness, not queue state, and one durable line per poll would bury the actual history. They are
 therefore forgotten on restart, which is honest — the restart is visible in `uptimeSec`.
-
-If nobody ever calls `/heartbeat`, the page falls back to inference: an agent that claimed or
-answered something recently is evidently alive, and `watch.source` says `inferred` rather than
-`heartbeat` so the difference is never hidden.
 
 ---
 
@@ -575,14 +602,17 @@ server-side so the page never needs the event log:
 
   | `state` | Meaning |
   | ------- | ------- |
-  | `watching` | checked in within 60 s |
-  | `stale` | checked in within 10 minutes |
-  | `silent` | last check-in older than 10 minutes |
+  | `working` | acted or checked in recently, with nothing stalled |
+  | `idle` | nothing waiting and nothing to do — healthy, and shown as such |
+  | `stuck` | **still checking in but has done nothing while a message waits** |
+  | `stale` / `silent` | work stalled and no sign of the agent at all |
   | `never` | an agent is assigned but has never called `/heartbeat` |
   | `unassigned` | no `agent` set on the conversation |
 
-  A `silent` agent is the single most important thing this list can surface, so the page says
-  **NOT RESPONDING** in words, changes the glyph, *and* colours it — never colour alone.
+  `agentState` carries `seenAgoSec` and `actedAgoSec` separately so the two are never conflated.
+  **`stuck` is the most important thing this list can surface** — it is what a hung agent looks
+  like, and it used to render as the healthiest row on the page. It says **STUCK** in words, changes
+  the glyph, *and* colours it — never colour alone.
 
 ### The menu
 

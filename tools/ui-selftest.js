@@ -325,7 +325,7 @@ const conv2 = (id, title, extra) => Object.assign({
   counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
   messages: 0, lastTs: '2026-01-01T00:00:00.000Z', lastRole: 'user', lastText: '',
   spark: new Array(12).fill(0), sparkBucketMs: 900000,
-  agentState: { state: 'unassigned', agoSec: null },
+  agentState: { state: 'unassigned', seenAgoSec: null, actedAgoSec: null, waitingSec: null },
 }, extra || {});
 
 /** All the text a stub element and its descendants would render. */
@@ -968,11 +968,11 @@ async function main() {
     const env = liveEnv();
     env.store.convs = [
       conv2('main', 'Main', { spark: [0, 2, 5, 1, 0, 0, 3, 8, 2, 0, 1, 4], sparkBucketMs: 900000,
-        agent: 'communicator', agentState: { state: 'watching', agoSec: 4 } }),
+        agent: 'communicator', agentState: { state: 'watching', seenAgoSec: 4, actedAgoSec: 9, waitingSec: null } }),
       conv2('c2', 'Widget audit', { spark: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], sparkBucketMs: 900000,
-        agent: 'coordinator-2', agentState: { state: 'silent', agoSec: 7200 } }),
+        agent: 'coordinator-2', agentState: { state: 'stuck', seenAgoSec: 2, actedAgoSec: 480, waitingSec: 470 } }),
       conv2('c3', 'Empty', { spark: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], sparkBucketMs: 900000,
-        agent: null, agentState: { state: 'unassigned', agoSec: null } }),
+        agent: null, agentState: { state: 'unassigned', seenAgoSec: null, actedAgoSec: null, waitingSec: null } }),
     ];
     await settle();
     env.els.menu.dispatch('click');
@@ -1003,11 +1003,14 @@ async function main() {
 
     const agents = rows.map((r) => r.children.find((k) => /convagent/.test(k.className)));
     check('the owning agent is named', textOf(agents[0]).indexOf('communicator') > -1, textOf(agents[0]));
-    check('a watching agent says so', /watching/.test(textOf(agents[0])), textOf(agents[0]));
-    check('*** a silent agent is unmistakable ***',
-      /NOT RESPONDING/.test(textOf(agents[1])) && /silent/.test(agents[1].className),
+    check('a working agent says "working", not merely "checking in"',
+      /working/.test(textOf(agents[0])), textOf(agents[0]));
+    check('*** beating-but-not-acting reads as STUCK, not healthy ***',
+      /STUCK/.test(textOf(agents[1])) && /stuck/.test(agents[1].className),
       `${textOf(agents[1])} | ${agents[1].className}`);
-    check('the silent one is named too', textOf(agents[1]).indexOf('coordinator-2') > -1, textOf(agents[1]));
+    check('...and never as "fine"', !/^.*working/.test(textOf(agents[1])), textOf(agents[1]));
+    check('...with how long it has done nothing', /for /.test(textOf(agents[1])), textOf(agents[1]));
+    check('the stuck one is named too', textOf(agents[1]).indexOf('coordinator-2') > -1, textOf(agents[1]));
     check('liveness is not conveyed by colour alone',
       textOf(agents[0]).indexOf('●') > -1 && textOf(agents[1]).indexOf('!') > -1,
       `${textOf(agents[0])} / ${textOf(agents[1])}`);

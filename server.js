@@ -361,6 +361,8 @@ function conversationSummaries() {
       lastText: '',
       spark: new Array(SPARK_BUCKETS).fill(0),
       sparkBucketMs: SPARK_BUCKET_MS,
+      lastActedAt: null,   // a claim or a result: proof an agent actually ran
+      oldestWaitingTs: null,
     });
   }
   for (const t of tasks.values()) {
@@ -371,7 +373,8 @@ function conversationSummaries() {
       // under a placeholder beats hiding the user's messages.
       a = { ...newConversation(id, id, null), counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
         messages: 0, lastTs: null, lastRole: null, lastText: '', missing: true,
-        spark: new Array(SPARK_BUCKETS).fill(0), sparkBucketMs: SPARK_BUCKET_MS };
+        spark: new Array(SPARK_BUCKETS).fill(0), sparkBucketMs: SPARK_BUCKET_MS,
+        lastActedAt: null, oldestWaitingTs: null };
       acc.set(id, a);
     }
     a.counts[t.status]++;
@@ -379,6 +382,12 @@ function conversationSummaries() {
     a.messages++;
     // Both halves of a turn count as activity — a conversation where the agent
     // is answering is busy, not idle.
+    for (const at of [t.claimedAt, t.resultTs]) {
+      if (at && (!a.lastActedAt || msOf(at) > msOf(a.lastActedAt))) a.lastActedAt = at;
+    }
+    if (t.status !== 'done' && (!a.oldestWaitingTs || msOf(t.ts) < msOf(a.oldestWaitingTs))) {
+      a.oldestWaitingTs = t.ts;
+    }
     const bIn = bucketOf(t.ts);
     if (bIn >= 0) a.spark[bIn]++;
     if (t.resultTs) {
@@ -403,18 +412,44 @@ function conversationSummaries() {
  * status page uses, so "watching" means the same thing in both places. Computed
  * outside the memo above because heartbeats arrive without changing the queue.
  */
-function agentLiveness(name) {
-  if (!name) return { state: 'unassigned', agoSec: null };
-  const h = HEARTBEATS.get(name);
-  if (!h) return { state: 'never', agoSec: null };
-  const agoSec = secSince(h.at);
-  const ms = agoSec * 1000;
-  return { state: ms <= WATCHING_MS ? 'watching' : ms <= SILENT_MS ? 'stale' : 'silent', agoSec };
+/*
+ * Per-conversation agent state, on the same evidence rules as the status page:
+ * a heartbeat is weak, a claim or a result is strong, and the judgement is made
+ * against whether work is actually waiting rather than against raw silence.
+ *
+ * `stuck` is the state that matters: checking in, but nothing done, while a
+ * message sits unanswered. That is precisely the shape of a hung agent, and it
+ * used to render as the healthiest thing on the page.
+ */
+function agentLiveness(c) {
+  const seenAgoSec = c.agent && HEARTBEATS.get(c.agent) ? secSince(HEARTBEATS.get(c.agent).at) : null;
+  const actedAgoSec = secSince(c.lastActedAt);
+  const waitingSec = secSince(c.oldestWaitingTs);
+  const base = { seenAgoSec, actedAgoSec, waitingSec };
+
+  if (!c.agent) return { ...base, state: 'unassigned' };
+  if (seenAgoSec === null && actedAgoSec === null) return { ...base, state: 'never' };
+
+  const idle = actedAgoSec === null ? Infinity : actedAgoSec;
+  const waited = waitingSec === null ? 0 : waitingSec;   // no waiting work = nothing is stalled
+  const stalled = waitingSec === null ? 0 : Math.min(idle, waited);
+  const beating = seenAgoSec !== null && seenAgoSec * 1000 <= WATCHING_MS;
+
+  if (stalled * 1000 > WAITING_GRACE_MS) {
+    // Work is genuinely sitting there with nothing happening.
+    if (beating) return { ...base, state: 'stuck' };
+    return { ...base, state: stalled * 1000 >= WAITING_ALARM_MS ? 'silent' : 'stale' };
+  }
+  if (beating || (actedAgoSec !== null && actedAgoSec * 1000 <= WATCHING_MS)) {
+    return { ...base, state: 'watching' };
+  }
+  // Nothing waiting and nobody talking: resting, not broken.
+  return { ...base, state: 'idle' };
 }
 
 /** Summaries plus live agent state — what the conversation list actually renders. */
 const conversationsWithLiveness = () =>
-  conversationSummaries().map((c) => ({ ...c, agentState: agentLiveness(c.agent) }));
+  conversationSummaries().map((c) => ({ ...c, agentState: agentLiveness(c) }));
 
 // ---------------------------------------------------------------- live stream
 /*
@@ -789,9 +824,16 @@ async function ttsRoute(req, res) {
  */
 const HEARTBEATS = new Map(); // agent -> { at, note }
 const MAX_AGENTS = 20;
-const WATCHING_MS = 60 * 1000; // a check-in this recent means someone is there
-const SILENT_MS = 10 * 60 * 1000; // ...and this stale means nobody is
-const WORRY_MS = 4 * 60 * 1000; // pending work + this much silence is a problem
+const WATCHING_MS = 60 * 1000; // a check-in this recent means *something* is there
+const SILENT_MS = 10 * 60 * 1000; // ...and this stale means nothing is
+/*
+ * Health is judged by whether WORK IS WAITING, not by raw silence. An agent
+ * quiet for an hour with an empty conversation is perfectly healthy; an agent
+ * quiet for a minute with an unanswered message in front of it is not. Fixed
+ * silence thresholds get this exactly backwards and cry wolf at idle.
+ */
+const WAITING_GRACE_MS = 60 * 1000; // normal latency: work this fresh is not a problem
+const WAITING_ALARM_MS = 5 * 60 * 1000; // work stalled this long is an alarm, not a warning
 const RECENT_N = 25; // activity rows returned
 const SAMPLE_N = 25; // most recent messages used for the timing sample
 
@@ -880,44 +922,66 @@ function derivedStatus() {
  * evidently alive — so the page still says something useful even if nobody ever
  * calls /heartbeat.
  */
+/*
+ * Is anyone actually working?
+ *
+ * TWO KINDS OF EVIDENCE, AND THEY ARE NOT EQUAL:
+ *
+ *   - "acted"     — a claim or a result. STRONG. Only an agent that genuinely
+ *                   ran and did something can produce one.
+ *   - "heartbeat" — a POST. WEAK. Anything with a socket can produce one, and
+ *                   in practice it usually comes from a background poll loop,
+ *                   which proves the LOOP is ticking and says nothing at all
+ *                   about whether the agent is awake.
+ *
+ * This was learned the hard way: a coordinator hung for eight minutes while the
+ * status page cheerfully showed it alive at "0s ago" the entire time, because
+ * its heartbeat came from a shell loop. Liveness read healthiest exactly when it
+ * was most stuck. So a fresh heartbeat is never treated as proof of health, and
+ * the divergence between "last seen" and "last acted" is surfaced explicitly —
+ * beating but not acting, with work waiting, is the most misleading state this
+ * page can be in and now has a name.
+ */
 function watchState(derived) {
   const agents = [...HEARTBEATS.entries()]
     .map(([name, h]) => ({ name, lastSeen: h.at, agoSec: secSince(h.at), note: h.note }))
     .sort((a, b) => a.agoSec - b.agoSec);
 
-  if (agents.length) {
-    const best = agents[0];
-    const ms = best.agoSec * 1000;
-    return {
-      agents,
-      source: 'heartbeat',
-      state: ms <= WATCHING_MS ? 'watching' : ms <= SILENT_MS ? 'stale' : 'silent',
-      agent: best.name,
-      agoSec: best.agoSec,
-    };
-  }
-
-  // Nobody has ever checked in. Did an agent *do* anything recently?
   const acted = [derived.lastClaimAt, derived.lastResultAt]
     .filter(Boolean)
     .sort((a, b) => msOf(b) - msOf(a))[0] || null;
+  const best = agents[0] || null;
+
   return {
-    agents: [],
-    source: acted ? 'inferred' : 'none',
-    state: acted && Date.now() - msOf(acted) <= SILENT_MS ? 'stale' : 'unknown',
-    agent: null,
-    agoSec: secSince(acted),
+    agents,
+    agent: best ? best.name : null,
+    // Strong evidence first: what an agent DID beats what it merely said.
+    evidence: acted ? 'acted' : (best ? 'heartbeat' : 'none'),
+    lastActedAt: acted,
+    lastActedAgoSec: secSince(acted),
+    lastSeenAt: best ? best.lastSeen : null,
+    lastSeenAgoSec: best ? best.agoSec : null,
+    // Kept for callers written against the previous shape.
+    source: acted ? 'inferred' : (best ? 'heartbeat' : 'none'),
+    agoSec: best ? best.agoSec : secSince(acted),
+    state: best && best.agoSec * 1000 <= WATCHING_MS ? 'watching'
+      : best && best.agoSec * 1000 <= SILENT_MS ? 'stale'
+        : best ? 'silent'
+          : acted && Date.now() - msOf(acted) <= SILENT_MS ? 'stale' : 'unknown',
   };
 }
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-const humanAgo = (sec) => {
-  if (sec === null || sec === undefined) return 'never';
-  if (sec < 60) return `${sec}s ago`;
-  if (sec < 3600) return `${Math.round(sec / 60)} min ago`;
-  if (sec < 86400) return `${Math.round(sec / 3600)}h ago`;
-  return `${Math.round(sec / 86400)}d ago`;
+/** A duration on its own: "7 min". Use when the sentence supplies "for". */
+const humanFor = (sec) => {
+  if (sec === null || sec === undefined) return 'a while';
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)} min`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
 };
+/** A point in the past: "7 min ago". */
+const humanAgo = (sec) => (sec === null || sec === undefined ? 'never' : `${humanFor(sec)} ago`);
 
 /*
  * The one line at the top of the page. Levels are deliberately coarse:
@@ -932,37 +996,51 @@ const humanAgo = (sec) => {
 function headline(c, watch, derived) {
   const waiting = c.pending + c.claimed;
   const oldestSec = derived.oldestWaiting ? secSince(derived.oldestWaiting.ts) : null;
-  const seen = watch.state === 'watching' || watch.state === 'stale' || watch.source === 'inferred';
+  const actedAgo = watch.lastActedAgoSec;
+  const seenAgo = watch.lastSeenAgoSec;
+  const beating = seenAgo !== null && seenAgo * 1000 <= WATCHING_MS;
 
+  // NOTHING IS WAITING. Quiet is not broken and must never be dressed up as an
+  // alarm — with no work to do, an agent that is not talking is simply resting.
   if (!waiting) {
-    if (watch.state === 'watching') return { level: 'ok', text: 'All caught up, and an agent is watching.' };
-    return {
-      level: 'idle',
-      text: seen ? 'All caught up. Nothing is waiting.' : 'Nothing is waiting.',
-    };
+    if (actedAgo !== null && actedAgo * 1000 <= SILENT_MS) {
+      return { level: 'ok', text: `All caught up. An agent was working ${humanAgo(actedAgo)}.` };
+    }
+    if (beating) return { level: 'ok', text: 'All caught up, and an agent is checking in.' };
+    return { level: 'idle', text: 'Nothing is waiting.' };
   }
 
   const what = c.pending
     ? `${plural(c.pending, 'message', 'messages')} waiting`
     : `${plural(c.claimed, 'message', 'messages')} being worked on`;
 
-  if (watch.state === 'watching') return { level: 'ok', text: `${what}, and an agent is watching.` };
-  if (watch.state === 'stale' && watch.agoSec * 1000 < WORRY_MS) {
-    return { level: 'ok', text: `${what}. Last checked in ${humanAgo(watch.agoSec)}.` };
-  }
-  if (oldestSec !== null && oldestSec * 1000 < WORRY_MS && !c.pending) {
-    return { level: 'ok', text: `${what}.` };
-  }
-  if (watch.source === 'none') {
+  /*
+   * How long has nothing actually HAPPENED while work sits there? Whichever is
+   * shorter: how long the oldest item has waited, or how long since an agent
+   * last did something. Heartbeats deliberately do not enter this calculation.
+   */
+  const idle = actedAgo === null ? Infinity : actedAgo;
+  const waited = oldestSec === null ? Infinity : oldestSec;
+  const stalledRaw = Math.min(idle, waited);
+  const stalled = Number.isFinite(stalledRaw) ? stalledRaw : (oldestSec !== null ? oldestSec : 0);
+
+  if (stalled * 1000 <= WAITING_GRACE_MS) return { level: 'ok', text: `${what}.` };
+
+  const level = stalled * 1000 >= WAITING_ALARM_MS ? 'alarm' : 'warn';
+
+  // THE MISLEADING ONE: still checking in, but nothing has actually been done.
+  // Worded so it reads as "stuck", never as "fine".
+  if (beating) {
     return {
-      level: oldestSec !== null && oldestSec * 1000 > WORRY_MS ? 'alarm' : 'warn',
-      text: `${what}, and no agent has ever checked in.`,
+      level,
+      text: `${watch.agent || 'An agent'} is still checking in but has done nothing for `
+        + `${humanFor(stalled)}, with ${what}. It looks stuck.`,
     };
   }
-  return {
-    level: watch.state === 'silent' || watch.state === 'unknown' ? 'alarm' : 'warn',
-    text: `${what}, and nothing has checked in for ${humanAgo(watch.agoSec)}.`,
-  };
+  if (watch.evidence === 'none') {
+    return { level, text: `${what}, and no agent has ever checked in.` };
+  }
+  return { level, text: `${what}, and nothing has happened for ${humanFor(stalled)}.` };
 }
 
 /*

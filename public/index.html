@@ -191,7 +191,10 @@
   .convagent { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; font-size: 12px; }
   .convagent .adot { flex: 0 0 auto; font-size: 11px; }
   .convagent.watching { color: #1a7f4b; }
+  .convagent.idle { color: var(--muted); }
   .convagent.stale { color: var(--off); }
+  /* Beating but not acting. This used to render as the healthiest row here. */
+  .convagent.stuck { color: var(--rec); font-weight: 700; }
   /* The one thing this list most needs to shout. Not hue alone: it also says
      "NOT RESPONDING" and swaps the glyph for an exclamation mark. */
   .convagent.silent { color: var(--rec); font-weight: 700; }
@@ -834,9 +837,17 @@
     return wrap;
   }
 
+  /*
+   * Wording matters here. "checking in" is not "working": a heartbeat can come
+   * from a background loop and prove nothing about whether the agent is awake.
+   * `stuck` is the state that used to look healthiest — beating steadily while
+   * a message sits unanswered — so it is the loudest thing in the list.
+   */
   var AGENT_STATE = {
-    watching: 'watching',
-    stale: 'quiet for a bit',
+    watching: 'working',
+    idle: 'idle, nothing waiting',
+    stuck: 'STUCK — checking in but doing nothing',
+    stale: 'not responding',
     silent: 'NOT RESPONDING',
     never: 'has never checked in',
     unassigned: 'nobody assigned'
@@ -853,11 +864,17 @@
     line.className = 'convagent ' + st.state;
     var dot = document.createElement('span');
     dot.className = 'adot';
-    dot.textContent = st.state === 'watching' ? '●' : st.state === 'stale' ? '◐' : st.state === 'silent' ? '!' : '○';
+    dot.textContent = st.state === 'watching' ? '●'
+      : st.state === 'stuck' ? '!'
+        : st.state === 'silent' || st.state === 'stale' ? '!'
+          : st.state === 'idle' ? '·' : '○';
     line.appendChild(dot);
     var label = c.agent ? c.agent + ' · ' + AGENT_STATE[st.state] : AGENT_STATE.unassigned;
-    if ((st.state === 'stale' || st.state === 'silent') && st.agoSec !== null) {
-      label += ' (' + rel(new Date(Date.now() - st.agoSec * 1000).toISOString()) + ')';
+    // For the states that mean trouble, say how long — "stuck" is only credible
+    // with a duration attached, and it is the number that makes it actionable.
+    if ((st.state === 'stuck' || st.state === 'stale' || st.state === 'silent')
+      && st.actedAgoSec !== null && st.actedAgoSec !== undefined) {
+      label += ' for ' + rel(new Date(Date.now() - st.actedAgoSec * 1000).toISOString());
     }
     var name = document.createElement('span'); // spacing comes from the flex gap
     name.textContent = label;
@@ -1079,16 +1096,26 @@
     // --- the headline ---
     var head = el('div', 'shead ' + ((s.headline && s.headline.level) || 'idle'));
     head.appendChild(el('div', null, (s.headline && s.headline.text) || 'Status unavailable.'));
+    /*
+     * Both kinds of evidence, always, and never conflated. "Last checked in" is
+     * a heartbeat, which anything with a socket can send; "last did something"
+     * is a claim or a result, which only a running agent can produce. Showing
+     * them side by side is what makes a stuck agent visible — beating at 2s
+     * while having done nothing for 8 minutes.
+     */
     var w = s.watch || {};
-    var sub;
-    if (w.source === 'heartbeat') {
-      sub = w.agent + ' checked in ' + ago(w.agoSec) + '.';
-    } else if (w.source === 'inferred') {
-      sub = 'No agent reports in, but one was working ' + ago(w.agoSec) + '.';
+    var sub = [];
+    if (w.lastActedAgoSec !== null && w.lastActedAgoSec !== undefined) {
+      sub.push('Last did something ' + ago(w.lastActedAgoSec) + '.');
     } else {
-      sub = 'No agent has ever reported in here.';
+      sub.push('No agent has done anything here yet.');
     }
-    head.appendChild(el('div', 'ssub', sub));
+    if (w.lastSeenAgoSec !== null && w.lastSeenAgoSec !== undefined) {
+      sub.push((w.agent || 'An agent') + ' last checked in ' + ago(w.lastSeenAgoSec) + '.');
+    } else {
+      sub.push('Nothing is sending heartbeats.');
+    }
+    head.appendChild(el('div', 'ssub', sub.join(' ')));
     frag.appendChild(head);
 
     if (sawRestart) {

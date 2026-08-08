@@ -250,31 +250,37 @@ async function statusChecks() {
     check('*** a quiet queue is NEVER an alarm ***', s.headline.level !== 'alarm' && s.headline.level !== 'warn',
       s.headline.text);
     check('and it says so in plain words', /nothing is waiting/i.test(s.headline.text), s.headline.text);
-    check('it admits nobody has checked in', s.watch.source === 'none', JSON.stringify(s.watch));
+    check('it admits nobody has checked in', s.watch.evidence === 'none', JSON.stringify(s.watch));
     check('there is nothing to measure yet', s.responsiveness.timeToAnswerSec === null);
     check('and nothing waiting', s.responsiveness.oldestWaiting === null);
 
-    console.log('\nstatus — waiting work with nobody listening is an alarm');
+    console.log('\nstatus — brand new work is normal latency, not a problem');
     await postAt(base, '/tasks', { text: 'is anyone there?' });
     s = await getAt(base, '/status?engines=0');
-    check('a waiting message with no agent is raised', s.headline.level === 'warn' || s.headline.level === 'alarm',
+    check('a message that just arrived is not an alarm', s.headline.level === 'ok',
       `${s.headline.level}: ${s.headline.text}`);
-    check('it names the problem', /no agent has ever checked in/i.test(s.headline.text), s.headline.text);
     check('the oldest waiting message is reported', !!s.responsiveness.oldestWaiting
       && s.responsiveness.oldestWaiting.text === 'is anyone there?');
     check('with how long it has been waiting',
       typeof s.responsiveness.oldestWaiting.waitingSec === 'number');
 
-    console.log('\nstatus — a heartbeat changes the answer');
+    console.log('\nstatus — a heartbeat is WEAK evidence, and is not proof of health');
     const hb = await postAt(base, '/heartbeat', { agent: 'coordinator', note: 'polling' });
     check('a heartbeat is accepted', hb.status === 200 && hb.body.ok === true);
     s = await getAt(base, '/status?engines=0');
-    check('the same queue now reads as fine', s.headline.level === 'ok',
-      `${s.headline.level}: ${s.headline.text}`);
-    check('it says an agent is watching', /an agent is watching/i.test(s.headline.text), s.headline.text);
     check('the agent is named', s.watch.agents[0] && s.watch.agents[0].name === 'coordinator');
     check('with its note', s.watch.agents[0].note === 'polling');
-    check('and the source is the heartbeat, not a guess', s.watch.source === 'heartbeat');
+    check('*** a heartbeat alone never counts as having acted ***',
+      s.watch.evidence === 'heartbeat' && s.watch.lastActedAt === null, JSON.stringify(s.watch));
+    check('last-seen and last-acted are reported separately',
+      s.watch.lastSeenAgoSec !== null && s.watch.lastActedAgoSec === null, JSON.stringify(s.watch));
+
+    console.log('\nstatus — acting is STRONG evidence and outranks a heartbeat');
+    const acted = await postAt(base, '/tasks', { text: 'claim me' });
+    await postAt(base, `/tasks/${acted.body.id}/claim`, { by: 'coordinator' });
+    s = await getAt(base, '/status?engines=0');
+    check('doing something outranks saying something', s.watch.evidence === 'acted', JSON.stringify(s.watch));
+    check('and it is timed', typeof s.watch.lastActedAgoSec === 'number');
 
     console.log('\nstatus — the rest of the picture');
     const made = await postAt(base, '/tasks', { text: 'answer me' });
@@ -300,6 +306,79 @@ async function statusChecks() {
     check('*** heartbeats are never written to the durable log ***',
       fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8') === before,
       'the event log grew — one line per poll would bury the real history');
+  } finally {
+    await stop(proc);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
+  }
+
+  await stuckChecks();
+}
+
+/*
+ * The state that used to lie.
+ *
+ * A coordinator hung for eight minutes while /status showed it alive at "0s
+ * ago" the whole time, because its heartbeat came from a background shell loop:
+ * the beat proved the loop was ticking, not that the agent was awake. Liveness
+ * read healthiest exactly when it was most stuck.
+ *
+ * Seeded with a back-dated unanswered message so the queue is genuinely stalled
+ * while the heartbeat is perfectly fresh.
+ */
+async function stuckChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-stuck-'));
+  const port = PORT + 2;
+  const base = `http://127.0.0.1:${port}`;
+  const stale = new Date(Date.now() - 9 * 60 * 1000).toISOString();
+  fs.writeFileSync(path.join(dir, 'events.jsonl'), JSON.stringify({
+    t: 'create',
+    task: {
+      id: 'stuck-1', role: 'user', conversationId: 'main', instruction: 'answer me please',
+      from: 'web', ts: stale, status: 'pending', claimedBy: null, claimedAt: null,
+      result: null, resultTs: null, relayed: false, relayedAt: null,
+    },
+  }) + '\n');
+
+  const proc = spawn(process.execPath, [SERVER], {
+    env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout.on('data', () => {});
+  try {
+    for (let i = 0; i < 100; i++) {
+      try { if ((await fetch(`${base}/health`)).ok) break; } catch { /* not up */ }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await postAt(base, '/conversations/main', { agent: 'coordinator' });
+    await postAt(base, '/heartbeat', { agent: 'coordinator', note: 'still here!' });
+
+    console.log('\nstatus — beating but not acting is the state that used to lie');
+    const s = await getAt(base, '/status?engines=0');
+    check('*** a fresh heartbeat does NOT make a stalled queue look healthy ***',
+      s.headline.level !== 'ok' && s.headline.level !== 'idle',
+      `${s.headline.level}: ${s.headline.text}`);
+    check('it says the agent looks stuck', /looks stuck/i.test(s.headline.text), s.headline.text);
+    check('...and names it', /coordinator/.test(s.headline.text), s.headline.text);
+    check('...and never calls it fine', !/all caught up|is watching/i.test(s.headline.text), s.headline.text);
+    check('the heartbeat is still reported, just not believed',
+      s.watch.lastSeenAgoSec !== null && s.watch.lastSeenAgoSec < 60, JSON.stringify(s.watch.lastSeenAgoSec));
+    check('and last-acted shows the truth', s.watch.lastActedAt === null, JSON.stringify(s.watch.lastActedAt));
+
+    const cs = (await getAt(base, '/conversations')).conversations.find((x) => x.id === 'main');
+    check('the conversation list agrees it is stuck',
+      cs && cs.agentState && cs.agentState.state === 'stuck', JSON.stringify(cs && cs.agentState));
+    check('...and carries both timings', cs.agentState.seenAgoSec !== null,
+      JSON.stringify(cs.agentState));
+
+    console.log('\nstatus — the same silence with NOTHING waiting is healthy');
+    await postAt(base, `/tasks/stuck-1/result`, { result: 'answered at last' });
+    const t = await getAt(base, '/status?engines=0');
+    check('answering it clears the alarm', t.headline.level === 'ok',
+      `${t.headline.level}: ${t.headline.text}`);
+    const cs2 = (await getAt(base, '/conversations')).conversations.find((x) => x.id === 'main');
+    check('*** an idle agent with an empty queue is not "stuck" ***',
+      cs2.agentState.state !== 'stuck' && cs2.agentState.state !== 'silent',
+      JSON.stringify(cs2.agentState));
   } finally {
     await stop(proc);
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
