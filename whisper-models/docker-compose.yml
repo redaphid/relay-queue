@@ -1,0 +1,83 @@
+# Extra whisper engines, one container per model — the thing that lets the config
+# page's model dropdown actually switch anything.
+#
+# WHY THIS EXISTS RATHER THAN "recreate the whisper container with new args":
+# switching a model by rewriting a container's arguments needs Docker control, and
+# the only way to give relay-queue that is to mount /var/run/docker.sock into it.
+# relay-queue has no authentication of its own, so that would hand root-equivalent
+# control of this host to anyone who can reach port 3901. Running every model at
+# once and choosing which port to talk to needs no Docker access at all: the
+# "switch" is a number in a settings file. Idle RAM is the price, and this machine
+# has 62 GB of it.
+#
+# The tiny-int8 engine is NOT here. It belongs to the `homeassistant` compose
+# project (/home/hypnodroid/Projects/homeassistant/docker-compose.yml), is shared
+# with Home Assistant's own voice pipeline, and is left strictly alone — relay-queue
+# reaches it the way it always has, via host.docker.internal:10300.
+#
+#   docker compose -f whisper-models/docker-compose.yml up -d      # start
+#   docker compose -f whisper-models/docker-compose.yml down       # undo, completely
+#
+# The project name is pinned below so those commands behave identically from a
+# worktree and from the live checkout.
+name: whisper-models
+
+# EVERY SERVICE BELOW SETS --cpu-threads. The image's default is 4, on a host with
+# 32 — so the default leaves most of the machine idle while the human waits. This
+# is the cheapest latency win available and it costs nothing but a flag. All of
+# these are CPU inference (CTranslate2 int8); nothing here touches the GPU, which
+# is separately at ~90% for ComfyUI/ollama and must not be contended.
+x-whisper: &whisper
+  image: rhasspy/wyoming-whisper
+  restart: unless-stopped
+  networks:
+    # relay-queue's own network, joined from outside. No `ports:` stanza anywhere
+    # in this file, on purpose — nothing is published to the host, so these
+    # engines are reachable only from containers already on that network. That is
+    # strictly less exposed than the pre-existing tiny engine, which publishes
+    # 10300 on 0.0.0.0.
+    - relay
+
+services:
+  # Middle of the ladder: better than tiny on proper nouns and punctuation.
+  whisper-base:
+    <<: *whisper
+    container_name: whisper-base
+    command: ["--model", "base-int8", "--language", "en", "--cpu-threads", "8"]
+    volumes:
+      - whisper-base-data:/data
+
+  whisper-small:
+    <<: *whisper
+    container_name: whisper-small
+    command: ["--model", "small-int8", "--language", "en", "--cpu-threads", "8"]
+    volumes:
+      - whisper-small-data:/data
+
+  whisper-medium:
+    <<: *whisper
+    container_name: whisper-medium
+    command: ["--model", "medium-int8", "--language", "en", "--cpu-threads", "16"]
+    volumes:
+      - whisper-medium-data:/data
+
+  # The accurate end. `large-v3` is not one of rhasspy's `-int8` aliases, so the
+  # quantisation is asked for explicitly: without --compute-type this would load
+  # in float and be far slower still on CPU.
+  whisper-large:
+    <<: *whisper
+    container_name: whisper-large
+    command: ["--model", "large-v3", "--compute-type", "int8", "--language", "en", "--cpu-threads", "16"]
+    volumes:
+      - whisper-large-data:/data
+
+volumes:
+  whisper-base-data:
+  whisper-small-data:
+  whisper-medium-data:
+  whisper-large-data:
+
+networks:
+  relay:
+    external: true
+    name: relay-queue_default

@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>relay-queue — settings</title>
+<!--
+  The settings page. Its own file and its own route (/config) rather than a panel
+  inside index.html: that page is large and edited constantly, and this one is read
+  rarely, alone, and deliberately.
+
+  Two things live here, and they are the two things that are a matter of taste
+  rather than correctness:
+
+    1. WHICH SPEECH MODEL transcribes dictation. Accuracy against latency, and
+       nobody but the person doing the talking can pick the right point on that
+       curve. So the page does not argue about it — it lets you record your own
+       voice once and shows you what every model heard and how long each took.
+
+    2. THE ENDPOINTING THRESHOLDS that decide when you have stopped speaking.
+
+  Switching model does NOT recreate a container, and this page has no Docker access
+  of any kind — see the long note in server.js. Every model is already running; the
+  setting picks which one to talk to.
+-->
+<style>
+  /* Same tokens as index.html, so the two pages are obviously one app. */
+  :root {
+    --hue: 217; --hue2: 267;
+    --bg:#f4f6f8; --fg:#14161a; --muted:#667085; --line:#dfe3e8; --panel:#ffffff;
+    --accent: hsl(var(--hue) 78% 48%);
+    --accent-soft: hsl(var(--hue) 78% 48% / .10);
+    --accent-grad: linear-gradient(135deg, hsl(var(--hue) 84% 54%), hsl(var(--hue2) 76% 56%));
+    --err-fg:#8a2018; --err-bg:#fdeceb; --off:#c2410c; --rec:#c0271d;
+    --ok-bg:#a7f3d0; --ok-fg:#053f2c;
+    --warn-bg:#fde68a; --warn-fg:#5c3d00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0e1116; --fg:#e6e8ec; --muted:#98a2b3; --line:#242a35; --panel:#141922;
+      --accent: hsl(var(--hue) 80% 62%);
+      --accent-soft: hsl(var(--hue) 80% 62% / .16);
+      --accent-grad: linear-gradient(135deg, hsl(var(--hue) 72% 52%), hsl(var(--hue2) 66% 54%));
+      --err-fg:#ffb4ab; --err-bg:#3a1714; --off:#fdba74; --rec:#e5484d;
+      --ok-bg:#6ee7b7; --ok-fg:#04301f;
+      --warn-bg:#facc15; --warn-fg:#3a2800;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    padding: max(10px, env(safe-area-inset-top)) 14px 10px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  header::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: -3px; height: 3px;
+    background: var(--accent-grad);
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; flex: 1; }
+  a.back {
+    color: var(--accent); text-decoration: none; font-weight: 600;
+    padding: 8px 10px; margin: -8px 0 -8px -10px; border-radius: 8px;
+  }
+  a.back:hover { background: var(--accent-soft); }
+  main { max-width: 760px; margin: 0 auto; padding: 16px 14px 64px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px; margin-bottom: 18px;
+  }
+  h2 { font-size: 15px; margin: 0 0 4px; font-weight: 650; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  label { display: block; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+  select, input[type=number] {
+    font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; width: 100%;
+  }
+  select:focus-visible, input:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+    border-radius: 10px; padding: 10px 14px; min-height: 44px;
+  }
+  button.primary { background: var(--accent-grad); color: #fff; border-color: transparent; }
+  button[disabled] { opacity: .5; cursor: default; }
+  button.rec { background: var(--rec); color: #fff; border-color: transparent; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .grow { flex: 1; min-width: 0; }
+  .note {
+    font-size: 13px; color: var(--muted); margin-top: 10px;
+  }
+  .pill {
+    display: inline-block; font-size: 12px; font-weight: 700; padding: 2px 8px;
+    border-radius: 999px; vertical-align: 1px;
+  }
+  .pill.ok { background: var(--ok-bg); color: var(--ok-fg); }
+  .pill.bad { background: var(--err-bg); color: var(--err-fg); }
+  .banner {
+    border-radius: 10px; padding: 10px 12px; font-size: 13.5px; margin-bottom: 14px;
+  }
+  .banner.warn { background: var(--warn-bg); color: var(--warn-fg); }
+  .banner.err { background: var(--err-bg); color: var(--err-fg); }
+  .banner.ok { background: var(--ok-bg); color: var(--ok-fg); }
+  .banner code, .note code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px;
+  }
+  pre {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px; overflow-x: auto; font-size: 12.5px; margin: 8px 0 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 700; }
+  td.ms { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 650; }
+  tr.active { background: var(--accent-soft); }
+  .heard { color: var(--fg); }
+  .heard.empty { color: var(--muted); font-style: italic; }
+  .knob { padding: 14px 0; border-bottom: 1px solid var(--line); }
+  .knob:last-of-type { border-bottom: 0; }
+  .knob .help { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .knob .ctl { display: flex; gap: 12px; align-items: center; }
+  .knob input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); height: 34px; }
+  .knob .val { width: 108px; flex: none; }
+  .knob .changed { color: var(--accent); font-weight: 700; }
+  .meter { height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; margin-top: 10px; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--rec); transition: width .08s linear; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/" title="Back to the queue">&larr; Queue</a>
+  <h1>Settings</h1>
+</header>
+
+<main>
+  <div id="loaderr" class="banner err hidden"></div>
+
+  <!-- ------------------------------------------------------ speech model -->
+  <section>
+    <h2>Speech model</h2>
+    <p class="sub">
+      Which whisper engine transcribes your dictation. Bigger models are more accurate and slower.
+      All of them are running already, so switching is instant &mdash; it only changes which one is asked.
+    </p>
+
+    <label for="model">Model used for dictation</label>
+    <select id="model" disabled><option>Loading&hellip;</option></select>
+    <div class="note" id="modelinfo"></div>
+    <div id="modelmsg" class="banner ok hidden" style="margin:12px 0 0"></div>
+  </section>
+
+  <!-- ---------------------------------------------------- compare models -->
+  <section>
+    <h2>Hear the difference</h2>
+    <p class="sub">
+      Record one phrase and every model transcribes that same recording. You get the real numbers for
+      your voice, your room and this machine &mdash; which is the only way to pick a point on the
+      accuracy-versus-speed trade honestly.
+    </p>
+
+    <div class="row">
+      <button id="rec" class="primary">Record a phrase</button>
+      <button id="again" class="hidden">Re-run on the last recording</button>
+      <span id="recstate" class="note" style="margin:0"></span>
+    </div>
+    <div class="meter hidden" id="metwrap"><i id="met"></i></div>
+    <div id="recerr" class="banner err hidden" style="margin:12px 0 0"></div>
+
+    <table id="cmp" class="hidden">
+      <thead><tr><th>Model</th><th>Time</th><th>What it heard</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="note" id="cmpnote"></p>
+  </section>
+
+  <!-- -------------------------------------------------- dictation timing -->
+  <section>
+    <h2>Dictation timing</h2>
+    <p class="sub">
+      When dictation decides you have finished speaking. These are the knobs worth turning by feel:
+      if it keeps cutting you off mid-thought, or never stops listening in a noisy room, they are why.
+    </p>
+
+    <div id="hookwarn" class="banner warn hidden"></div>
+    <div id="knobs"></div>
+
+    <div class="row" style="margin-top:16px">
+      <button id="save" class="primary" disabled>Save timing</button>
+      <button id="reset">Reset to defaults</button>
+      <span id="savestate" class="note" style="margin:0"></span>
+    </div>
+  </section>
+
+  <p class="note">
+    Saved on the server in <code>data/settings.json</code>, so these travel with the machine rather than
+    the browser &mdash; the same settings apply from your phone and your desktop.
+  </p>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- helpers
+  var $ = function (id) { return document.getElementById(id); };
+
+  /** Milliseconds a human can read at a glance. */
+  function ms(n) {
+    if (n === null || n === undefined) return '—';
+    return n < 1000 ? Math.round(n) + ' ms' : (n / 1000).toFixed(1) + ' s';
+  }
+
+  function show(el, kind, html) {
+    el.className = 'banner ' + kind;
+    el.innerHTML = html;
+  }
+
+  function text(s) {
+    var d = document.createElement('div');
+    d.textContent = s === null || s === undefined ? '' : String(s);
+    return d.innerHTML;
+  }
+
+  /** fetch + JSON, turning any non-2xx into a rejection carrying the server's message. */
+  function api(path, opts) {
+    return fetch(path, opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) throw new Error(body && body.error ? body.error : r.status + ' ' + r.statusText);
+        return body;
+      });
+    });
+  }
+
+  var state = { settings: null, models: [], knobs: null, defaults: null, lastPcm: null, lastRate: 16000 };
+
+  // ---------------------------------------------------------------- load
+  function load() {
+    return api('/settings').then(function (d) {
+      state.settings = d.settings;
+      state.models = d.models;
+      state.knobs = d.knobs;
+      state.defaults = d.defaults;
+      drawModels();
+      drawKnobs();
+      $('loaderr').className = 'banner err hidden';
+    }).catch(function (e) {
+      show($('loaderr'), 'err', 'Could not load settings: ' + text(e.message));
+      $('loaderr').className = 'banner err';
+    });
+  }
+
+  // ---------------------------------------------------------------- models
+  function drawModels() {
+    var sel = $('model');
+    sel.innerHTML = '';
+    state.models.forEach(function (m) {
+      var o = document.createElement('option');
+      o.value = m.id;
+      // An unreachable engine stays visible but unselectable. Hiding it would make
+      // "the model I wanted is gone" indistinguishable from "it was never offered".
+      o.textContent = m.label + (m.reachable ? '' : ' — not responding');
+      o.disabled = !m.reachable;
+      if (m.id === state.settings.sttModel) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.disabled = false;
+    describeModel();
+  }
+
+  function describeModel() {
+    var m = state.models.filter(function (x) { return x.id === $('model').value; })[0];
+    if (!m) { $('modelinfo').innerHTML = ''; return; }
+    var pill = m.reachable
+      ? '<span class="pill ok">running</span>'
+      : '<span class="pill bad">not responding</span>';
+    $('modelinfo').innerHTML = pill + ' ' + text(m.blurb) +
+      '<br><code>' + text(m.endpoint) + '</code>' +
+      (m.error ? ' — ' + text(m.error) : '');
+  }
+
+  $('model').addEventListener('change', function () {
+    describeModel();
+    var id = $('model').value;
+    var msg = $('modelmsg');
+    msg.className = 'banner ok';
+    msg.textContent = 'Saving…';
+    api('/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sttModel: id })
+    }).then(function (d) {
+      state.settings = d.settings;
+      var m = state.models.filter(function (x) { return x.id === id; })[0];
+      show(msg, 'ok', 'Saved. Dictation now uses <b>' + text(m ? m.label : id) + '</b>.');
+      markActiveRow();
+    }).catch(function (e) {
+      show(msg, 'err', text(e.message));
+      // Put the control back on what is actually saved, so the page never shows a
+      // selection the server did not accept.
+      $('model').value = state.settings.sttModel;
+      describeModel();
+    });
+  });
+
+  // ---------------------------------------------------------------- compare
+  /*
+   * Record once, transcribe on every reachable model. The same bytes go to each,
+   * so the only variable is the model — which is what makes the comparison worth
+   * anything.
+   *
+   * Capture is deliberately manual (press to start, press to stop) rather than
+   * reusing the main page's voice-activity endpointing: here the point is to
+   * measure the models, and automatic endpointing would put its own thresholds
+   * between you and the answer.
+   */
+  var WORKLET = 'class P extends AudioWorkletProcessor{' +
+    'constructor(o){super();this.n=o.processorOptions.n;this.b=new Float32Array(this.n);this.i=0;}' +
+    'process(ins){var c=ins[0]&&ins[0][0];if(!c)return true;' +
+    'for(var k=0;k<c.length;k++){this.b[this.i++]=c[k];' +
+    'if(this.i===this.n){this.port.postMessage(this.b);this.b=new Float32Array(this.n);this.i=0;}}' +
+    'return true;}}' +
+    'registerProcessor("pcm",P);';
+
+  var RATE = 16000, FRAME = 512, MAX_MS = 20000;
+  var rec = null; // { ctx, stream, node, blocks, rate, timer }
+
+  // Box average rather than plain picking: downsampling without it aliases badly.
+  function resample(x, inRate, outRate) {
+    if (inRate === outRate) return x;
+    var ratio = inRate / outRate;
+    var out = new Float32Array(Math.floor(x.length / ratio));
+    for (var i = 0; i < out.length; i++) {
+      var a = Math.floor(i * ratio);
+      var b = Math.min(Math.max(Math.floor((i + 1) * ratio), a + 1), x.length);
+      var sum = 0;
+      for (var j = a; j < b; j++) sum += x[j];
+      out[i] = sum / (b - a);
+    }
+    return out;
+  }
+
+  function toInt16(f) {
+    var dv = new DataView(new ArrayBuffer(f.length * 2));
+    for (var i = 0; i < f.length; i++) {
+      var v = f[i] < -1 ? -1 : f[i] > 1 ? 1 : f[i];
+      dv.setInt16(i * 2, Math.round(v < 0 ? v * 32768 : v * 32767), true); // little-endian
+    }
+    return dv.buffer;
+  }
+
+  function rms(f) {
+    var s = 0;
+    for (var i = 0; i < f.length; i++) s += f[i] * f[i];
+    return Math.sqrt(s / (f.length || 1));
+  }
+
+  function capture(ctx, source, onFrame) {
+    // AudioWorklet where it exists; ScriptProcessor is the fallback for older
+    // Safari, which is a real phone this page gets opened on.
+    function legacy() {
+      if (!ctx.createScriptProcessor) return Promise.reject(new Error('no audio capture API in this browser'));
+      var node = ctx.createScriptProcessor(4096, 1, 1);
+      node.onaudioprocess = function (e) { onFrame(new Float32Array(e.inputBuffer.getChannelData(0))); };
+      source.connect(node);
+      // ScriptProcessor only runs when connected to a destination; a zero gain
+      // node keeps the microphone from being played back into the room.
+      var mute = ctx.createGain();
+      mute.gain.value = 0;
+      node.connect(mute);
+      mute.connect(ctx.destination);
+      return Promise.resolve(node);
+    }
+    if (!ctx.audioWorklet || !window.Blob || !window.URL || !URL.createObjectURL) return legacy();
+    var url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+    return ctx.audioWorklet.addModule(url).then(function () {
+      URL.revokeObjectURL(url);
+      var node = new AudioWorkletNode(ctx, 'pcm', { numberOfInputs: 1, outputChannelCount: [1], processorOptions: { n: FRAME } });
+      node.port.onmessage = function (e) { onFrame(e.data); };
+      source.connect(node);
+      return node;
+    }).catch(legacy);
+  }
+
+  function startRec() {
+    $('recerr').className = 'banner err hidden';
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return fail('This browser will not give a page the microphone. Over plain HTTP that is usually the reason — open this page over HTTPS.');
+    }
+    navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (stream) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      var ctx;
+      try { ctx = new AC({ sampleRate: RATE }); } catch (e) { ctx = new AC(); }
+      var source = ctx.createMediaStreamSource(stream);
+      var blocks = [];
+      return capture(ctx, source, function (f) {
+        blocks.push(f);
+        $('met').style.width = Math.min(100, Math.round(rms(f) * 400)) + '%';
+      }).then(function (node) {
+        rec = { ctx: ctx, stream: stream, node: node, blocks: blocks, rate: ctx.sampleRate };
+        rec.timer = setTimeout(stopRec, MAX_MS);
+        $('rec').textContent = 'Stop and compare';
+        $('rec').className = 'rec';
+        $('recstate').textContent = 'Listening — say a sentence with a name or a technical word in it.';
+        $('metwrap').className = 'meter';
+      });
+    }).catch(function (e) {
+      fail(e && e.name === 'NotAllowedError'
+        ? 'Microphone permission was refused.'
+        : 'Could not start the microphone: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  function fail(m) {
+    show($('recerr'), 'err', text(m));
+    $('recerr').className = 'banner err';
+    resetRecUi();
+  }
+
+  function resetRecUi() {
+    $('rec').textContent = 'Record a phrase';
+    $('rec').className = 'primary';
+    $('rec').disabled = false;
+    $('metwrap').className = 'meter hidden';
+    $('met').style.width = '0';
+  }
+
+  function stopRec() {
+    if (!rec) return;
+    var r = rec;
+    rec = null;
+    clearTimeout(r.timer);
+    try { r.node.disconnect(); } catch (e) {}
+    try { r.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { r.ctx.close(); } catch (e) {}
+
+    var total = r.blocks.reduce(function (n, b) { return n + b.length; }, 0);
+    var flat = new Float32Array(total), w = 0;
+    r.blocks.forEach(function (b) { flat.set(b, w); w += b.length; });
+    resetRecUi();
+
+    if (total / r.rate < 0.4) return fail('That was too short to judge anything by — try a whole sentence.');
+
+    state.lastPcm = toInt16(resample(flat, r.rate, RATE));
+    state.lastRate = RATE;
+    runCompare();
+  }
+
+  function runCompare() {
+    var pcm = state.lastPcm;
+    if (!pcm) return;
+    var secs = (pcm.byteLength / 2 / RATE);
+    $('recstate').textContent = '';
+    $('again').className = '';
+    $('cmp').className = '';
+    $('cmpnote').textContent = 'Same ' + secs.toFixed(1) + ' s recording through each model, one at a time.';
+
+    var body = $('cmp').querySelector('tbody');
+    body.innerHTML = '';
+    var usable = state.models.filter(function (m) { return m.reachable; });
+    var rows = {};
+    usable.forEach(function (m) {
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td><b>' + text(m.label) + '</b></td><td class="ms">…</td>' +
+        '<td class="heard empty">waiting</td><td></td>';
+      tr.dataset.model = m.id;
+      body.appendChild(tr);
+      rows[m.id] = tr;
+    });
+    markActiveRow();
+
+    $('rec').disabled = true;
+    $('again').disabled = true;
+
+    // Strictly one at a time. Run in parallel and every model would be competing
+    // for the same CPU, and the timings — the entire point of this table — would
+    // be measuring the contention rather than the models.
+    var i = 0;
+    (function next() {
+      if (i >= usable.length) {
+        $('rec').disabled = false;
+        $('again').disabled = false;
+        return;
+      }
+      var m = usable[i++];
+      var tr = rows[m.id];
+      tr.children[1].textContent = 'running…';
+      var t0 = Date.now();
+      fetch('/stt?model=' + encodeURIComponent(m.id) + '&rate=' + RATE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: pcm
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (d) {
+          if (!r.ok) throw new Error(d && d.error ? d.error : r.status + ' ' + r.statusText);
+          return d;
+        });
+      }).then(function (d) {
+        // The server's own tookMs is the engine time; the wall clock here also
+        // includes shipping the audio, which is what you actually wait for.
+        tr.children[1].innerHTML = text(ms(d.tookMs)) +
+          '<br><span class="note" style="font-weight:400">' + text(ms(Date.now() - t0)) + ' end to end</span>';
+        var heard = (d.text || '').trim();
+        tr.children[2].className = 'heard' + (heard ? '' : ' empty');
+        tr.children[2].textContent = heard || 'heard nothing';
+        if (m.id !== state.settings.sttModel) {
+          var b = document.createElement('button');
+          b.textContent = 'Use this';
+          b.style.padding = '6px 10px';
+          b.style.minHeight = '0';
+          b.onclick = function () { $('model').value = m.id; $('model').dispatchEvent(new Event('change')); };
+          tr.children[3].innerHTML = '';
+          tr.children[3].appendChild(b);
+        }
+      }).catch(function (e) {
+        tr.children[1].textContent = 'failed';
+        tr.children[2].className = 'heard empty';
+        tr.children[2].textContent = e.message;
+      }).then(next);
+    })();
+  }
+
+  function markActiveRow() {
+    var rows = $('cmp').querySelectorAll('tbody tr');
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].className = rows[i].dataset.model === state.settings.sttModel ? 'active' : '';
+    }
+  }
+
+  $('rec').addEventListener('click', function () { rec ? stopRec() : startRec(); });
+  $('again').addEventListener('click', runCompare);
+
+  // ---------------------------------------------------------------- knobs
+  function drawKnobs() {
+    var wrap = $('knobs');
+    wrap.innerHTML = '';
+    Object.keys(state.knobs).forEach(function (key) {
+      var spec = state.knobs[key];
+      var val = state.settings.dictation[key];
+      var d = document.createElement('div');
+      d.className = 'knob';
+      d.innerHTML =
+        '<label for="k_' + key + '">' + text(spec.label) +
+          ' <span class="note" style="font-weight:400">(' + text(key) + ')</span></label>' +
+        '<div class="ctl">' +
+          '<input type="range" id="k_' + key + '" min="' + spec.min + '" max="' + spec.max +
+            '" step="' + spec.step + '" value="' + val + '">' +
+          '<input type="number" class="val" id="n_' + key + '" min="' + spec.min + '" max="' + spec.max +
+            '" step="' + spec.step + '" value="' + val + '">' +
+        '</div>' +
+        '<div class="help">' + text(spec.help) + '</div>';
+      wrap.appendChild(d);
+
+      var r = d.querySelector('#k_' + key), n = d.querySelector('#n_' + key);
+      // The slider is for feel, the number box is for a value you already know.
+      // They are two views of one setting, so each writes through to the other.
+      r.addEventListener('input', function () { n.value = r.value; dirty(); });
+      n.addEventListener('input', function () { r.value = n.value; dirty(); });
+    });
+    dirty();
+    checkHook();
+  }
+
+  function readKnobs() {
+    var out = {};
+    Object.keys(state.knobs).forEach(function (key) { out[key] = Number($('n_' + key).value); });
+    return out;
+  }
+
+  function dirty() {
+    var cur = readKnobs(), changed = false;
+    Object.keys(cur).forEach(function (k) { if (cur[k] !== state.settings.dictation[k]) changed = true; });
+    $('save').disabled = !changed;
+    $('savestate').textContent = changed ? 'Unsaved changes' : '';
+  }
+
+  $('save').addEventListener('click', function () {
+    $('save').disabled = true;
+    $('savestate').textContent = 'Saving…';
+    api('/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dictation: readKnobs() })
+    }).then(function (d) {
+      state.settings = d.settings;
+      $('savestate').textContent = 'Saved.';
+      dirty();
+    }).catch(function (e) {
+      $('savestate').textContent = e.message;
+      $('save').disabled = false;
+    });
+  });
+
+  $('reset').addEventListener('click', function () {
+    Object.keys(state.knobs).forEach(function (key) {
+      $('k_' + key).value = state.defaults.dictation[key];
+      $('n_' + key).value = state.defaults.dictation[key];
+    });
+    dirty();
+  });
+
+  /*
+   * Does the main page actually read these yet?
+   *
+   * The timing knobs live in the `V` block of index.html and that file is owned by
+   * someone else right now, so this page can save them but cannot yet make them
+   * take effect. Rather than pretend, the page asks: it fetches the main page and
+   * looks for a marker the hook leaves behind. Silent settings that do nothing are
+   * worse than no settings page at all, and this way the warning disappears by
+   * itself the moment the hook lands.
+   */
+  function checkHook() {
+    fetch('/').then(function (r) { return r.text(); }).then(function (html) {
+      if (html.indexOf('RELAY_CONFIG_HOOK') !== -1) { $('hookwarn').className = 'banner warn hidden'; return; }
+      show($('hookwarn'), 'warn',
+        '<b>Saved, but not yet applied.</b> The main page still uses its built-in timings. ' +
+        'It needs one hook in the <code>V</code> block of <code>public/index.html</code>:' +
+        '<pre>// RELAY_CONFIG_HOOK — /config overrides these\n' +
+        'fetch(\'/settings\').then(function (r) { return r.json(); })\n' +
+        '  .then(function (d) { Object.assign(V, d.settings.dictation); })\n' +
+        '  .catch(function () { /* keep the built-in defaults */ });</pre>' +
+        'This notice clears itself once that is in.');
+      $('hookwarn').className = 'banner warn';
+    }).catch(function () { /* cannot tell: say nothing rather than cry wolf */ });
+  }
+
+  load();
+})();
+</script>
+</body>
+</html>

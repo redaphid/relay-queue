@@ -23,6 +23,14 @@ const UI_FILES = [
   path.join(__dirname, 'public', 'index.html'),
   path.join(DATA_DIR, 'ui', 'index.html'),
 ].filter(Boolean);
+// The settings page, served at /config. Its own file rather than a panel inside
+// index.html: that page is large, busy, and frequently edited, and a config
+// screen is read rarely and independently.
+const CONFIG_FILES = [
+  process.env.CONFIG_FILE,
+  path.join(__dirname, 'public', 'config.html'),
+  path.join(DATA_DIR, 'ui', 'config.html'),
+].filter(Boolean);
 const MAX_BODY = 1024 * 1024; // 1 MiB
 const MAX_TEXT = 8000; // per-message cap for instruction/text; results are only bounded by MAX_BODY
 
@@ -61,6 +69,200 @@ const MAX_SPEAK_TEXT = 2000; // one reply's worth; the page condenses before it 
 const STARTED_AT = Date.now();
 const STATUSES = ['pending', 'claimed', 'done'];
 const DEFAULT_ROLE = 'user'; // records written before roles existed are the human's messages
+
+// --- settings (GET/POST /settings, page at /config) ------------------------
+/*
+ * The handful of things worth turning without editing source: which speech model
+ * transcribes dictation, and the endpointing thresholds that decide when you have
+ * stopped talking. Both are matters of taste on this machine, in this room, in
+ * this voice — which is exactly the kind of thing that should not live in a
+ * constant somebody has to redeploy.
+ *
+ * WHY SWITCHING MODEL IS A CHOICE OF PORT AND NOT A CHOICE OF CONTAINER ARGS.
+ * The obvious implementation is to recreate the whisper container with a
+ * different `--model`, and the only way this process could do that is with
+ * /var/run/docker.sock mounted into it. This server has no authentication of its
+ * own, so that socket would promote "anyone who can reach port 3901" into "anyone
+ * can start a privileged container on this host" — root-equivalent, from a
+ * messaging app. So instead every offered model runs in its own container the
+ * whole time (see whisper-models/docker-compose.yml) and switching is nothing
+ * more than picking which socket to open. No Docker access, no new privilege, and
+ * the only cost is idle RAM on a machine with 62 GB of it.
+ *
+ * The catalog below is a fixed list in source, deliberately. A stored setting can
+ * only ever name one of these entries, so the worst a hostile POST /settings can
+ * do is point transcription at one of three known local engines. Letting it carry
+ * a host and port instead would have made this an outbound-request forgery
+ * primitive pointed at anything the container can route to.
+ */
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+
+const STT_MODELS = [
+  {
+    id: 'tiny-int8',
+    label: 'Tiny',
+    blurb: 'Fastest. Fine for short plain sentences; mangles names, jargon and numbers.',
+    // The engine that was here first. It belongs to the `homeassistant` compose
+    // project and is shared with Home Assistant's voice pipeline, so it is left
+    // exactly as it is and reached the way it always has been.
+    host: STT_HOST,
+    port: STT_PORT,
+  },
+  {
+    id: 'base-int8',
+    label: 'Base',
+    blurb: 'A clear step up on proper nouns and punctuation, for a modest wait.',
+    host: process.env.STT_BASE_HOST || 'whisper-base',
+    port: Number(process.env.STT_BASE_PORT || 10300),
+  },
+  {
+    id: 'small-int8',
+    label: 'Small',
+    blurb: 'Handles names, jargon and numbers well. The usual sweet spot for dictation.',
+    host: process.env.STT_SMALL_HOST || 'whisper-small',
+    port: Number(process.env.STT_SMALL_PORT || 10300),
+  },
+  {
+    id: 'medium-int8',
+    label: 'Medium',
+    blurb: 'Better again on unusual words, for a wait you will notice.',
+    host: process.env.STT_MEDIUM_HOST || 'whisper-medium',
+    port: Number(process.env.STT_MEDIUM_PORT || 10300),
+  },
+  {
+    id: 'large-v3',
+    label: 'Large (v3)',
+    blurb: 'The most accurate available. On CPU it is slow enough that you will feel it on every message.',
+    host: process.env.STT_LARGE_HOST || 'whisper-large',
+    port: Number(process.env.STT_LARGE_PORT || 10300),
+  },
+];
+/*
+ * The model dictation uses when nothing has been chosen. Kept at the fastest one
+ * on purpose: this is also the fallback if the saved setting names an engine that
+ * has gone away, and a fallback should be the option least likely to be down or
+ * cold. Change what you actually use from /config, not here.
+ */
+const DEFAULT_STT_MODEL = 'tiny-int8';
+
+/*
+ * The dictation knobs, with the range each is allowed to take. The range is not
+ * decoration: it is the validation, and it is also what the page draws its
+ * sliders from, so the two can never disagree about what is legal.
+ *
+ * Defaults match the `V` block in public/index.html. That file is the only place
+ * they take effect, so if it changes these should follow.
+ */
+const DICTATION_KNOBS = {
+  SILENCE_MS: {
+    label: 'Silence that ends a message',
+    unit: 'ms', min: 400, max: 8000, step: 100, dflt: 2400,
+    help: 'How long you can pause before dictation decides you are done. Too short and it cuts you off ' +
+      'mid-thought; too long and every short message takes an extra beat to send. A truncated message is ' +
+      'much the more expensive mistake — it costs a whole round trip to notice and repair.',
+  },
+  CONV_SILENCE_MS: {
+    label: 'Silence that ends a turn (conversation mode)',
+    unit: 'ms', min: 600, max: 12000, step: 100, dflt: 3000,
+    help: 'The same idea in conversation mode, where you are talking continuously and fragments get ' +
+      'stitched back together anyway — so it can afford to be more patient than the one above.',
+  },
+  NOISE_MULT: {
+    label: 'How much louder than the room speech must be',
+    unit: '×', min: 1.1, max: 6, step: 0.1, dflt: 2.2,
+    help: 'The room is measured for a moment before listening starts. Raise this if a noisy room means ' +
+      'dictation never hears silence and never ends; lower it if a quiet voice is not being noticed.',
+  },
+  RMS_FLOOR: {
+    label: 'Minimum loudness to count as speech',
+    unit: '', min: 0.001, max: 0.08, step: 0.001, dflt: 0.01,
+    help: 'A floor under the setting above, so a silent room cannot make the threshold approach zero and ' +
+      'turn every rustle into speech.',
+  },
+};
+
+/** @type {{sttModel: string, dictation: Record<string, number>, updatedAt: string|null}} */
+let settings = defaultSettings();
+
+function defaultSettings() {
+  const dictation = {};
+  for (const [key, spec] of Object.entries(DICTATION_KNOBS)) dictation[key] = spec.dflt;
+  return { sttModel: DEFAULT_STT_MODEL, dictation, updatedAt: null };
+}
+
+function sttModelById(id) {
+  return STT_MODELS.find((m) => m.id === id) || null;
+}
+
+/**
+ * Which engine a transcription should go to. `id` is an explicit per-request
+ * override (the compare tool on the config page uses it to put one recording
+ * through every model); otherwise it is whatever is saved. Falls back all the way
+ * to a real entry, so this can never return undefined and strand dictation.
+ */
+function sttTarget(id) {
+  return sttModelById(id) || sttModelById(settings.sttModel) || sttModelById(DEFAULT_STT_MODEL) || STT_MODELS[0];
+}
+
+/**
+ * Fold `patch` onto `base`, keeping only what this server recognises and only
+ * inside the published range. Out-of-range values are rejected rather than
+ * clamped, and named in the reply: silently turning someone's typo into a number
+ * nobody chose is how a settings page starts lying about itself.
+ */
+function mergeSettings(base, patch) {
+  const next = { sttModel: base.sttModel, dictation: { ...base.dictation }, updatedAt: base.updatedAt };
+  const rejected = [];
+  if (patch && patch.sttModel !== undefined) {
+    if (sttModelById(patch.sttModel)) next.sttModel = patch.sttModel;
+    else rejected.push(`sttModel "${patch.sttModel}" is not one of: ${STT_MODELS.map((m) => m.id).join(', ')}`);
+  }
+  const d = patch && patch.dictation;
+  if (d !== undefined && (typeof d !== 'object' || d === null || Array.isArray(d))) {
+    rejected.push('dictation must be an object of setting names to numbers');
+  } else if (d) {
+    for (const [key, value] of Object.entries(d)) {
+      const spec = DICTATION_KNOBS[key];
+      if (!spec) { rejected.push(`unknown dictation setting "${key}"`); continue; }
+      const n = Number(value);
+      if (!Number.isFinite(n)) { rejected.push(`${key} must be a number, got "${value}"`); continue; }
+      if (n < spec.min || n > spec.max) { rejected.push(`${key} must be between ${spec.min} and ${spec.max}, got ${n}`); continue; }
+      next.dictation[key] = n;
+    }
+  }
+  return { settings: next, rejected };
+}
+
+/*
+ * Settings live in their own small file rather than in events.jsonl. That log is
+ * an append-only history of messages whose replay rebuilds the queue, and every
+ * append also broadcasts to live pages; a settings row would have to be threaded
+ * through both. A settings document is one mutable value with no history worth
+ * keeping, so it gets a file, and the message path stays untouched.
+ */
+function loadSettings() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    // Through the same validator as a POST: a file hand-edited into nonsense, or
+    // written by an older version, degrades to defaults per field instead of
+    // taking the server down on boot.
+    settings = mergeSettings(defaultSettings(), raw).settings;
+    settings.updatedAt = typeof raw.updatedAt === 'string' ? raw.updatedAt : null;
+  } catch {
+    settings = defaultSettings(); // absent or unreadable: same as a fresh install
+  }
+  return settings;
+}
+
+function saveSettings(next) {
+  next.updatedAt = nowIso();
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${SETTINGS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+  fs.renameSync(tmp, SETTINGS_FILE); // atomic swap: a torn file can never be read back
+  settings = next;
+  return settings;
+}
 
 // ---------------------------------------------------------------- event log
 /** @type {Map<string, object>} id -> task (insertion order == creation order) */
@@ -527,44 +729,54 @@ function sseRoute(req, res) {
 }
 
 // ---------------------------------------------------------------- static UI
-let indexCache = null; // { file, mtimeMs, buf } — re-read only when the file changes on disk
+/** @type {Map<string, {file: string, mtimeMs: number, buf: Buffer}>} */
+const pageCache = new Map(); // keyed by the first candidate; re-read only when the file changes on disk
 
-function findUiFile() {
-  for (const f of UI_FILES) {
+// The pages are fully self-contained, and this forbids any external request from
+// them. `blob:` in script-src/worker-src is for the inline AudioWorklet used by
+// voice dictation — the worklet source is built into a Blob so a page stays one
+// file. It grants nothing new: the pages already run with 'unsafe-inline'.
+const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; " +
+  "script-src 'unsafe-inline' blob:; worker-src blob:; img-src data:; " +
+  "media-src blob: data:; connect-src 'self'; " +
+  "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+function findFirstFile(candidates) {
+  for (const f of candidates) {
     try { return { file: f, mtimeMs: fs.statSync(f).mtimeMs }; } catch { /* try the next one */ }
   }
   return null;
 }
 
-function sendIndex(res) {
-  const found = findUiFile();
-  if (!found) {
-    return fail(res, 503, 'UI page not found on disk', { searched: UI_FILES });
-  }
+const findUiFile = () => findFirstFile(UI_FILES);
+
+/** Serve the first of `candidates` that exists, from a mtime-checked cache. */
+function sendHtmlFile(res, candidates, what) {
+  const key = candidates[0];
+  const found = findFirstFile(candidates);
+  if (!found) return fail(res, 503, `${what} not found on disk`, { searched: candidates });
+  let hit = pageCache.get(key);
   try {
-    if (!indexCache || indexCache.file !== found.file || indexCache.mtimeMs !== found.mtimeMs) {
-      indexCache = { ...found, buf: fs.readFileSync(found.file) };
+    if (!hit || hit.file !== found.file || hit.mtimeMs !== found.mtimeMs) {
+      hit = { ...found, buf: fs.readFileSync(found.file) };
+      pageCache.set(key, hit);
     }
   } catch {
-    return fail(res, 503, `UI page is unreadable: ${found.file}`);
+    return fail(res, 503, `${what} is unreadable: ${found.file}`);
   }
   res.writeHead(200, {
     'content-type': 'text/html; charset=utf-8',
-    'content-length': indexCache.buf.length,
+    'content-length': hit.buf.length,
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'no-referrer',
-    // The page is fully self-contained; this forbids any external request from it.
-    // `blob:` in script-src/worker-src is for the inline AudioWorklet used by voice
-    // dictation — the worklet source is built into a Blob so the page stays one file.
-    // It grants nothing new: the page already runs with 'unsafe-inline'.
-    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; " +
-      "script-src 'unsafe-inline' blob:; worker-src blob:; img-src data:; " +
-      "media-src blob: data:; connect-src 'self'; " +
-      "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'content-security-policy': PAGE_CSP,
   });
-  res.end(indexCache.buf);
+  res.end(hit.buf);
 }
+
+const sendIndex = (res) => sendHtmlFile(res, UI_FILES, 'UI page');
+const sendConfigPage = (res) => sendHtmlFile(res, CONFIG_FILES, 'config page');
 
 // ---------------------------------------------------------------- speech to text
 /*
@@ -669,12 +881,16 @@ function wyomingExchange(opts) {
   });
 }
 
-/** PCM (int16 LE) -> transcript text. Rejects with an httpErr on any failure. */
-function transcribe(pcm, fmt) {
+/**
+ * PCM (int16 LE) -> transcript text. Rejects with an httpErr on any failure.
+ * `target` is an entry from STT_MODELS; omitted, it is whichever model the
+ * config page has selected.
+ */
+function transcribe(pcm, fmt, target = sttTarget()) {
   return wyomingExchange({
-    host: STT_HOST,
-    port: STT_PORT,
-    what: 'speech engine',
+    host: target.host,
+    port: target.port,
+    what: `speech engine (${target.id})`,
     timeoutMs: STT_TIMEOUT_MS,
     send(sock) {
       const frame = fmt.width * fmt.channels;
@@ -758,13 +974,22 @@ async function sttRoute(req, res, q) {
     width: num('width', 2, (n) => n === 2), // int16 only
     channels: num('channels', 1, (n) => n === 1), // mono only
   };
+  // `?model=` sends this one request to a named engine without changing what is
+  // saved — it is how the config page puts a single recording through every model
+  // to compare them. Unknown names are refused rather than silently ignored.
+  const wanted = q.get('model');
+  if (wanted !== null && !sttModelById(wanted)) {
+    throw httpErr(400, `unknown model "${wanted}" (have: ${STT_MODELS.map((m) => m.id).join(', ')})`);
+  }
+  const target = sttTarget(wanted);
+
   const pcm = await readRawBody(req, MAX_AUDIO);
   const frame = fmt.width * fmt.channels;
   if (pcm.length < frame) return fail(res, 400, 'no audio in request body');
   if (pcm.length % frame) return fail(res, 400, `audio is not a whole number of ${frame}-byte frames`);
 
   const startedAt = Date.now();
-  const heard = (await transcribe(pcm, fmt)).trim();
+  const heard = (await transcribe(pcm, fmt, target)).trim();
   // Repaired here rather than in the page, so every caller of /stt gets it — and
   // `raw` is returned alongside so the composer can offer a one-tap undo.
   const fixed = repairTranscript(heard);
@@ -772,6 +997,7 @@ async function sttRoute(req, res, q) {
     text: fixed.text,
     raw: heard,
     corrections: fixed.corrections,
+    model: target.id, // which engine actually answered — the compare tool reads this
     audioMs: Math.round((pcm.length / frame / fmt.rate) * 1000),
     tookMs: Date.now() - startedAt,
   });
@@ -1240,6 +1466,52 @@ function probeEngine(name, host, port) {
   });
 }
 
+/*
+ * GET /settings — everything the config page needs to draw itself: the saved
+ * values, the catalog of models with each one's live reachability, the knob
+ * ranges, and the defaults.
+ *
+ * The catalog is probed rather than assumed. A model whose container is down must
+ * read as down: offering it in a dropdown that then fails on the next dictation
+ * is the same failure as a status page that cannot tell idle from broken.
+ */
+async function settingsRoute(res) {
+  const models = await Promise.all(STT_MODELS.map(async (mdl) => {
+    const probe = await probeEngine(`stt:${mdl.id}`, mdl.host, mdl.port);
+    return {
+      id: mdl.id,
+      label: mdl.label,
+      blurb: mdl.blurb,
+      endpoint: `${mdl.host}:${mdl.port}`,
+      reachable: !!probe.ok,
+      error: probe.ok ? null : probe.error,
+    };
+  }));
+  send(res, 200, { settings, models, knobs: DICTATION_KNOBS, defaults: defaultSettings() });
+}
+
+async function saveSettingsRoute(res, body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return fail(res, 400, 'body must be a JSON object');
+  }
+  const { settings: next, rejected } = mergeSettings(settings, body);
+  if (rejected.length) return fail(res, 400, rejected.join('; '), { rejected });
+
+  // Refuse to point dictation at an engine that is not answering. The whole
+  // reason this page exists is to be trusted with the thing the user speaks
+  // into; saving a setting that silently breaks his microphone would be worse
+  // than not having the page. He can still pick it once its container is up.
+  if (next.sttModel !== settings.sttModel) {
+    const mdl = sttModelById(next.sttModel);
+    const probe = await probeEngine(`stt:${mdl.id}`, mdl.host, mdl.port);
+    if (!probe.ok) {
+      return fail(res, 409, `the ${mdl.label} engine at ${mdl.host}:${mdl.port} is not answering (${probe.error}) — not switching to a model that cannot transcribe`, { model: mdl.id });
+    }
+  }
+  saveSettings(next);
+  send(res, 200, { settings });
+}
+
 async function statusRoute(req, res, q) {
   const c = counts();
   const derived = derivedStatus();
@@ -1282,11 +1554,16 @@ async function statusRoute(req, res, q) {
   // Probing costs a socket to each engine, so it is opt-out for callers that
   // only want the cheap half.
   if (q.get('engines') !== '0' && q.get('engines') !== 'false') {
+    // The speech engine reported here is the one dictation would actually use,
+    // not a fixed address — otherwise the status chip would keep saying "fine"
+    // about an engine nobody is talking to. Cached per model id for the same
+    // reason: a shared key would answer for whichever was probed most recently.
+    const active = sttTarget();
     const [stt, tts] = await Promise.all([
-      probeEngine('stt', STT_HOST, STT_PORT),
+      probeEngine(`stt:${active.id}`, active.host, active.port),
       probeEngine('tts', TTS_HOST, TTS_PORT),
     ]);
-    body.engines = { stt, tts };
+    body.engines = { stt: { ...stt, model: active.id }, tts };
   }
   send(res, 200, body);
 }
@@ -1758,6 +2035,19 @@ async function route(req, res) {
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
   }
 
+  // /config — the settings page
+  if (seg.length === 1 && seg[0] === 'config') {
+    if (!need('GET')) return;
+    return sendConfigPage(res);
+  }
+
+  // /settings — what the config page reads and writes
+  if (seg.length === 1 && seg[0] === 'settings') {
+    if (m === 'GET') return settingsRoute(res);
+    if (m === 'POST') return saveSettingsRoute(res, await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
   // /status — is anything actually listening?
   if (seg.length === 1 && seg[0] === 'status') {
     if (!need('GET')) return;
@@ -1869,11 +2159,12 @@ const server = http.createServer((req, res) => {
  * `require('./server.js')` gives you the functions and nothing else — no port
  * bound, no data directory touched, no timers running.
  */
-module.exports = { repairTranscript, metaphone, headline, stuckClaims };
+module.exports = { repairTranscript, metaphone, headline, stuckClaims, mergeSettings, defaultSettings, STT_MODELS, DICTATION_KNOBS };
 
 if (require.main !== module) return;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+loadSettings();
 ensureDefaultConv(); // before replay, so a rename of it replays onto something
 const replayed = replay();
 ensureDefaultConv(); // ...and after, in case the log somehow removed it
@@ -1883,6 +2174,8 @@ server.listen(PORT, HOST, () => {
   console.log(`log: ${LOG_FILE} (${replayed.events} events replayed, ${replayed.skipped} skipped)`);
   const ui = findUiFile();
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);
+  const active = sttTarget();
+  console.log(`stt: ${active.id} at ${active.host}:${active.port} (change it at /config)`);
   console.log(`tasks: ${tasks.size} total — ${c.pending} pending, ${c.claimed} claimed, ${c.done} done, ${c.unrelayed} unrelayed`);
 });
 
