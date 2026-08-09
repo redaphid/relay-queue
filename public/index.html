@@ -1259,6 +1259,9 @@
   /* What to say about this tick, in words. null when there is nothing to say. */
   function checkMark(rec) {
     if (!rec) return null;                       // settled: the server agrees
+    /* A login page came back, so there IS a network — whatever navigator.onLine
+       says. Waiting will not fix this one; signing in will, so name that. */
+    if (rec.challenge) return { cls: 'failed', text: 'not saved — sign in again' };
     if (rec.state === 'queued') return { cls: 'unsure', text: 'queued — offline' };
     if (rec.state === 'failed') return { cls: 'failed', text: 'not saved — tap to retry' };
     return { cls: 'saving', text: 'saving' };
@@ -1304,7 +1307,31 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ index: index, on: !!on, by: checkAuthor() })
     }).then(function (r) {
+      /*
+       * A CHALLENGE IS NOT AN ANSWER. An expired Cloudflare Access session does
+       * not answer 4xx — it redirects to a login page, so what lands here is a
+       * 200 full of HTML. `r.ok` says yes to that, and a branch that reads only
+       * the status files a login screen as a successful write: the tick is
+       * deleted from the outbox, the row loses its mark, and a mark-less row
+       * means "settled, the server agrees". Silently wrong, with nothing left
+       * to retry — strictly worse than the failure this outbox was built for.
+       *
+       * So only THIS SERVER'S JSON is allowed to settle a tick or to kill one.
+       * Anything else in the path — a login page, a captive portal, a proxy's
+       * error page — is "not now": kept, shown, and retried once the way back
+       * is open. The service worker already refuses to cache a login page as
+       * the app shell (`x-relay-app`); this is the same guard on the write.
+       */
+      var ourJson = /^application\/json/i.test(String(r.headers.get('content-type') || ''));
       return r.json().catch(function () { return null; }).then(function (j) {
+        if (!ourJson || !j || typeof j !== 'object' || r.redirected) {
+          var ch = new Error(r.redirected
+            ? 'not saved — a login page answered instead of the server'
+            : 'not saved — HTTP ' + r.status + ' did not come from the server');
+          ch.permanent = false; // signing back in fixes it, so it must keep trying
+          ch.challenge = true;  // ...and waiting for signal will not, so say so
+          throw ch;
+        }
         if (!r.ok) {
           var err = new Error((j && j.error) || ('HTTP ' + r.status));
           // 4xx is the server saying "never, stop asking"; 5xx is "not now".
@@ -1323,10 +1350,20 @@
       if (!rec) return;
       // Offline is not a failure. It is a write that has not happened yet, and
       // saying "not saved" about it would be a lie in the alarming direction.
-      var offline = (typeof navigator !== 'undefined' && navigator.onLine === false) ||
-        (!err.permanent && /network|fetch|load failed/i.test(String(err && err.message)));
+      /*
+       * A challenge outranks `navigator.onLine`. That flag is a hint, not a
+       * fact — a captive portal or a limping hotspot can leave it false while a
+       * login page comes back perfectly well — and a response in hand is proof
+       * there is a network. Calling that "offline" sends him off to wait for
+       * signal he already has, which is the same lie in a quieter voice.
+       */
+      var challenge = !!err.challenge;
+      var offline = !challenge &&
+        ((typeof navigator !== 'undefined' && navigator.onLine === false) ||
+        (!err.permanent && /network|fetch|load failed/i.test(String(err && err.message))));
       rec.state = err.permanent ? 'failed' : (offline ? 'queued' : 'failed');
       rec.permanent = !!err.permanent;
+      rec.challenge = challenge;
       rec.error = (err && err.message) || 'network error';
       saveOutbox();
       paintAllTasks();
