@@ -334,23 +334,38 @@ None of this counts as being alive. Liveness is judged on claims and results —
 real work — precisely so that an agent busily reporting tool calls from inside a
 poll loop cannot look healthy while achieving nothing.
 
-**The parent posts the roster. A worker must never post its own `spawned`.**
-The model is `agent` = the coordinator doing the reporting, `subagent` = the
-worker being reported. A worker announcing itself is claiming it spawned itself,
-and the damage is not cosmetic, because **`spawned` and `finished` pair on the
-subagent NAME** — the one key the whole roster depends on. Verified against a
-real server:
+**The contract: the parent posts the roster.** `agent` is the coordinator doing
+the reporting; `subagent` is the worker being reported. So:
+
+- **Only the parent posts `spawned` and `finished`**, exactly once each.
+- **A worker never announces itself.** Doing so claims it spawned itself.
+- **A worker may post `tool` entries** about its own work. Those do not pair, so
+  they cannot damage the roster.
+
+Follow the contract and you never need the rest of this. The reason it is not a
+matter of taste is that **`spawned` and `finished` pair on the subagent NAME** —
+one key, holding the whole roster together — so a stray `spawned` does not add
+noise, it corrupts an existing row.
+
+*What today's server does with a violation, probed on 2026-08-08. The panel
+owner is weighing whether to reject these outright, so treat this as the cost of
+breaking the contract, not as behaviour to rely on:*
 
 - Two `spawned` under one name do **not** produce two rows. They produce one
   row, and the later spawn **silently overwrites the task text** — `"the real
-  task"` became `"I spawned myself"` with no error and no trace in the roster.
-- Worse, a self-announcement that arrives *after* the coordinator's `finished`
-  **resurrects the row**: `running` flips back to `true`, `ok` resets to `null`,
-  and it never finishes again, because the coordinator already sent its one
-  `finished`. A permanent phantom worker, apparently still holding a worktree.
+  task"` became `"I spawned myself"`, with no error and no trace in the roster.
+- Worse, a self-announcement arriving *after* the coordinator's `finished`
+  **resurrects the row**: `running` returns to `true`, `ok` to `null`, and it can
+  never finish again, because the coordinator already sent its single `finished`.
+  The result is a permanent phantom worker that looks like it is still holding a
+  worktree.
 
-A worker may post `tool` entries about its own work. Those do not pair, so they
-cannot do either of those things.
+Read that last one twice, because it is the whole argument: **a well-meaning
+worker announcing itself makes the panel manufacture the very ghost the panel
+was built to expose.** The feature's one job is telling a live agent from an
+abandoned one, and a stray `spawned` fabricates exactly the lie it exists to
+catch — a reassuring, plausible signal produced by a failure, which is the
+impostor pattern from "The rules" appearing inside our own data.
 
 **Post `spawned` at spawn time.** The server timestamps on arrival, so a roster
 posted after the fact carries the *backfill* time, not the true start — and a
