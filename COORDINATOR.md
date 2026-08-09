@@ -334,6 +334,34 @@ None of this counts as being alive. Liveness is judged on claims and results —
 real work — precisely so that an agent busily reporting tool calls from inside a
 poll loop cannot look healthy while achieving nothing.
 
+**The parent posts the roster. A worker must never post its own `spawned`.**
+The model is `agent` = the coordinator doing the reporting, `subagent` = the
+worker being reported. A worker announcing itself is claiming it spawned itself,
+and the damage is not cosmetic, because **`spawned` and `finished` pair on the
+subagent NAME** — the one key the whole roster depends on. Verified against a
+real server:
+
+- Two `spawned` under one name do **not** produce two rows. They produce one
+  row, and the later spawn **silently overwrites the task text** — `"the real
+  task"` became `"I spawned myself"` with no error and no trace in the roster.
+- Worse, a self-announcement that arrives *after* the coordinator's `finished`
+  **resurrects the row**: `running` flips back to `true`, `ok` resets to `null`,
+  and it never finishes again, because the coordinator already sent its one
+  `finished`. A permanent phantom worker, apparently still holding a worktree.
+
+A worker may post `tool` entries about its own work. Those do not pair, so they
+cannot do either of those things.
+
+**Post `spawned` at spawn time.** The server timestamps on arrival, so a roster
+posted after the fact carries the *backfill* time, not the true start — and a
+coordinator resumed mid-flight is always backfilling, which yields confident,
+wrong durations. (A contract change is in flight to accept an explicit `at` plus
+a `reconstructed` marker; until it lands, say so in the `task` text rather than
+letting an inferred start read as an observed one.) The general rule is the one
+this project keeps arriving at from new directions: **mark what you
+reconstructed.** A confident wrong number is worse than a visible gap, for the
+same reason you render no counters rather than untrusted zeroes.
+
 ## The human
 
 They post from a phone, usually by voice, so expect transcription errors —
