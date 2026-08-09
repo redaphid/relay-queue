@@ -3733,7 +3733,17 @@ ensureDefaultConv(); // ...and after, in case the log somehow removed it
 if (PUSH_ON) vapidKeys = loadVapidKeys(); // after mkdir: the key file lives in DATA_DIR
 server.listen(PORT, HOST, () => {
   const c = counts();
-  console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
+  /*
+   * The port we ASKED for is not necessarily the port we GOT: PORT=0 means "any
+   * free one", which is how the selftests avoid fighting each other over a fixed
+   * number. Print what the socket actually bound, because a harness reads this
+   * line to learn where its own child is listening — and a log that echoed the
+   * request back would hand it "0" and, worse, would keep looking correct on the
+   * day the two ever differed.
+   */
+  const bound = server.address();
+  const boundPort = bound && typeof bound === 'object' ? bound.port : PORT;
+  console.log(`${NAME} v${VERSION} listening on http://${HOST}:${boundPort}`);
   console.log(`log: ${LOG_FILE} (${replayed.events} events replayed, ${replayed.skipped} skipped)`);
   const ui = findUiFile();
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);

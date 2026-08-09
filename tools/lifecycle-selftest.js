@@ -34,12 +34,35 @@ const os = require('node:os');
 const path = require('node:path');
 
 const SERVER = path.join(__dirname, '..', 'server.js');
-// 3931, not 3919: checklist-selftest landed on 3919 independently, and two
-// suites sharing a default is a race waiting for someone to run them together.
-// (The real fix is an ephemeral port plus a nonce proving the server is ours —
-// a harness that binds a fixed port can silently interrogate a stranger's.)
-const PORT = Number(process.env.LIFECYCLE_TEST_PORT || 3931);
-const BASE = `http://127.0.0.1:${PORT}`;
+
+/*
+ * PORT 0 — AND WHY THIS IS NOT A STYLE PREFERENCE.
+ *
+ * This harness used to bind a fixed port. Every fixed-port harness has the same
+ * defect, and it is worse than a flaky test: it does not fail when the bind
+ * fails. Node's server exits on EADDRINUSE, the harness's boot-wait polls
+ * /health, /health is answered by WHOEVER ALREADY OWNS THE PORT, and the suite
+ * then interrogates a stranger's server. Its data is not ours, so a few checks
+ * fail for reasons that make no sense — but the rest PASS, and a pass earned
+ * against the wrong process is a false pass. We hit exactly this: two suites
+ * independently picked 3919, and a leaked scratch server on 3921 made
+ * replay-selftest report seven failures that had nothing to do with the code.
+ *
+ * So: ask the OS for any free port, and then learn which one we actually got
+ * FROM THE CHILD'S OWN STDOUT. That last part is the real fix. The port is not
+ * guessed, computed, or re-derived — it is reported by the process we spawned,
+ * in a line it only prints from inside the listen callback. Talking to a
+ * stranger is therefore not merely unlikely, it is unrepresentable: we have no
+ * address to talk to until our child gives us one.
+ *
+ * Set LIFECYCLE_TEST_PORT to pin it (debugging, poking at it by hand). Pinning
+ * re-enables the collision, but not the silence — a pinned port that is taken
+ * makes the child exit, and the boot-wait below reports that instead of quietly
+ * carrying on against whatever answered.
+ */
+const PORT = Number(process.env.LIFECYCLE_TEST_PORT || process.env.PORT || 0);
+/** Set by waitForBoot() from the child's announcement. Never assumed. */
+let BASE = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -67,16 +90,53 @@ function stop(proc) {
   return gone;
 }
 
+/*
+ * Wait for OUR child, and prove it is ours.
+ *
+ * The proof is the port itself: server.js prints its bound address from inside
+ * the listen callback, so that line appearing means (a) the process we spawned
+ * is alive and (b) it owns the socket we are about to talk to. We take the
+ * address from that line and nowhere else.
+ *
+ * The two ways this can go wrong are both reported, never swallowed:
+ *   - the child dies (EADDRINUSE on a pinned port, a syntax error, a bad env) —
+ *     exitCode goes non-null and we throw with everything it printed;
+ *   - it lives but never announces — we time out and throw, again with output.
+ * Neither can be mistaken for a pass, which is the entire point.
+ */
 async function waitForBoot(proc) {
+  const LISTENING = /listening on http:\/\/[^\s:]+:(\d+)/;
+  const deadline = Date.now() + 20000;
+
+  let port = null;
+  while (port === null) {
+    const m = LISTENING.exec(proc.output);
+    if (m) { port = Number(m[1]); break; }
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      throw new Error(
+        `server exited before it ever listened (code ${proc.exitCode}, signal ${proc.signalCode}).\n`
+        + `--- its output ---\n${proc.output || '(nothing)'}`);
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`server never announced a port within 20s.\n--- its output ---\n${proc.output || '(nothing)'}`);
+    }
+    await sleep(50);
+  }
+
+  BASE = `http://127.0.0.1:${port}`;
+
+  // It said it was listening; confirm it actually answers before we rely on it.
   for (let i = 0; i < 100; i++) {
-    if (proc.exitCode !== null) throw new Error(`server exited early with code ${proc.exitCode}`);
+    if (proc.exitCode !== null) {
+      throw new Error(`server died just after announcing port ${port}.\n--- its output ---\n${proc.output}`);
+    }
     try {
       const r = await fetch(`${BASE}/health`);
-      if (r.ok) return;
-    } catch { /* not listening yet */ }
-    await sleep(100);
+      if (r.ok) return port;
+    } catch { /* still coming up */ }
+    await sleep(50);
   }
-  throw new Error('server did not start listening');
+  throw new Error(`server announced port ${port} but /health never answered.\n--- its output ---\n${proc.output}`);
 }
 
 function boot(dir) {
@@ -84,7 +144,7 @@ function boot(dir) {
     env: {
       ...process.env,
       DATA_DIR: dir,
-      PORT: String(PORT),
+      PORT: String(PORT), // 0 = let the OS choose; we read the real one back
       HOST: '127.0.0.1',
       WATCH_SOURCE: '0',
       // Squeezed so the stalled-work transitions are reachable in seconds
@@ -94,8 +154,23 @@ function boot(dir) {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  proc.stdout.on('data', () => {});
-  proc.stderr.on('data', () => {});
+
+  /*
+   * Keep every byte the child says, and echo it. The old version registered
+   * empty 'data' handlers, which is strictly worse than not reading at all: it
+   * drains the pipe so the child never blocks, and throws the contents away, so
+   * a stack trace explaining precisely why the server would not start was
+   * discarded on the way past. When this harness fails, the reason is almost
+   * always in here.
+   */
+  proc.output = '';
+  const tee = (stream, mark) => stream.on('data', (d) => {
+    const s = String(d);
+    proc.output += s;
+    for (const line of s.split('\n')) if (line.trim()) console.log(`  [server${mark}] ${line.trimEnd()}`);
+  });
+  tee(proc.stdout, '');
+  tee(proc.stderr, ' !');
   return proc;
 }
 
