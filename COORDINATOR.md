@@ -339,8 +339,21 @@ task list in an instruction or a result becomes tickable on its own.
 ```
 
 **The id you address is the THREAD ENTRY, not the task.** A task projects to two
-entries: `<taskId>` is the instruction, `<taskId>:r` is your result. A checklist
-you wrote lives on `<taskId>:r`. Getting this wrong is a 404, not silent damage.
+entries: `<taskId>` is the instruction, `<taskId>:r` is the result. Which one you
+want follows from where the text lives, and this is now verified end to end
+rather than inferred:
+
+- A checklist in a **result** — anything an agent wrote back — is `<taskId>:r`.
+- A checklist in an **instruction**, which includes any message he typed himself,
+  is the bare `<taskId>`.
+
+**Guessing wrong is not reliably a 404.** A single task can carry *two
+independent lists*, one on each half, and then the wrong id silently ticks the
+wrong list. Verified: with `- [ ] passport` on the instruction and
+`- [ ] check in` on the result, a tick on the bare id marked `passport`, left the
+reply's list untouched, and returned 200 both times. The 404 only appears when
+the half you named has no list at all. So resolve the id from where the text
+actually is — do not post hopefully and read the status code as confirmation.
 
 ```bash
 curl -s http://127.0.0.1:3901/tasks/<entryId>/checks          # one list
@@ -411,3 +424,28 @@ in a localStorage outbox, shows "queued — offline" on the row, and retries on
 reconnect and on every poll. So a list can be behind the phone, briefly; it is
 never silently lost. A `4xx` is treated as final and stops retrying, and the row
 says "not saved — tap to retry" instead of pretending.
+
+### Open question: nobody has ever ticked a box through the tunnel
+
+Every verification of ticking, including the end-to-end browser run that proved
+it works, was against **`127.0.0.1`**. The Cloudflare tunnel plus Access path has
+**never been exercised — not once.** So what happens when he ticks a box from his
+phone through the tunnel on an expired Access session is *unknown*. It is not
+"fine", and it is not "probably fine".
+
+The code is *designed* to degrade safely: a `4xx` is treated as final, retrying
+stops, and the row says "not saved — tap to retry" rather than pretending. But an
+Access challenge is a redirect to an HTML login page, not the clean `4xx` that
+logic was written against, and nobody has watched what the row actually does when
+it receives one. **"Degrades safely by design" is a claim about the code; it is
+not an observation of that path.** Do not let it be written up as coverage — that
+substitution is this project's recurring injury, the same shape as a geometry
+suite that looked like coverage while never being run.
+
+It is live right now, not hypothetical: he is on plane wifi, which is precisely
+the flaky, re-authenticating network this gap covers.
+
+**The experiment that closes it:** load the page through the tunnel with a
+deliberately expired Access session, tap a box, and observe whether the row
+reports honestly or claims a tick that never landed. Until someone does that and
+writes down what they saw, this stays an open question.
