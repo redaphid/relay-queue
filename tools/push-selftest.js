@@ -16,12 +16,12 @@
  */
 
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const wp = require('../push.js');
 const { classify, browserLabel } = require('../server.js');
+const { startServer } = require('./harness-lib');
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -383,15 +383,18 @@ console.log('\nbrowsers are named, so he can tell which one is armed');
  *  - A scratch PORT, never 3901. The live instance is never touched.
  */
 
-const SERVER = path.join(__dirname, '..', 'server.js');
-const TEST_PORT = Number(process.env.PUSH_TEST_PORT || 3993);
-const BASE = `http://127.0.0.1:${TEST_PORT}`;
+// The server under test is started through tools/harness-lib.js, which owns
+// the path, the port, and the proof of identity.
+const TEST_PORT = Number(process.env.PUSH_TEST_PORT || 0);
 const DEBOUNCE_MS = 40;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const getJson = async (p) => (await fetch(BASE + p)).json();
+/** The scratch instance, set by overHttp(). Everything reads srv.base. */
+let srv = null;
+
+const getJson = async (p) => (await fetch(srv.base + p)).json();
 async function post(p, body) {
-  const res = await fetch(BASE + p, {
+  const res = await fetch(srv.base + p, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body === undefined ? {} : body),
@@ -411,44 +414,31 @@ async function queuedBy(fn) {
   return (await getJson('/push/config')).stats.queued - before;
 }
 
-async function waitForBoot(proc) {
-  for (let i = 0; i < 100; i++) {
-    if (proc.exitCode !== null) throw new Error(`server exited early with code ${proc.exitCode}`);
-    try { if ((await fetch(`${BASE}/health`)).ok) return; } catch { /* not listening yet */ }
-    await sleep(100);
-  }
-  throw new Error('server did not start listening');
-}
-
-function stop(proc) {
-  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
-  const gone = new Promise((r) => proc.once('exit', r));
-  proc.kill('SIGTERM');
-  return gone;
-}
-
 async function overHttp() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-push-'));
-  const env = {
-    ...process.env,
-    DATA_DIR: dir,
-    PORT: String(TEST_PORT),
-    HOST: '127.0.0.1',
-    WATCH_SOURCE: '0',        // do not exit when a sibling agent saves server.js
-    WATCH_TICK_MS: '600000',  // the deadman must not queue a 'broken' mid-run
-    PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
-  };
-  delete env.PUSH;           // must be ON, or the counters never move (see above)
-  delete env.PUSH_PER_HOUR;  // we assert the compiled-in default
-  const proc = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-  let out = '';
-  proc.stdout.on('data', (c) => { out += c; });
-  proc.stderr.on('data', (c) => { out += c; });
+  srv = await startServer({
+    dir,
+    port: TEST_PORT,
+    label: 'push',
+    env: {
+      WATCH_TICK_MS: '600000',  // the deadman must not queue a 'broken' mid-run
+      PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
+    },
+    // PUSH must be ON, or the counters never move (see above); the hourly
+    // ceiling must be the compiled-in default, because that is what is asserted.
+    unsetEnv: ['PUSH', 'PUSH_PER_HOUR'],
+  });
 
   try {
-    await waitForBoot(proc);
-
-    console.log(`\nover HTTP: a scratch instance on ${TEST_PORT} that can reach nobody`);
+    /*
+     * The port is the OS's choice, so it is stated rather than promised — and
+     * whatever it is, the server answering on it has already proved it is the
+     * child spawned two lines up. Which matters more here than anywhere: the
+     * safety argument for this file rests on the instance under test having no
+     * subscriptions, and that argument is void if it is not the instance being
+     * measured.
+     */
+    console.log(`\nover HTTP: a scratch instance on ${srv.port} that can reach nobody`);
     const cfg0 = await getJson('/push/config');
     if (!Array.isArray(cfg0.devices) || cfg0.devices.length !== 0) {
       throw new Error('ABORT: this instance has subscribed devices — refusing to run, it could buzz a real phone');
@@ -537,13 +527,13 @@ async function overHttp() {
     check('the budget spent matches the flushes', end.budgetLeft === 6 - end.stats.flushed,
       `${end.budgetLeft} left after ${end.stats.flushed} flushes`);
     check('NOTHING was delivered — there was never a device to deliver to', end.stats.delivered === 0);
-    check('the server never tried the network', out.indexOf('[push] sent') === -1);
+    check('the server never tried the network', srv.out.indexOf('[push] sent') === -1);
   } catch (e) {
     failures++;
     console.log(`  FAIL the HTTP section did not run — ${e && e.message}`);
-    if (out) console.log(out.split('\n').slice(-8).map((l) => `       | ${l}`).join('\n'));
+    if (srv.out) console.log(srv.out.split('\n').slice(-8).map((l) => `       | ${l}`).join('\n'));
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows can hold it briefly */ }
   }
 }
@@ -551,4 +541,13 @@ async function overHttp() {
 overHttp().then(() => {
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
+}).catch((err) => {
+  /*
+   * A server that never booted lands here, carrying the child's own output in
+   * the message. It must exit non-zero: a run that aborted before its first
+   * assertion prints no verdict at all, and "no failures" and "never ran" are
+   * indistinguishable to anything reading the log rather than the exit code.
+   */
+  console.error(`\nFAIL — the push selftest could not run\n${err && err.message ? err.message : err}\n`);
+  process.exit(1);
 });
