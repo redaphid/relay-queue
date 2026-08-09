@@ -126,6 +126,41 @@ but it is an impostor, and you should know it is there.
 So the discipline is **provenance, everywhere**. Do not ask "did I get an
 answer". Ask "can I prove this answer came from the thing I meant to ask".
 
+**A defence that exists somewhere in the codebase is not a defence of the
+codebase.** Grep for the guard before concluding the hazard is handled.
+
+`public/sw.js` had *already* identified "a 200 full of HTML" — an Access login
+page — and guarded the **read** path against it with the `x-relay-app` header,
+comment and all. The hazard was known. The defence was written. **Nobody applied
+it to the write path**, where the tick POST tested only `r.ok`, so a login page
+read as a successful write: the tick was deleted from the outbox, the row lost
+its mark, and a mark-less row means "settled, the server agrees". Silently
+wrong, with nothing left to retry — strictly worse than the failure the outbox
+was built for.
+
+Finding one instance of a defence proves only that its author knew about the
+hazard. It says nothing about coverage. The dangerous move feels like diligence:
+read `sw.js`, conclude "this codebase handles Access challenges properly", move
+on. That conclusion was **true of the file and false of the system**, and the
+gap between those two cost real data off his phone.
+
+This is the impostor principle seen from the author's side rather than the
+reader's: the reassuring signal was **our own prior good work**. So enumerate the
+paths — read *and* write, worker *and* page — and check each one by name.
+
+**And when you find that something works, establish whether it works ON
+PURPOSE.** In that same investigation one case came out safe: a cross-origin
+Access redirect. It was not safe by design. It survived because the page's CSP
+happened to block the redirect, **and** because the resulting error text happened
+to match the offline regex. Two accidents in a row produced correct behaviour.
+
+**A behaviour that is correct by accident is a latent defect with a passing test
+in front of it.** Someone will later tidy that regex or relax that CSP and
+convert a passing case into data loss, with no test failing and no diff that
+looks dangerous. The only thing standing between it and a regression is a
+comment nobody has written yet. **Write the comment** — record luck as luck, in
+the code, in those words.
+
 **Always work in a worktree.** Never edit a repo's main checkout directly —
 branch into a git worktree, work there, and merge. This is the user's standing
 instruction and it is what makes parallel agents safe: a worktree cannot lose
