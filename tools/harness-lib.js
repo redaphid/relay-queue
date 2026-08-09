@@ -231,4 +231,33 @@ function listenEphemeral(server, host = '127.0.0.1', port = 0) {
   });
 }
 
-module.exports = { startServer, listenEphemeral, ServerHandle, SERVER };
+/**
+ * Confirm that what is listening at `base` is a relay-queue, before a tool
+ * starts posting to it.
+ *
+ * For the probes that talk to an ALREADY-RUNNING server rather than starting
+ * one — stt/tts-selftest against the real deployment on 3901. There is no
+ * nonce to check there, and no child to blame, but the failure mode is the
+ * same shape: an address is assumed, something else answers, and the run
+ * reports on a stranger. A GET of /health is read-only and settles it.
+ *
+ * @returns {Promise<object>} the /health body, so a caller can log the version.
+ */
+async function assertRelayAt(base) {
+  let health;
+  try {
+    const r = await fetch(`${base}/health`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    health = await r.json();
+  } catch (e) {
+    throw new Error(`nothing usable is answering at ${base} — ${e.message}. `
+      + 'Set RELAY_URL if the server is somewhere else.');
+  }
+  if (!health || health.name !== 'relay-queue') {
+    throw new Error(`${base} is answering, but it is not a relay-queue — /health said `
+      + `name=${JSON.stringify(health && health.name)}. Refusing to send it anything.`);
+  }
+  return health;
+}
+
+module.exports = { startServer, listenEphemeral, assertRelayAt, ServerHandle, SERVER };
