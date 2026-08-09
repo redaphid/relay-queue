@@ -446,10 +446,33 @@ infrastructure, state the rollback in the same breath.
 
 ### Hand humans a rollback that survives a moving base
 
-`git reset --hard <sha>` is correct only for as long as nothing else lands.
-`git reset --hard ORIG_HEAD` stays correct regardless. When you give a human a
-command they may run hours later, out of context, and possibly only once, **a
-hardcoded SHA is a trap you set for them.**
+`git reset --hard <sha>` is correct only for as long as nothing else lands. When
+you give a human a command they may run hours later, out of context, and
+possibly only once, **a hardcoded SHA is a trap you set for them.**
+
+`git reset --hard ORIG_HEAD` is the usual improvement, and it is a real one — a
+fast-forward merge does set `ORIG_HEAD` to the pre-merge commit, so after *his*
+merge it points where he wants. **But do not hand it over believing it is
+unconditionally safe.** `ORIG_HEAD` is a single slot per repository, overwritten
+by *any* operation that moves HEAD — including another agent's merge, minutes
+later, on a repo he is not watching. It cures staleness. It does not cure
+concurrency, which is the failure this project actually has.
+
+Measured in this very repo: after a run of agent merges, `ORIG_HEAD` and `HEAD`
+were **the same commit**, which makes `reset --hard ORIG_HEAD` a silent no-op —
+a rollback that reports success and rolls nothing back.
+
+**The robust form is a ref he creates himself, that nothing else will touch:**
+
+```sh
+git branch pre-merge-backup      # or: git tag pre-merge-backup
+# ...merge...
+git reset --hard pre-merge-backup
+```
+
+A named ref is immune to other agents, survives any number of intervening
+operations, and still reads clearly to him in six hours. `git reflog` is the
+fallback when nobody thought to make one.
 
 This is not theoretical. A rollback SHA handed over tonight went stale when main
 advanced, and running it at that point would have **silently discarded a commit**
