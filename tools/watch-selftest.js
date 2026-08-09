@@ -15,14 +15,19 @@
  *
  * Zero dependencies. Node built-ins only.
  */
-const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const { startServer } = require('./harness-lib');
 
-const SERVER = path.join(__dirname, '..', 'server.js');
-let nextPort = Number(process.env.TEST_PORT || 3987);
+/*
+ * Ports come from the OS, not from a guess. TEST_PORT is still honoured for a
+ * pinned run, and each server then takes the next one up — but a pinned port
+ * that is already taken now fails the run loudly instead of quietly handing
+ * the test to whoever is already there. See tools/harness-lib.js.
+ */
+let nextPort = Number(process.env.TEST_PORT || 0);
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -34,23 +39,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Spawns a server, waits for it, hands you a client, then always cleans up. */
 async function withServer(env, fn) {
-  const port = nextPort++;
-  const base = `http://127.0.0.1:${port}`;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-watch-'));
-  const proc = spawn(process.execPath, [SERVER], {
+  const srv = await startServer({
+    dir,
+    port: nextPort ? nextPort++ : 0,
+    label: 'watch',
     env: {
-      ...process.env,
-      PORT: String(port),
-      HOST: '127.0.0.1',
-      DATA_DIR: dir,
-      WATCH_SOURCE: '0', // never self-restart mid-test
       WATCH_TICK_MS: '400', // the deadman's clock, sped up so a stall is observable
       ...env,
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  proc.stdout.on('data', () => {});
-  proc.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
+  const base = srv.base;
 
   const api = (method, p, body) => fetch(base + p, {
     method,
@@ -86,16 +85,17 @@ async function withServer(env, fn) {
   }
 
   try {
-    let up = false;
-    for (let i = 0; i < 80 && !up; i++) {
-      try { up = (await fetch(base + '/health')).ok; } catch { await sleep(250); }
-    }
-    if (!up) throw new Error('test server never came up');
+    // No boot poll here any more: startServer only resolves once the child
+    // itself has answered with our nonce, so by this line the server we are
+    // about to drive is provably the one we spawned.
     await fn({ api, watch: () => api('GET', '/watch'), listen, pushed });
+  } catch (err) {
+    // Whatever the child said on its way down is usually the whole story.
+    process.stderr.write(`\n[server output]\n${srv.out}\n`);
+    throw err;
   } finally {
     if (stream) stream.destroy();
-    proc.kill();
-    await sleep(200);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows may hold the log */ }
   }
 }
