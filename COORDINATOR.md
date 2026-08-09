@@ -204,6 +204,13 @@ Established empirically, so nobody re-derives it:
   on schedule and all six arrived batched on an external poke.
 - **Cannot** self-schedule. No cron in a coordinator's toolset; and where cron
   does exist it is session-only, so it dies exactly when it would be needed.
+  The instance, because the abstract version keeps not landing: a coordinator
+  set a gate reminder for 17:28. Its session was killed at 23:31. The reminder
+  came due at 00:28 and never fired — the thing that was supposed to raise the
+  alarm had died an hour before the alarm, and nothing announced that. He made
+  his plane without us. **Anything time-critical must live outside Claude**: the
+  watchdog container, or pending work in the queue. A reminder you hold yourself
+  is not a reminder, it is a note in a burning building.
 - Therefore **something outside must poke you.** Today that is the main session.
   Nothing inside a Claude session outlives Claude.
 
@@ -341,6 +348,28 @@ A burst of taps settles into **one** notification after `CHECK_SETTLE_MS`
 **Do not add a per-tap message.** That was the first implementation and it put
 six messages in his thread for one packing session. It is also why nothing here
 pushes or speaks: he performed the action himself, seconds ago, with his thumb.
+
+### Ticks older than 2026-08-08T23:20Z are invisible to the endpoint
+
+Durable ticks began when the checklist feature landed, at **2026-08-08T23:20Z**.
+Before that a tick was a per-browser flag and left **no server record at all**,
+so `GET /tasks/<entryId>/checks` cannot report one and never will.
+
+This is not a small edge case today. At the time of writing the live event log
+holds **zero** `check` events — every list that exists predates the cutover,
+including the five he ticked at 23:01, nineteen minutes before it. So the
+endpoint currently answers "nothing is ticked" for the entire history, and it is
+answering honestly: it has no record, which is a different statement.
+
+**So: an empty result on an old list means "we have no record", not "he has not
+done it."** For anything from before the cutover, the tick *messages* in the
+conversation are the reliable evidence. For anything created since, the endpoint
+is authoritative and the messages are merely convenient.
+
+The failure this prevents is the tempting one: reading the endpoint's silence as
+fact and re-asking him to do things he already did, or rewriting an old list to
+"fix" it. That is inventing state he never set, and he has no way to tell it
+from a real regression.
 
 **A tick can be queued rather than written.** With no signal the page keeps it
 in a localStorage outbox, shows "queued — offline" on the row, and retries on
