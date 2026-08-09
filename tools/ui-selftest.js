@@ -1804,6 +1804,54 @@ async function main() {
       JSON.stringify(marks()[0].textContent));
   }
 
+  /*
+   * The two are recovered by DIFFERENT actions, so they must not share a word.
+   * "queued — offline" promises it will go by itself once there is signal. A
+   * challenge will not: it goes when he signs in again. Saying "offline" to a
+   * man who needs to log in is a smaller version of the same lie — comforting,
+   * and wrong about what to do next.
+   *
+   * `navigator.onLine` is the trap. It is a hint, not a fact, and a captive
+   * portal or a flaky hotspot can leave it false while a login page is coming
+   * back perfectly well — so a response in hand has to outrank the flag.
+   */
+  console.log('\nchecklists — a challenge is not the same as being offline');
+  {
+    const env = liveEnv();
+    await settle();
+    env.store.checkFail = 'challenge';
+    env.store.online = false;            // the browser insists there is no network...
+    env.agentReply('- [ ] passport', 'list-e');
+    await settle();
+    const marks = () => findAll(env.els.list, byClass('tmark'));
+    const box = boxesIn(env)[0];
+    box.checked = true;
+    box.dispatch('change');
+    await settle();
+    // ...but a login page came back, so plainly there IS a network.
+    check('*** a login page is never called "offline", whatever navigator.onLine claims ***',
+      !/offline/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
+    check('...it names the thing that will actually fix it',
+      /sign in/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
+    check('...and the tick is still held', /list-e#0/.test(String(env.sandbox.localStorage.getItem('relay.checks.outbox'))),
+      String(env.sandbox.localStorage.getItem('relay.checks.outbox')));
+
+    // A genuine tunnel, same offline flag, must still say "queued — offline".
+    const env2 = liveEnv();
+    await settle();
+    env2.store.checkFail = 'network';
+    env2.store.online = false;
+    env2.agentReply('- [ ] passport', 'list-f');
+    await settle();
+    const b2 = boxesIn(env2)[0];
+    b2.checked = true;
+    b2.dispatch('change');
+    await settle();
+    check('*** while a real tunnel still says "queued — offline", unchanged ***',
+      /queued/i.test(findAll(env2.els.list, byClass('tmark'))[0].textContent),
+      JSON.stringify(findAll(env2.els.list, byClass('tmark'))[0].textContent));
+  }
+
   console.log('\nchecklists — an HTML-bodied 401 is a challenge, not a refusal');
   {
     const env = liveEnv();
