@@ -280,6 +280,57 @@ entire class impossible rather than merely discouraged:
 git worktree add /tmp/probe --detach main
 ```
 
+### Removing a worktree can delete the LIVE app's node_modules
+
+The single most dangerous fact on this disk. Some worktrees have a
+`node_modules` that is not a directory but a **Windows junction pointing at the
+real one**. Verified, not assumed — three of them today:
+
+```
+D:\projects\relay-panel\node_modules              Junction -> D:\projects\relay-queue\node_modules
+D:\projects\relay-ports\node_modules              Junction -> D:\projects\relay-queue\node_modules
+D:\projects\relay-queue-wt-listening\node_modules Junction -> D:\projects\relay-queue\node_modules
+```
+
+**A recursive delete follows the junction and destroys the contents of the real
+one** — the live application's dependencies. That is true of `rm -rf`,
+`Remove-Item -Recurse`, `git worktree remove`, and Explorer alike. The worktree
+looks like disposable scratch space; the junction inside it is pointed at the
+deployment.
+
+**Unlink first, then remove.** `rmdir` without `/s` deletes the link and never
+the target:
+
+```sh
+cmd /c rmdir "D:\projects\<worktree>\node_modules"   # NO /s — link only
+cd D:/projects/relay-queue && git worktree remove <path>
+```
+
+The generalisable part is the reason: **a junction is indistinguishable from a
+real directory to almost every tool that deletes things**, so the blast radius
+points *outward*, from the disposable thing to the precious one. Before acting
+on a directory, check what it actually points at — `Get-Item <path> -Force` shows
+`LinkType` and `Target`.
+
+This is live right now: **there are 15 registered worktrees**, so "tidy up the
+leftovers" is a natural, well-intentioned next task, and the obvious way to do it
+takes down his page. It was found only because someone looked before deleting.
+
+**If it already happened — recovery, and read this before panicking.** Nothing
+irreplaceable is lost. But `npm install` **will not fix it**, and that is worth
+knowing in the moment: `package.json` has *zero* dependencies and does not
+mention playwright, because the browser tooling was installed with `--no-save`.
+`npm install` would cheerfully succeed and restore nothing. The real repair is:
+
+```sh
+cd D:/projects/relay-queue && npm i --no-save playwright
+```
+
+The browser binaries live in `~/AppData/Local/ms-playwright`, outside
+`node_modules`, so they survive the deletion and usually need no reinstall. The
+server itself has no runtime dependencies at all — **relay keeps running
+throughout.** Only the dev tooling, `mobile-selftest` above all, is affected.
+
 **Front-end merges deploy INSTANTLY — there is no restart to hide behind.** The
 whole working tree is bind-mounted read-only into the container
 (`D:/projects/relay-queue:/app:ro`), and `public/index.html` is served straight
