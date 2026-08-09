@@ -18,12 +18,17 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const V = require('./voice-lib');
+const { assertRelayAt } = require('./harness-lib');
 
 const RELAY = process.env.RELAY_URL || 'http://127.0.0.1:3901';
 const PIPER_HOST = process.env.PIPER_HOST || '127.0.0.1';
 const PIPER_PORT = Number(process.env.PIPER_PORT || 10200);
 
 async function main() {
+  // 3901 is an assumption, not a fact — check it before sending audio at it.
+  const relay = await assertRelayAt(RELAY);
+  console.log(`relay ${RELAY} — ${relay.name} v${relay.version}`);
+
   const args = process.argv.slice(2);
   const ti = args.indexOf('--text');
   const spoken = ti >= 0 ? args[ti + 1] : 'The quick brown fox jumps over the lazy dog.';

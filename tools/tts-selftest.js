@@ -27,6 +27,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const V = require('./voice-lib');
+const { assertRelayAt } = require('./harness-lib');
 
 const RELAY = process.env.RELAY_URL || 'http://127.0.0.1:3901';
 const MIN_RMS = 0.005; // below this it is silence, not speech
@@ -60,6 +61,10 @@ async function speak(text) {
 }
 
 async function main() {
+  // 3901 is an assumption, not a fact — check it before asking it to speak.
+  const relay = await assertRelayAt(RELAY);
+  console.log(`\nrelay ${RELAY} — ${relay.name} v${relay.version}`);
+
   const args = process.argv.slice(2);
   const ti = args.indexOf('--text');
   const text = ti >= 0 ? args[ti + 1] : 'Forty two widgets are on hand and three are backordered.';
