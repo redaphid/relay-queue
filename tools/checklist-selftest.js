@@ -28,15 +28,21 @@
  *
  * Nothing here touches the real data directory. Zero dependencies.
  */
-const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { startServer } = require('./harness-lib');
 
-const SERVER = path.join(__dirname, '..', 'server.js');
-const PORT = Number(process.env.CHECKLIST_TEST_PORT || 3919);
-const BASE = `http://127.0.0.1:${PORT}`;
+/*
+ * The port is whatever the OS hands out, and the server under test proves it is
+ * the one that answered before a single assertion runs — see
+ * tools/harness-lib.js. CHECKLIST_TEST_PORT still pins it for a deliberate run.
+ */
+const PORT = Number(process.env.CHECKLIST_TEST_PORT || 0);
 const SETTLE_MS = 400; // the debounce window, shortened so the test is quick
+
+/** The running server, set by boot(). Everything below reads srv.base. */
+let srv = null;
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -46,9 +52,9 @@ function check(name, cond, detail) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const get = async (p) => (await fetch(BASE + p)).json();
+const get = async (p) => (await fetch(srv.base + p)).json();
 async function post(p, body) {
-  const res = await fetch(BASE + p, {
+  const res = await fetch(srv.base + p, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body === undefined ? {} : body),
@@ -56,42 +62,15 @@ async function post(p, body) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
-function stop(proc) {
-  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
-  const gone = new Promise((r) => proc.once('exit', r));
-  proc.kill('SIGTERM');
-  return gone;
-}
-
-async function waitForBoot(proc) {
-  for (let i = 0; i < 100; i++) {
-    if (proc.exitCode !== null) throw new Error(`server exited early with code ${proc.exitCode}`);
-    try {
-      const r = await fetch(`${BASE}/health`);
-      if (r.ok) return;
-    } catch { /* not listening yet */ }
-    await sleep(100);
-  }
-  throw new Error('server did not start listening');
-}
-
-function boot(dir) {
-  const proc = spawn(process.execPath, [SERVER], {
-    env: {
-      ...process.env,
-      DATA_DIR: dir,
-      PORT: String(PORT),
-      HOST: '127.0.0.1',
-      WATCH_SOURCE: '0',
-      CHECK_SETTLE_MS: String(SETTLE_MS),
-      PUSH: '0',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+/** Boot the server under test and adopt it as the one `get`/`post` talk to. */
+async function boot(dir) {
+  srv = await startServer({
+    dir,
+    port: PORT,
+    label: 'checklist',
+    env: { CHECK_SETTLE_MS: String(SETTLE_MS), PUSH: '0' },
   });
-  proc.out = '';
-  proc.stdout.on('data', (c) => { proc.out += c; });
-  proc.stderr.on('data', (c) => { proc.out += c; });
-  return proc;
+  return srv;
 }
 
 /** Post a question and answer it, so the checklist lives on the reply entry. */
@@ -124,11 +103,9 @@ const PACKING = [
 
 async function main() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-checklist-'));
-  let proc = boot(dir);
+  await boot(dir);
 
   try {
-    await waitForBoot(proc);
-
     // ------------------------------------------------------------- parsing
     console.log('\nparsing — what counts as an item, and in what order');
     const entryId = await listMessage(PACKING);
@@ -149,7 +126,7 @@ async function main() {
     check('the summary counts agree', cl.done === 1 && cl.remaining === 4,
       `${cl.done}/${cl.total}`);
     check('a message with no task list has no checklist at all',
-      (await (await fetch(`${BASE}/tasks/${entryId.replace(':r', '')}/checks`)).status) === 404);
+      (await (await fetch(`${srv.base}/tasks/${entryId.replace(':r', '')}/checks`)).status) === 404);
 
     // ------------------------------------------------------------- writing
     console.log('\nwriting — a tick is an event, with a name on it');
@@ -311,9 +288,9 @@ async function main() {
     check('...recording the entry, index, who and when',
       /"entryId":"[^"]+","index":0,"on":true,"by":"web\/abc12345","at":"/.test(logBefore));
 
-    await stop(proc);
-    proc = boot(dir);
-    await waitForBoot(proc);
+    // Same DATA_DIR, new process, new port — the handle carries the address so
+    // `get` and `post` need no telling.
+    await srv.restart();
 
     const revived = await get(`/tasks/${entryId}/checks`);
     check('*** every tick came back after a restart ***', revived.done === 5,
@@ -328,12 +305,12 @@ async function main() {
       fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').startsWith(logBefore));
 
     console.log('\ndurability — a log from a build that never heard of checklists still loads');
-    check('the server booted clean on replay', /events replayed/.test(proc.out),
-      proc.out.split('\n').find((l) => /replayed/.test(l)));
-    check('...with nothing skipped', /0 skipped/.test(proc.out),
-      proc.out.split('\n').find((l) => /replayed/.test(l)));
+    check('the server booted clean on replay', /events replayed/.test(srv.out),
+      srv.out.split('\n').find((l) => /replayed/.test(l)));
+    check('...with nothing skipped', /0 skipped/.test(srv.out),
+      srv.out.split('\n').find((l) => /replayed/.test(l)));
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows may hold it */ }
   }
 
