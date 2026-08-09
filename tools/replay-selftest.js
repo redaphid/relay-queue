@@ -23,15 +23,20 @@
  *
  * Nothing here touches the real data directory. Zero dependencies.
  */
-const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { startServer } = require('./harness-lib');
 
-const SERVER = path.join(__dirname, '..', 'server.js');
-const PORT = Number(process.env.REPLAY_TEST_PORT || 3917);
-const BASE = `http://127.0.0.1:${PORT}`;
+/*
+ * No fixed ports. Each phase asks the OS for a free one and learns which it got
+ * from the child itself; see tools/harness-lib.js for why anything else is a
+ * coin flip. REPLAY_TEST_PORT still works, but it is a REQUEST — if it is
+ * occupied the run fails loudly instead of quietly testing whoever is there.
+ */
+const PORT = Number(process.env.REPLAY_TEST_PORT || 0);
+const askPort = (n) => (PORT ? PORT + n : 0);
 
 // A log exactly as previous versions wrote it: no `role`, no `conversationId`.
 const OLD_LOG = [
@@ -62,34 +67,6 @@ async function postAt(base, p, body) {
   });
   return { status: res.status, body: await res.json() };
 }
-const get = (p) => getAt(BASE, p);
-const post = (p, body) => postAt(BASE, p, body);
-
-/*
- * Stop a child and wait for it to actually be gone. A process killed by a signal
- * reports exitCode === null (signalCode carries the signal), so a naive
- * `exitCode === null` guard re-kills an already-dead child and then awaits an
- * 'exit' event that fired long ago — which hangs silently and, once the event
- * loop drains, ends the run with no output and a success code.
- */
-function stop(proc) {
-  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
-  const gone = new Promise((r) => proc.once('exit', r));
-  proc.kill('SIGTERM');
-  return gone;
-}
-
-async function waitForBoot(proc, base = BASE) {
-  for (let i = 0; i < 100; i++) {
-    if (proc.exitCode !== null) throw new Error(`server exited early with code ${proc.exitCode}`);
-    try {
-      const r = await fetch(`${base}/health`);
-      if (r.ok) return;
-    } catch { /* not listening yet */ }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error('server did not start listening');
-}
 
 async function main() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-replay-'));
@@ -100,22 +77,18 @@ async function main() {
   const beforeBytes = fs.readFileSync(logFile);
 
   console.log(`\nbooting server.js on a scratch DATA_DIR (${dir})`);
-  const proc = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, DATA_DIR: dir, PORT: String(PORT), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let out = '';
-  proc.stdout.on('data', (c) => { out += c; });
-  proc.stderr.on('data', (c) => { out += c; });
+  const srv = await startServer({ dir, port: askPort(0), label: 'replay' });
+  console.log(`  (it took port ${srv.port}, and proved it was the one that answered)`);
+  const get = (p) => getAt(srv.base, p);
+  const post = (p, body) => postAt(srv.base, p, body);
 
   try {
-    await waitForBoot(proc);
-
     console.log('\nan old log replays');
     const health = await get('/health');
     check('the server came up', health.status === 'ok');
-    check('all 5 old events replayed', /5 events replayed/.test(out), out.split('\n').find((l) => /replayed/.test(l)));
-    check('the torn final line was skipped, not fatal', /1 skipped/.test(out));
+    check('all 5 old events replayed', /5 events replayed/.test(srv.out),
+      srv.out.split('\n').find((l) => /replayed/.test(l)));
+    check('the torn final line was skipped, not fatal', /1 skipped/.test(srv.out));
     check('all 3 old tasks are loaded', health.counts.pending + health.counts.claimed + health.counts.done === 3,
       JSON.stringify(health.counts));
 
@@ -194,27 +167,18 @@ async function main() {
       (await get('/conversations?archived=only')).conversations.some((c) => c.id === conv.body.id));
 
     console.log('\nit survives a restart with the new records in the log');
-    await stop(proc);
-    const proc2 = spawn(process.execPath, [SERVER], {
-      env: { ...process.env, DATA_DIR: dir, PORT: String(PORT), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let out2 = '';
-    proc2.stdout.on('data', (c) => { out2 += c; });
-    try {
-      await waitForBoot(proc2);
-      const after = await get('/conversations?archived=1');
-      check('the created conversation survived the restart',
-        after.conversations.some((c) => c.id === conv.body.id && c.title === 'Second thread'));
-      check('its agent survived', after.conversations.some((c) => c.agent === 'coordinator-9'));
-      check('its archived flag survived', after.conversations.some((c) => c.id === conv.body.id && c.archived === true));
-      check('the old messages are still there',
-        (await get('/tasks')).tasks.some((t) => t.id === 'old-1'));
-    } finally {
-      await stop(proc2);
-    }
+    // The replacement process gets its own port and its own nonce; `get` and
+    // `post` follow it because they read srv.base at call time.
+    await srv.restart();
+    const after = await get('/conversations?archived=1');
+    check('the created conversation survived the restart',
+      after.conversations.some((c) => c.id === conv.body.id && c.title === 'Second thread'));
+    check('its agent survived', after.conversations.some((c) => c.agent === 'coordinator-9'));
+    check('its archived flag survived', after.conversations.some((c) => c.id === conv.body.id && c.archived === true));
+    check('the old messages are still there',
+      (await get('/tasks')).tasks.some((t) => t.id === 'old-1'));
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows may hold it briefly */ }
   }
 
@@ -251,12 +215,12 @@ function fakeSubscription(n) {
  */
 async function pushChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-push-'));
-  const port = PORT + 4;
-  const base = `http://127.0.0.1:${port}`;
-  let proc = spawn(process.execPath, [SERVER], {
+  const srv = await startServer({
+    dir,
+    port: askPort(4),
+    label: 'push',
     env: {
-      ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1',
-      WATCH_SOURCE: '0', PUSH_DEBOUNCE_MS: '120',
+      PUSH_DEBOUNCE_MS: '120',
       /*
        * The hourly ceiling is deliberately NOT the variable under test here.
        * This one long-lived server flushes a dozen notifications in a few
@@ -267,12 +231,14 @@ async function pushChecks() {
        */
       PUSH_PER_HOUR: '1000',
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  proc.stdout.on('data', () => {});
-  proc.stderr.on('data', () => {});
-  const g = (p) => getAt(base, p);
-  const p_ = (path_, body) => postAt(base, path_, body);
+  /*
+   * Read through the handle, never through a cached URL: a restart moves the
+   * port, and the whole point of this rewrite is that the address is something
+   * the child tells us rather than something we assume.
+   */
+  const g = (p) => getAt(srv.base, p);
+  const p_ = (path_, body) => postAt(srv.base, path_, body);
   const stats = async () => (await g('/push/config')).stats;
   const settle = () => sleep(400); // comfortably past the 120ms debounce
   const hhmm = (m) => {
@@ -285,8 +251,6 @@ async function pushChecks() {
   };
 
   try {
-    await waitForBoot(proc, base);
-
     console.log('\npush — the server offers a key and starts disarmed');
     {
       const cfg = await g('/push/config');
@@ -567,7 +531,7 @@ async function pushChecks() {
        * without this a service worker could pass every browser test and still be
        * blocked in production by the old `worker-src blob:`.
        */
-      const sw = await fetch(`${base}/sw.js`);
+      const sw = await fetch(`${srv.base}/sw.js`);
       check('/sw.js is served', sw.status === 200, String(sw.status));
       check('...as javascript', String(sw.headers.get('content-type')).indexOf('javascript') >= 0,
         String(sw.headers.get('content-type')));
@@ -605,7 +569,7 @@ async function pushChecks() {
       check('...and there is a way to throw it all away from the page',
         body.indexOf('forget-offline') >= 0);
 
-      const page = await fetch(`${base}/`);
+      const page = await fetch(`${srv.base}/`);
       const csp = String(page.headers.get('content-security-policy'));
       check('the CSP allows a same-origin worker', csp.indexOf("worker-src 'self'") >= 0, csp);
       check('...while still allowing the audio worklet blob', csp.indexOf('blob:') >= 0);
@@ -618,7 +582,7 @@ async function pushChecks() {
 
     console.log('\ninstallable — the manifest and the icons Android insists on');
     {
-      const mf = await fetch(`${base}/manifest.webmanifest`);
+      const mf = await fetch(`${srv.base}/manifest.webmanifest`);
       check('the manifest is served', mf.status === 200, String(mf.status));
       check('...with the type that makes it a manifest',
         String(mf.headers.get('content-type')).indexOf('application/manifest+json') >= 0,
@@ -641,7 +605,7 @@ async function pushChecks() {
         (m.icons || []).some((i) => String(i.purpose).indexOf('maskable') >= 0), JSON.stringify(m.icons));
 
       for (const icon of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png']) {
-        const r = await fetch(`${base}/${icon}`);
+        const r = await fetch(`${srv.base}/${icon}`);
         const buf = Buffer.from(await r.arrayBuffer());
         check(`/${icon} is a real PNG`,
           r.status === 200 && buf.subarray(0, 8).toString('hex') === '89504e470d0a1a0a',
@@ -649,29 +613,22 @@ async function pushChecks() {
       }
       // The declared size and the actual pixels must agree, or Android quietly
       // ignores the icon and installs a letter in a grey circle instead.
-      const big = Buffer.from(await (await fetch(`${base}/icon-512.png`)).arrayBuffer());
+      const big = Buffer.from(await (await fetch(`${srv.base}/icon-512.png`)).arrayBuffer());
       check('...and 512 means 512', big.readUInt32BE(16) === 512 && big.readUInt32BE(20) === 512,
         `${big.readUInt32BE(16)}x${big.readUInt32BE(20)}`);
 
       check('an icon that does not exist is a 404, not a file off disk',
-        (await fetch(`${base}/icon-999.png`)).status === 404);
+        (await fetch(`${srv.base}/icon-999.png`)).status === 404);
       // There is no path join anywhere near this route, and this is the check
       // that says so out loud.
-      const trav = await fetch(`${base}/${encodeURIComponent('../server.js')}`);
+      const trav = await fetch(`${srv.base}/${encodeURIComponent('../server.js')}`);
       check('...and the icon route cannot be walked out of', trav.status === 404, String(trav.status));
     }
 
     console.log('\npush — what he armed survives a restart');
     {
       const keyBefore = (await g('/push/config')).vapidPublicKey;
-      await stop(proc);
-      proc = spawn(process.execPath, [SERVER], {
-        env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      proc.stdout.on('data', () => {});
-      proc.stderr.on('data', () => {});
-      await waitForBoot(proc, base);
+      await srv.restart();
       const cfg = await g('/push/config?deviceId=devicefirefox1');
       check('the armed device replayed from the log', cfg.devices.length === 1, String(cfg.devices.length));
       check('...and is still recognised as this browser', cfg.subscribedHere === true);
@@ -684,7 +641,7 @@ async function pushChecks() {
       check('...and the counters reset with the process', cfg.stats.queued === 0);
     }
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
   }
 }
@@ -698,19 +655,9 @@ async function pushChecks() {
  */
 async function statusChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-status-'));
-  const port = PORT + 1;
-  const base = `http://127.0.0.1:${port}`;
-  const proc = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  proc.stdout.on('data', () => {});
+  const srv = await startServer({ dir, port: askPort(1), label: 'status' });
+  const base = srv.base;
   try {
-    for (let i = 0; i < 100; i++) {
-      try { if ((await fetch(`${base}/health`)).ok) break; } catch { /* not up */ }
-      await new Promise((r) => setTimeout(r, 100));
-    }
-
     console.log('\nstatus — an empty queue is calm, not broken');
     let s = await getAt(base, '/status?engines=0');
     check('nothing waiting reads as idle', s.headline.level === 'idle',
@@ -775,7 +722,7 @@ async function statusChecks() {
       fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8') === before,
       'the event log grew — one line per poll would bury the real history');
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
   }
 
@@ -795,8 +742,6 @@ async function statusChecks() {
  */
 async function stuckChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-stuck-'));
-  const port = PORT + 2;
-  const base = `http://127.0.0.1:${port}`;
   const stale = new Date(Date.now() - 9 * 60 * 1000).toISOString();
   fs.writeFileSync(path.join(dir, 'events.jsonl'), JSON.stringify({
     t: 'create',
@@ -807,16 +752,9 @@ async function stuckChecks() {
     },
   }) + '\n');
 
-  const proc = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  proc.stdout.on('data', () => {});
+  const srv = await startServer({ dir, port: askPort(2), label: 'stuck' });
+  const base = srv.base;
   try {
-    for (let i = 0; i < 100; i++) {
-      try { if ((await fetch(`${base}/health`)).ok) break; } catch { /* not up */ }
-      await new Promise((r) => setTimeout(r, 100));
-    }
     await postAt(base, '/conversations/main', { agent: 'coordinator' });
     await postAt(base, '/heartbeat', { agent: 'coordinator', note: 'still here!' });
 
@@ -848,7 +786,7 @@ async function stuckChecks() {
       cs2.agentState.state !== 'stuck' && cs2.agentState.state !== 'silent',
       JSON.stringify(cs2.agentState));
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
   }
 }
@@ -861,23 +799,11 @@ async function stuckChecks() {
  */
 async function protocolChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-protocol-'));
-  const port = PORT + 3;
-  const base = `http://127.0.0.1:${port}`;
-  const proc = spawn(process.execPath, [SERVER], {
-    env: {
-      ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1',
-      WATCH_SOURCE: '0', CLAIM_LEASE_MS: '1200',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  proc.stdout.on('data', () => {});
-  proc.stderr.on('data', () => {});
-  const g = (p) => getAt(base, p);
-  const p_ = (path_, body) => postAt(base, path_, body);
+  const srv = await startServer({ dir, port: askPort(3), label: 'protocol', env: { CLAIM_LEASE_MS: '1200' } });
+  const g = (p) => getAt(srv.base, p);
+  const p_ = (path_, body) => postAt(srv.base, path_, body);
 
   try {
-    await waitForBoot(proc, base);
-
     /*
      * 4.4, verbatim. An agent chains result-then-relayed in one command; the
      * result POST fails on a malformed body; the relayed POST must not then
@@ -1035,29 +961,20 @@ async function protocolChecks() {
     check('a bad channel name is refused', (await p_('/messages', { text: 'x', channel: 'has spaces' })).status === 400);
 
     console.log('\nit all survives a restart, because it is only ever the event log');
-    await stop(proc);
-    const proc2 = spawn(process.execPath, [SERVER], {
-      env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', WATCH_SOURCE: '0' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    proc2.stdout.on('data', () => {});
-    proc2.stderr.on('data', () => {});
-    try {
-      await waitForBoot(proc2, base);
-      check('the agent\'s own message replayed as the agent\'s',
-        (await g('/thread?conversation=main')).entries.some((e) => e.role === 'agent' && e.text === 'the sync finished'));
-      check('*** internal traffic is STILL invisible after a replay ***',
-        !(await g('/thread')).entries.some((e) => /hands off/.test(e.text))
-        && !(await g('/conversations')).conversations.some((c) => c.id === '#agents'));
-      check('...and still readable on its channel', (await g('/messages?channel=agents')).count === 1);
-      check('the takeover survived', (await g(`/tasks/${held.body.id}`)).takenOverFrom === 'romeo');
-      check('the relayed guard still holds after a replay',
-        (await p_(`/tasks/${(await p_('/tasks', { text: 'fresh' })).body.id}/relayed`, {})).status === 409);
-    } finally {
-      await stop(proc2);
-    }
+    // A fresh process on a fresh port, and `g`/`p_` follow it. The CLAIM_LEASE
+    // override is carried over by the handle.
+    await srv.restart();
+    check('the agent\'s own message replayed as the agent\'s',
+      (await g('/thread?conversation=main')).entries.some((e) => e.role === 'agent' && e.text === 'the sync finished'));
+    check('*** internal traffic is STILL invisible after a replay ***',
+      !(await g('/thread')).entries.some((e) => /hands off/.test(e.text))
+      && !(await g('/conversations')).conversations.some((c) => c.id === '#agents'));
+    check('...and still readable on its channel', (await g('/messages?channel=agents')).count === 1);
+    check('the takeover survived', (await g(`/tasks/${held.body.id}`)).takenOverFrom === 'romeo');
+    check('the relayed guard still holds after a replay',
+      (await p_(`/tasks/${(await p_('/tasks', { text: 'fresh' })).body.id}/relayed`, {})).status === 409);
   } finally {
-    await stop(proc);
+    await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows */ }
   }
 }
