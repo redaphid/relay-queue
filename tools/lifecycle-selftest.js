@@ -29,6 +29,7 @@
  * Scratch DATA_DIR, own port, zero dependencies. Touches nothing real.
  */
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -125,26 +126,49 @@ async function waitForBoot(proc) {
 
   BASE = `http://127.0.0.1:${port}`;
 
-  // It said it was listening; confirm it actually answers before we rely on it.
+  /*
+   * It said it was listening; now confirm the thing answering at that address is
+   * still it. Learning the port from the child proves where it WAS; the boot
+   * nonce proves who is there NOW — the child could die between printing that
+   * line and our first request, and a squatter could take the port in the gap.
+   * Small window, but this whole file exists because "small window" is how a
+   * harness ends up reporting a stranger's findings as fact.
+   */
   for (let i = 0; i < 100; i++) {
     if (proc.exitCode !== null) {
       throw new Error(`server died just after announcing port ${port}.\n--- its output ---\n${proc.output}`);
     }
     try {
       const r = await fetch(`${BASE}/health`);
-      if (r.ok) return port;
-    } catch { /* still coming up */ }
+      if (r.ok) {
+        const h = await r.json();
+        if (h.boot !== proc.nonce) {
+          throw new Error(
+            `something else is on port ${port}: /health returned boot=${JSON.stringify(h.boot)}, `
+            + `expected ${JSON.stringify(proc.nonce)}. Refusing to test against it.`);
+        }
+        return port;
+      }
+    } catch (err) {
+      if (/Refusing to test against it/.test(err.message)) throw err;
+      /* still coming up */
+    }
     await sleep(50);
   }
   throw new Error(`server announced port ${port} but /health never answered.\n--- its output ---\n${proc.output}`);
 }
 
 function boot(dir) {
+  // Fresh per boot, including the restart mid-run: a nonce reused across boots
+  // would still match if the OLD process somehow survived, which is one of the
+  // things it is here to detect.
+  const nonce = crypto.randomUUID();
   const proc = spawn(process.execPath, [SERVER], {
     env: {
       ...process.env,
       DATA_DIR: dir,
       PORT: String(PORT), // 0 = let the OS choose; we read the real one back
+      RELAY_BOOT_NONCE: nonce, // echoed on /health; see waitForBoot
       HOST: '127.0.0.1',
       WATCH_SOURCE: '0',
       // Squeezed so the stalled-work transitions are reachable in seconds
@@ -163,6 +187,7 @@ function boot(dir) {
    * discarded on the way past. When this harness fails, the reason is almost
    * always in here.
    */
+  proc.nonce = nonce;
   proc.output = '';
   const tee = (stream, mark) => stream.on('data', (d) => {
     const s = String(d);
