@@ -16,6 +16,15 @@ const NAME = 'relay-queue';
 const VERSION = '1.5.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
+/*
+ * A one-shot token a test harness passes in so it can prove the server it
+ * reached is the child it spawned, and not a stranger already holding that
+ * port. Unset in production, where it reads as null everywhere. See
+ * tools/harness-lib.js — without this, a harness whose child died at birth
+ * happily interrogates whatever else is listening and reports its findings as
+ * fact.
+ */
+const BOOT_NONCE = process.env.RELAY_BOOT_NONCE || null;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'events.jsonl');
 // Where the UI page is read from, first match wins. `public/index.html` is the source of
@@ -3592,6 +3601,8 @@ async function route(req, res) {
       status: 'ok',
       name: NAME,
       version: VERSION,
+      boot: BOOT_NONCE, // null in production; a harness's proof of identity
+      port: server.address() ? server.address().port : PORT,
       counts: counts(),
       conversations: conversations.size,
       streams: streams.size,
@@ -3890,6 +3901,14 @@ server.listen(PORT, HOST, () => {
   const bound = server.address();
   const boundPort = bound && typeof bound === 'object' ? bound.port : PORT;
   console.log(`${NAME} v${VERSION} listening on http://${HOST}:${boundPort}`);
+  /*
+   * The same fact again, machine-readable, and this time signed. Knowing the
+   * port a child bound proves where it is; echoing back the caller's nonce
+   * proves the thing answering there is that child and not a stranger who was
+   * already holding the socket. Only printed under test, where a nonce was
+   * supplied. See tools/harness-lib.js.
+   */
+  if (BOOT_NONCE) console.log(`boot: port=${boundPort} nonce=${BOOT_NONCE}`);
   console.log(`log: ${LOG_FILE} (${replayed.events} events replayed, ${replayed.skipped} skipped)`);
   const ui = findUiFile();
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);
