@@ -161,6 +161,47 @@ looks dangerous. The only thing standing between it and a regression is a
 comment nobody has written yet. **Write the comment** — record luck as luck, in
 the code, in those words.
 
+**`git bisect` launders an environmental fault into an innocent commit.** Bisect
+assumes the only thing that varies is the code. When something in the
+environment is also broken, bisect inherits that fault and converts it into a
+*specific, confident, wrong* culprit — and its output is indistinguishable from a
+correct one, which is exactly what makes it dangerous.
+
+The case: `replay-selftest` failed on unmodified `main`. The cause was not in the
+repository at all — a stray relay server was squatting port 3921, left behind by
+a worker that died, backgrounded so it outlived its shell. Its `/health` answers,
+so a harness that hardcodes a port binds to *it*; running with `PUSH=0`, its
+`/push/config` returns a null VAPID key, which reads convincingly as a push-key
+defect.
+
+**A bisect would have blamed `cd89a66`** — the commit that introduced push, and
+so the first commit that touches 3921. Clean boundary, parent passes, child
+fails, a precise and plausible answer. **That commit scores 228/228 on a free
+port. It is entirely innocent.** The only reason we have the truth is that the
+investigating agent recognised the result as an artefact and refused to report
+it.
+
+So before trusting a bisect, establish that the failure reproduces **for a reason
+that lives in the repository**: run the suspect commit in a clean environment on
+a free port and see whether it still fails. **A suspiciously tidy boundary is
+grounds for suspicion, not confidence.** And note this repo makes bisect doubly
+hazardous — see *"in that repo, `git checkout` is a deploy"* above; do it in a
+throwaway worktree or not at all.
+
+Two companions:
+
+- **A backgrounded test server outlives its shell.** A dead agent's stray process
+  keeps answering `/health` long after the agent is gone. This is why harnesses
+  must be immune to squatters **by construction** — ephemeral port, prove you
+  reached your own child, as above — and not by everyone remembering to clear
+  ports. Remembering does not scale to agents that die mid-run.
+- **A recurring known-benign failure is not free.** This stray had been
+  root-caused three separate times before, roughly an hour each. The fourth
+  person to see a failure on 3921 will assume it is the known stray — and may
+  wave through a genuine failure hiding behind it. Alarm fatigue converts your
+  red lights into decoration. Fix the cause or make the check immune; do not let
+  the team learn to ignore it.
+
 **Always work in a worktree.** Never edit a repo's main checkout directly —
 branch into a git worktree, work there, and merge. This is the user's standing
 instruction and it is what makes parallel agents safe: a worktree cannot lose
