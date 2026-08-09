@@ -62,6 +62,41 @@ install step is why it will quietly stop being run — a test that looks like
 coverage but never executes is how the last breakage reached the user. Run it
 anyway.
 
+**Judge a suite by its exit code, never by the absence of "FAIL".** A harness
+that aborts prints no failures *and* no verdict, so "everything passed" and
+"nothing ran" are the same text. Read `$?`. If you also want a belt, require the
+suite's closing `all checks passed` line — a summary is only printed by a run
+that reached the end.
+
+**And make sure it was YOUR server that answered.** This is the other half of
+the same idea, and the more expensive one to learn. A harness that binds a fixed
+port does not fail when the bind fails: the child exits on `EADDRINUSE`, the
+boot-wait polls `/health`, and *whoever already owns that port* answers. The
+suite then interrogates a stranger — a few checks fail incoherently and the rest
+**pass**, which is a green earned against the wrong process. Two suites here
+independently chose 3919, and a leaked scratch server once made `replay-selftest`
+report seven failures that had nothing to do with any code.
+
+So do not choose the port, **learn** it: `PORT=0` asks the OS for a free one, and
+the harness reads which one it got from the child's own stdout. Then talking to a
+stranger is not unlikely, it is unrepresentable — there is no address to talk to
+until your own child supplies one. While you are there, never register empty
+`'data'` handlers on the child's pipes; that is worse than not reading them,
+because it drains the pipe and discards the stack trace explaining the failure.
+
+**Then prove the check can fail.** A test you cannot make fail on purpose has
+not been shown to measure anything. The way to demonstrate this one is to build
+a deliberate impostor: stand up a fake server on the port whose `/health`
+answers `ok` convincingly, point the harness at it, and require that the harness
+notices. `lifecycle-selftest` was verified exactly so — **exit 1, zero checks
+executed**, where the previous version would have sailed past that `/health` and
+run all 61 against a stranger.
+
+The through-line, because this project keeps relearning it from a new angle: a
+passing suite and a suite that never ran look identical from outside, and so do
+a correct server and a convincing impostor. In both cases the answer is
+provenance — prove the thing that answered you is the thing you started.
+
 **Always work in a worktree.** Never edit a repo's main checkout directly —
 branch into a git worktree, work there, and merge. This is the user's standing
 instruction and it is what makes parallel agents safe: a worktree cannot lose
