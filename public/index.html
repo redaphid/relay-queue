@@ -5015,7 +5015,13 @@
   setInterval(refreshTimes, 30000);
   initConvs();
   initStatus();
-  initActivity();
+  // Guarded like every other non-load-bearing feature here: reading and sending
+  // messages must not depend on the activity panel wiring itself up.
+  try {
+    initActivity();
+  } catch (err) {
+    logClient('activity-init-failed', { message: (err && err.message) || String(err) });
+  }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is
   // load-bearing for reading and sending messages.
