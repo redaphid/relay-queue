@@ -227,9 +227,39 @@ const ACTIVITY = new Map(); // conversationId -> entry[] (oldest first)
 const ACTIVITY_CAP = Number(process.env.ACTIVITY_CAP || 200); // per conversation
 const ACTIVITY_CONVS = 50; // distinct conversations tracked before the quietest is dropped
 const DURABLE_KINDS = new Set(['spawned', 'finished', 'worktree']);
+// How far back an explicit `at` may reach. Backfill is for a coordinator
+// resumed mid-flight, which is hours; anything older is a caller bug and is
+// rejected rather than quietly accepted into a feed that cannot hold it.
+const ACT_AT_MAX_AGE_MS = Number(process.env.ACT_AT_MAX_AGE_MS || 30 * 86400000);
+
+/*
+ * WHERE A TIMESTAMP CAME FROM, in three states rather than two.
+ *
+ *   false — the server stamped it when the POST arrived. Observed.
+ *   true  — the client supplied `at`. Reconstructed, and possibly a guess.
+ *   null  — UNKNOWN. The entry pre-dates this field.
+ *
+ * `null` is not tidiness, it is the honest answer for entries already in the
+ * append-only log. Some of those ARE backfills — a coordinator resumed
+ * mid-flight recorded six subagents with the backfill time as their start, so
+ * one that had been running an hour reported ten seconds. Nothing in the log
+ * distinguishes those from genuinely observed ones, and the log must not be
+ * rewritten to pretend otherwise. Defaulting them to `false` would launder a
+ * guess into an observation, which is the exact defect this field exists to
+ * expose. So they normalise to `null` and every consumer can see it does not
+ * know.
+ *
+ * Normalised HERE because every entry reaches the ring through this function —
+ * fresh from a POST and replayed from the log alike — so the key is always
+ * present on the way out, and no consumer ever needs an existence check.
+ */
+function actProvenance(v) {
+  return v === true ? true : v === false ? false : null;
+}
 
 function pushActivity(entry) {
   if (!entry || typeof entry.conversationId !== 'string') return null;
+  entry.reconstructed = actProvenance(entry.reconstructed);
   let feed = ACTIVITY.get(entry.conversationId);
   if (!feed) {
     if (ACTIVITY.size >= ACTIVITY_CONVS) {
@@ -238,7 +268,12 @@ function pushActivity(entry) {
       let oldestId = null;
       let oldestAt = Infinity;
       for (const [id, f] of ACTIVITY) {
-        const at = f.length ? msOf(f[f.length - 1].at) : 0;
+        // The NEWEST timestamp in the feed, not the last one appended: a
+        // backfilled entry carries an older `at`, and reading arrival order as
+        // time order here would let a busy conversation be evicted for having
+        // just corrected its own history.
+        let at = 0;
+        for (const e of f) { const t = msOf(e.at); if (t > at) at = t; }
         if (at < oldestAt) { oldestAt = at; oldestId = id; }
       }
       if (oldestId !== null) ACTIVITY.delete(oldestId);
@@ -3327,8 +3362,49 @@ function activityRoute(res, id, body) {
     return fail(res, 400, `kind "${kind}" needs a subagent name, so the panel can pair the two halves`);
   }
 
+  /*
+   * An explicit `at`, for backfill — and the entry is MARKED when one is used.
+   *
+   * A coordinator resumed mid-flight reports subagents it spawned before it was
+   * instrumented. Stamping those with the arrival time made a worker that had
+   * been running the better part of an hour report `runningForSec: 10`: a
+   * plausible number that is wrong, which is the one thing this feed exists to
+   * refuse. So the true start may be supplied — and never silently, because a
+   * reconstructed timestamp that looks observed is the same defect wearing a
+   * better disguise.
+   *
+   * Validated and REJECTED rather than coerced. Clamping a bad timestamp to now
+   * would resurrect the original bug and hide it behind a 201.
+   */
+  let at = nowIso();
+  let reconstructed = false;
+  if (body.at !== undefined && body.at !== null) {
+    if (typeof body.at !== 'string') {
+      return fail(res, 400, 'at must be an ISO 8601 string', { got: typeof body.at });
+    }
+    const t = Date.parse(body.at);
+    if (Number.isNaN(t)) {
+      return fail(res, 400, 'at is not a date this server can parse', { got: body.at });
+    }
+    // A few seconds of tolerance for clock skew; beyond that a "start" in the
+    // future is a bug in the caller, and accepting it would make a subagent
+    // report a negative age.
+    if (t > Date.now() + 5000) {
+      return fail(res, 400, 'at is in the future — a subagent cannot have started after now', {
+        got: body.at, now: nowIso(),
+      });
+    }
+    if (t < Date.now() - ACT_AT_MAX_AGE_MS) {
+      return fail(res, 400,
+        `at is more than ${Math.round(ACT_AT_MAX_AGE_MS / 86400000)} days old, which is further back than this feed keeps anything`,
+        { got: body.at });
+    }
+    at = new Date(t).toISOString();
+    reconstructed = true;
+  }
+
   const entry = {
-    at: nowIso(),
+    at,
     conversationId: id,
     kind,
     agent: str(body.agent, MAX_AGENT),   // who is reporting
@@ -3337,6 +3413,9 @@ function activityRoute(res, id, body) {
     tool: str(body.tool, 80),
     text: str(body.text, 300),
     ok: typeof body.ok === 'boolean' ? body.ok : null,
+    // true = client-supplied `at`, false = server-stamped, null = pre-dates
+    // this field. See actProvenance().
+    reconstructed,
   };
 
   if (DURABLE_KINDS.has(kind)) {
@@ -3355,30 +3434,97 @@ function activityRoute(res, id, body) {
  */
 function activityOf(conversationId) {
   const feed = ACTIVITY.get(conversationId) || [];
+  /*
+   * ORDER BY TIME, NOT BY ARRIVAL, and this is load-bearing now that `at` can
+   * be supplied by the client.
+   *
+   * The ring is in append order. Backfill deliberately carries an OLDER `at`
+   * than the entries around it, so the two orders diverge — and pairing over
+   * arrival order gets the answer wrong in a way that is not subtle: a
+   * coordinator that reports `finished` for a worker and only afterwards
+   * backfills its `spawned` would have the late-arriving spawn reset
+   * `finishedAt` to null, and a subagent that completed successfully would sit
+   * in the roster as "running" forever.
+   *
+   * Sorting first fixes the pairing, the feed order, and `lastAt` together. The
+   * sort is stable in Node, so entries sharing a timestamp keep arrival order.
+   */
+  const ordered = feed.slice().sort((a, b) => msOf(a.at) - msOf(b.at));
   const subagents = new Map();
   let tools = 0;
-  for (const e of feed) {
+  for (const e of ordered) {
     if (e.kind === 'tool') tools++;
     if (e.kind !== 'spawned' && e.kind !== 'finished') continue;
-    const cur = subagents.get(e.subagent) || { name: e.subagent, task: null, startedAt: null, finishedAt: null, ok: null };
-    if (e.kind === 'spawned') { cur.startedAt = e.at; cur.task = e.task || cur.task; cur.finishedAt = null; cur.ok = null; }
-    else { cur.finishedAt = e.at; cur.ok = e.ok; if (e.task && !cur.task) cur.task = e.task; }
+    const cur = subagents.get(e.subagent) || {
+      name: e.subagent, task: null, startedAt: null, finishedAt: null, ok: null,
+      startedAtReconstructed: null, finishedAtReconstructed: null,
+      spawns: 0, finishes: 0,
+    };
+    if (e.kind === 'spawned') {
+      /*
+       * A SECOND `spawned` UNDER A NAME THAT ALREADY HAS ONE.
+       *
+       * The roster is keyed by name, so this row is about to be overwritten:
+       * the task text is replaced, and if the name had already finished, the
+       * verdict is cleared and it goes back to "running" — permanently, since
+       * the coordinator already sent its one `finished`. That manufactures a
+       * phantom worker that looks like it is still holding a worktree, which
+       * is precisely the ghost this feature exists to expose. A well-meaning
+       * worker announcing itself under a name already in use is enough.
+       *
+       * The overwrite is kept — the latest run is the useful one — but it is
+       * COUNTED and disclosed rather than done silently, because a row that
+       * quietly means something other than what it says is the same failure as
+       * a heartbeat with nobody home. The UI warns on `nameCollision`.
+       */
+      cur.spawns++;
+      cur.startedAt = e.at; cur.task = e.task || cur.task; cur.finishedAt = null; cur.ok = null;
+      // Carried onto the roster so a consumer cannot read an inferred age as an
+      // observed one. `runningForSec` below is derived from exactly this.
+      cur.startedAtReconstructed = actProvenance(e.reconstructed);
+      cur.finishedAtReconstructed = null;
+    } else {
+      cur.finishes++;
+      cur.finishedAt = e.at; cur.ok = e.ok; if (e.task && !cur.task) cur.task = e.task;
+      cur.finishedAtReconstructed = actProvenance(e.reconstructed);
+    }
     subagents.set(e.subagent, cur);
   }
   const roster = [...subagents.values()].map((s) => ({
     ...s,
     running: s.finishedAt === null && s.startedAt !== null,
     runningForSec: s.finishedAt === null ? secSince(s.startedAt) : null,
+    /*
+     * The duration is only as trustworthy as the start it was measured from.
+     * `false` means observed, `true` means the coordinator reconstructed the
+     * start, `null` means the entry pre-dates the field and nothing here knows.
+     */
+    runningForSecIsApprox: s.finishedAt === null && s.startedAtReconstructed !== false,
+    /*
+     * The name was used by more than one run, so this row is the most recent
+     * of them and the earlier ones are not separately recoverable — the feed
+     * still has their entries, but the roster cannot tell them apart. Said out
+     * loud so "running" under a reused name is not read as one worker that has
+     * been going the whole time.
+     */
+    nameCollision: s.spawns > 1 || s.finishes > 1,
   }));
   return {
-    entries: feed,
+    entries: ordered,
     count: feed.length,
     capped: feed.length >= ACTIVITY_CAP,
     cap: ACTIVITY_CAP,
     subagents: roster,
     running: roster.filter((s) => s.running).length,
     toolCalls: tools,
-    lastAt: feed.length ? feed[feed.length - 1].at : null,
+    /*
+     * The MAXIMUM timestamp, not the last one appended. Those were the same
+     * thing until `at` became client-supplied; now a backfill arriving last
+     * would have dragged "last heard" backwards into the past, so a busy
+     * coordinator would look like it had gone quiet the moment it tidied up
+     * its own history.
+     */
+    lastAt: ordered.length ? ordered[ordered.length - 1].at : null,
     /*
      * Empty means one of two very different things and the UI must not guess:
      * either this coordinator has done nothing, or nobody taught it to report.
