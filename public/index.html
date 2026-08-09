@@ -835,6 +835,9 @@
   var DEFAULT_CONV = 'main';
   var activeConv = DEFAULT_CONV;
   var convs = [];
+  // Whether the last /conversations read was answered from the offline copy.
+  // Everything derived from it is then history, not news — see activityNode().
+  var convsFromCache = false;
   var convNew = Object.create(null);
   var convTimer = null;
 
@@ -1943,6 +1946,13 @@
     return fetch('/conversations', { headers: { accept: 'application/json' } })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
+        /*
+         * This read IS served from the service worker's saved copy when the
+         * network is gone, and it arrives looking exactly like a live one.
+         * Recorded so the activity badge can stop making live-sounding claims
+         * ("2 subagents running") out of a snapshot of unknown age.
+         */
+        convsFromCache = header(r, 'x-relay-from-cache') === '1';
         return r.json();
       })
       .then(function (j) {
@@ -2089,6 +2099,21 @@
     var a = c && c.activity;
     if (!a) return null;
     var line = document.createElement('div');
+    /*
+     * The list came out of the offline cache, so every number in it is of
+     * unknown age. "not reported" would be a claim about the coordinator made
+     * from a stale snapshot, and a green "2 subagents running" would be worse:
+     * the most confident-looking thing in the drawer, sourced from history.
+     * Say where it came from and drop the live styling.
+     */
+    if (convsFromCache) {
+      line.className = 'convact';
+      var known = a.reporting
+        ? (a.running ? a.running + ' running' : (a.subagents || 0) + ' subagents, none running')
+        : 'nothing reported';
+      line.appendChild(el('span', 'acount', 'subagents: ' + known + ' when last saved'));
+      return line;
+    }
     if (!a.reporting) {
       line.className = 'convact';
       line.appendChild(el('span', 'acount', 'subagents: not reported'));
@@ -2553,10 +2578,6 @@
   // timeout: nothing here ever hides a subagent for taking too long.
   var GHOST_SEC = 3600;
 
-  function convById(id) {
-    for (var i = 0; i < convs.length; i++) if (convs[i].id === id) return convs[i];
-    return null;
-  }
   /* `rel()` returns a bare "now", which reads as nonsense with "ago" bolted on. */
   function relAgo(iso) {
     var r = rel(iso);
@@ -2775,11 +2796,41 @@
       { headers: { accept: 'application/json' }, cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
+        /*
+         * The service worker does not intercept this route today — it handles
+         * only exactly /thread and /conversations, and everything else goes
+         * straight to the network. Checked anyway, because if it ever does
+         * start caching /conversations/* the failure is SILENT: a stale roster
+         * would arrive as a clean 200 and be reported as current.
+         */
+        var cached = header(r, 'x-relay-from-cache') === '1';
+        return r.json().then(function (j) { return { j: j, cached: cached }; });
       })
-      .then(function (a) {
+      .then(function (got) {
         // A conversation switch mid-flight must not paint the wrong panel.
         if (!actOn || id !== actConv) return false;
+        var a = got.j;
+        /*
+         * THREE STATES, NOT TWO: reporting, not-instrumented, and could-not-ask.
+         *
+         * A 200 with JSON in it is not proof this is an activity payload. A
+         * Cloudflare Access session that has expired answers with a login page,
+         * a proxy can answer with anything, and a cache keyed on a different
+         * route answers with a different endpoint's body entirely. Every one of
+         * those has a falsy `reporting`, and treating falsy as "nobody taught
+         * this coordinator to report" would state something confident about the
+         * coordinator on the strength of a response that was never about it.
+         * That is the impostor this whole panel is built to refuse, so the
+         * shape is checked before a single word is drawn.
+         */
+        if (!a || typeof a.reporting !== 'boolean' || !Array.isArray(a.entries)) {
+          renderActivityError('the reply was not an activity report — the session may have expired');
+          return false;
+        }
+        if (got.cached) {
+          renderActivityError('that answer came from the saved offline copy, so it cannot be trusted as current');
+          return false;
+        }
         renderActivity(a);
         return true;
       })
