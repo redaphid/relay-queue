@@ -211,7 +211,7 @@ function makeEnv(opts) {
     online: true,
     texts: {},              // entryId -> message text
     checked: {},            // "entryId#index" -> { on, by, at }
-    checkFail: null,        // null | 'network' | 'refused'
+    checkFail: null,        // null | 'network' | 'refused' | 'challenge' | 'challenge-401'
     checkCalls: [],
   };
 
@@ -268,10 +268,30 @@ function makeEnv(opts) {
   };
   els.input.focus = function () { doc.activeElement = this; this.focused = true; };
 
+  /*
+   * The real server stamps every answer `application/json` (see send() in
+   * server.js). This helper used to answer `null` to every header ask, which
+   * made it a weaker input than anything the page can actually receive — and
+   * so it could not tell the server's JSON apart from a login page, which is
+   * exactly the confusion the page must not make. A mock that is easier to
+   * satisfy than reality proves nothing, so this one says what the server says.
+   */
   const jsonRes = (obj, status) => Promise.resolve({
-    ok: (status || 200) < 400, status: status || 200,
+    ok: (status || 200) < 400, status: status || 200, redirected: false,
     json: () => Promise.resolve(obj),
-    headers: { get: () => null },
+    headers: { get: (h) => (String(h).toLowerCase() === 'content-type' ? 'application/json; charset=utf-8' : null) },
+  });
+
+  /*
+   * What an expired Cloudflare Access session actually sends: a login PAGE.
+   * Either a 200 of HTML (the redirect having been followed for us) or an
+   * HTML-bodied 401. Neither is this server, and neither may settle a tick.
+   */
+  const challengeRes = (status, redirected) => Promise.resolve({
+    ok: (status || 200) < 400, status: status || 200, redirected: !!redirected,
+    json: () => Promise.reject(new SyntaxError('Unexpected token < in JSON')),
+    text: () => Promise.resolve('<!doctype html><title>Sign in</title>'),
+    headers: { get: (h) => (String(h).toLowerCase() === 'content-type' ? 'text/html; charset=utf-8' : null) },
   });
 
   // `stored` models a device that has been used before: the remembered
@@ -345,6 +365,9 @@ function makeEnv(opts) {
         if (store.checkFail === 'network') return Promise.reject(new Error('network error'));
         // The server actively refusing (a 4xx) — a message that no longer exists.
         if (store.checkFail === 'refused') return jsonRes({ error: 'no checklist on entry' }, 404);
+        // An expired Access session: a login page, wearing a success code.
+        if (store.checkFail === 'challenge') return challengeRes(200, true);
+        if (store.checkFail === 'challenge-401') return challengeRes(401, false);
         store.checked[`${entryId}#${body.index}`] = { on: !!body.on, by: body.by, at: new Date().toISOString() };
         return jsonRes({ changed: true, checklist: modelChecklist(entryId) });
       }
@@ -1732,6 +1755,80 @@ async function main() {
       `${env.store.checkCalls.length - before}`);
     check('...and it stops claiming to be broken', !/not saved/i.test(marks()[0].textContent),
       JSON.stringify(marks()[0].textContent));
+  }
+
+  /*
+   * The failure the outbox was NOT written against. Cloudflare Access does not
+   * refuse with a 4xx when a session expires — it redirects to a login page, so
+   * the page receives a 200 carrying HTML. Read by status alone that is a
+   * successful write, and the tick is deleted from the outbox with the row left
+   * showing no marker at all: in this UI's own vocabulary, "settled, the server
+   * agrees". The tick is gone, there is nothing left to tap, and coming back
+   * online recovers nothing. Strictly worse than the refusal above.
+   *
+   * Observed in Firefox at 390x844 before the fix: three ticks under a
+   * same-origin Access redirect, empty outbox, no marker, no check event.
+   */
+  console.log('\nchecklists — a login page is not a saved tick');
+  {
+    const env = liveEnv();
+    await settle();
+    env.store.checkFail = 'challenge';     // 200, text/html, redirected
+    env.agentReply('- [ ] passport', 'list-c');
+    await settle();
+    const marks = () => findAll(env.els.list, byClass('tmark'));
+    const rows = () => findAll(env.els.list, byClass('mdtask'));
+    const box = boxesIn(env)[0];
+    box.checked = true;
+    box.dispatch('change');
+    await settle();
+
+    check('*** a login page answering 200 is NOT treated as a saved tick ***',
+      marks()[0].hidden === false, JSON.stringify(marks()[0].textContent));
+    check('...the row says so in words rather than going quiet',
+      /not saved/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
+    check('*** and the tick is still in the outbox, not dropped ***',
+      /list-c#0/.test(String(env.sandbox.localStorage.getItem('relay.checks.outbox'))),
+      String(env.sandbox.localStorage.getItem('relay.checks.outbox')));
+    check('...the server was genuinely not written to',
+      !env.store.checked['list-c#0'], JSON.stringify(env.store.checked));
+
+    // Unlike a 4xx, signing back in FIXES this — so it must retry itself.
+    env.store.checkFail = null;
+    env.sandbox.dispatchWindow('online');
+    await settle();
+    check('*** signing back in drains the tick without him touching anything ***',
+      env.store.checked['list-c#0'] && env.store.checked['list-c#0'].on === true,
+      JSON.stringify(env.store.checked));
+    check('...and the row goes quiet only once that is true', marks()[0].hidden === true,
+      JSON.stringify(marks()[0].textContent));
+  }
+
+  console.log('\nchecklists — an HTML-bodied 401 is a challenge, not a refusal');
+  {
+    const env = liveEnv();
+    await settle();
+    env.store.checkFail = 'challenge-401';
+    env.agentReply('- [ ] passport', 'list-d');
+    await settle();
+    const marks = () => findAll(env.els.list, byClass('tmark'));
+    const box = boxesIn(env)[0];
+    box.checked = true;
+    box.dispatch('change');
+    await settle();
+    check('a 401 full of HTML still says "not saved"',
+      /not saved/i.test(marks()[0].textContent), JSON.stringify(marks()[0].textContent));
+    /*
+     * The difference that matters: a 4xx from THIS SERVER is "never, stop
+     * asking", but a 4xx from the thing in front of it is "not yet". Only the
+     * body says which, so only the body may make it permanent.
+     */
+    env.store.checkFail = null;
+    env.sandbox.dispatchWindow('online');
+    await settle();
+    check('*** but it retries once the session is back, unlike a real refusal ***',
+      env.store.checked['list-d#0'] && env.store.checked['list-d#0'].on === true,
+      JSON.stringify(env.store.checked));
   }
 
   console.log('\nchecklists — the server has the last word');
