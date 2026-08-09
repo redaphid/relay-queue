@@ -40,11 +40,20 @@ const SERVER = path.join(__dirname, '..', 'server.js');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /*
- * The line server.js prints for us once it is actually listening. It carries
- * the port it truly bound — which is the only trustworthy source, since we
- * asked for 0 — and the nonce, which says the line is ours.
+ * How the port is learned: from the line server.js prints inside its own listen
+ * callback, on the pipe of the child WE spawned. It reports the socket it
+ * actually bound, which is the only trustworthy source given we asked for 0.
+ *
+ * This is deliberately the SAME line tools/lifecycle-selftest.js reads, and
+ * deliberately the only port-learning mechanism in the repo. Two ways of
+ * discovering the same fact is two things to keep in step, and drift between
+ * them is exactly how a harness ends up talking to a stranger.
+ *
+ * The nonce below is not a second channel for the port — it never carries one.
+ * It answers the separate question the port cannot: whether the thing ANSWERING
+ * at that address is still the child that announced it.
  */
-const BOOT_LINE = /^boot: port=(\d+) nonce=([0-9a-f]+)$/m;
+const LISTENING_LINE = /listening on http:\/\/[^\s:]+:(\d+)/;
 
 function tail(text, n = 4000) {
   const t = String(text || '');
@@ -123,9 +132,10 @@ class ServerHandle {
       }
 
       if (this.port === null) {
-        const m = BOOT_LINE.exec(this.stdout);
+        // Only our child writes to this pipe, so an announcement on it is our
+        // child's. That is what makes the address ours rather than assumed.
+        const m = LISTENING_LINE.exec(this.stdout);
         if (m) {
-          if (m[2] !== this.nonce) throw this.fail('a boot line came back with someone else\'s nonce');
           this.port = Number(m[1]);
           this.base = `http://127.0.0.1:${this.port}`;
         }
