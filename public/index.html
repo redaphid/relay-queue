@@ -284,6 +284,87 @@
   .sline .t { overflow-wrap: anywhere; }
   .snote { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
   .sempty { font-size: 15px; color: var(--muted); }
+
+  /* ---- the subagent activity panel ----
+   *
+   * Shares the status view's vocabulary (.shead/.scard/.srow/.sline) on purpose:
+   * this is the same kind of screen answering a different question, and giving
+   * it its own look would imply the two disagree about what a card means.
+   */
+  #actview {
+    position: fixed; inset: 0; z-index: 31;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #actview[hidden] { display: none; }
+  #actclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #acttitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #actopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #06b6d4, #6366f1, #a855f7) 1 / 0 0 0 4px;
+  }
+
+  /*
+   * THE IMPORTANT ONE. "Nobody taught this coordinator to report" is not a
+   * status — it is the absence of one, and it must borrow the vocabulary of
+   * neither health nor failure. It gets a DASHED edge, because a dashed border
+   * reads as "no signal here" where every solid one on this screen reads as a
+   * measurement that was actually taken. It is not `.ok` and not `.idle`: an
+   * unreporting coordinator may be working flat out, and rendering that as a
+   * calm empty feed is the same lie as a heartbeat with nobody home.
+   */
+  .shead.unknown {
+    color: var(--fg);
+    border: 1px dashed var(--muted);
+    background: var(--panel);
+  }
+  .shead.unknown .ssub { opacity: 1; color: var(--muted); }
+
+  /* One subagent. Never removed when it fails to finish — see renderActivity. */
+  .subrow { display: flex; gap: 8px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--line); }
+  .subrow:first-of-type { border-top: 0; }
+  .subrow .sdot { flex: 0 0 auto; width: 1.2em; text-align: center; font-size: 12px; color: var(--muted); }
+  .subrow .sbody { flex: 1 1 auto; min-width: 0; }
+  .subname { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+  .subtask { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .subwhen { margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .subrow.running .sdot { color: #1a7f4b; }
+  .subrow.running .subwhen { color: #1a7f4b; }
+  .subrow.failed .sdot, .subrow.failed .subwhen { color: var(--rec); font-weight: 650; }
+  /* Finished, but nobody said whether it worked. Not the same as "it worked". */
+  .subrow.noverdict .subwhen { color: var(--off); }
+  /* Running far longer than a subagent plausibly should: possibly a ghost still
+     holding a git worktree. Surfaced, never timed out or tidied away. */
+  .sublong { margin-top: 3px; font-size: 12px; color: var(--off); overflow-wrap: anywhere; }
+  @media (prefers-color-scheme: dark) {
+    .subrow.running .sdot, .subrow.running .subwhen { color: #4ade80; }
+  }
+
+  /* A caveat attached to a specific number, rather than buried in a footnote. */
+  .scaveat {
+    margin: 8px 0 0; padding: 8px 10px;
+    font-size: 12px; line-height: 1.4; color: var(--off);
+    background: #c2410c10; border: 1px dashed currentColor; border-radius: 10px;
+  }
+  .afeed .sline .t { overflow-wrap: anywhere; }
+  .afeed .sline.bad .w { color: var(--rec); }
+
+  /* The collapsed badge in the conversation list. Costs no extra request: the
+     summary already rides along on /conversations. */
+  .convact { display: flex; gap: 6px; align-items: baseline; margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .convact .acount { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .convact.live { color: #1a7f4b; font-weight: 650; }
+  @media (prefers-color-scheme: dark) { .convact.live { color: #4ade80; } }
+
   /* ---- alerts: web push, quiet hours, and what is actually armed ---- */
   .nbtn {
     display: block; width: 100%; min-height: 48px; margin-top: 8px; padding: 0 14px;
@@ -667,6 +748,7 @@
       <p id="converr"></p>
       <div id="convlist"></div>
       <button id="statusopen" type="button">Status &mdash; is anything listening?</button>
+      <button id="actopen" type="button">Activity &mdash; what are its subagents doing?</button>
     </nav>
   </div>
 
@@ -682,6 +764,19 @@
       would destroy any control placed inside it mid-tap.
     -->
     <div id="notifybody"></div>
+  </section>
+
+  <!--
+    The subagent activity panel. Per-conversation, not global: it answers "what
+    is THIS coordinator doing right now", which is a different question from
+    "is the server alive" that #statusview answers.
+  -->
+  <section id="actview" hidden aria-label="Subagent activity">
+    <div class="prow">
+      <b id="acttitle">Activity</b>
+      <button id="actclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="actbody" aria-live="polite"></div>
   </section>
 
 <script>
@@ -1977,6 +2072,38 @@
     return line;
   }
 
+  /*
+   * The collapsed activity badge. Reads the summary that already rides along on
+   * /conversations, so the list costs no extra request.
+   *
+   * Three outcomes, and the difference between them is the whole point:
+   *
+   *   - no `activity` field at all — an older server, or one that does not
+   *     track this. We do not know, so we say NOTHING. Inventing a reassuring
+   *     line from absent data is the failure this panel exists to avoid.
+   *   - `reporting: false` — the coordinator was never taught to report. Say
+   *     that, in words. Never "0 running", which would read as a measurement.
+   *   - `reporting: true` — the counts are real and can be shown plainly.
+   */
+  function activityNode(c) {
+    var a = c && c.activity;
+    if (!a) return null;
+    var line = document.createElement('div');
+    if (!a.reporting) {
+      line.className = 'convact';
+      line.appendChild(el('span', 'acount', 'subagents: not reported'));
+      return line;
+    }
+    var running = a.running || 0;
+    line.className = 'convact' + (running ? ' live' : '');
+    var bits = [];
+    if (running) bits.push(running + ' subagent' + (running === 1 ? '' : 's') + ' running');
+    else if (a.subagents) bits.push(a.subagents + ' subagent' + (a.subagents === 1 ? '' : 's') + ', none running');
+    else bits.push('reporting, no subagents yet');
+    line.appendChild(el('span', 'acount', bits.join(' · ')));
+    return line;
+  }
+
   function convNode(c) {
     var row = document.createElement('button');
     row.type = 'button';
@@ -2014,6 +2141,8 @@
 
     row.appendChild(sparkNode(c));
     row.appendChild(agentNode(c));
+    var an = activityNode(c);
+    if (an) row.appendChild(an);
 
     var bits = [];
     if (counts.pending) bits.push(counts.pending + ' waiting');
@@ -2372,6 +2501,299 @@
     if (statusOpen) statusOpen.addEventListener('click', showStatus);
     if (statusClose) statusClose.addEventListener('click', hideStatus);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideStatus(); });
+  }
+
+  /*
+   * ------------------------------------------------------- subagent activity
+   *
+   * What is this coordinator actually doing: which subagents it spawned, which
+   * are still running, and — if it bothers to report them — which tools it ran.
+   *
+   * THE ONE RULE, and the reason this panel is worth building at all:
+   *
+   *     `reporting: false` means NOBODY TAUGHT THIS COORDINATOR TO REPORT.
+   *     It does NOT mean the coordinator is idle.
+   *
+   * The server computes it as "has anything ever been posted here", and posting
+   * is optional — an agent reports nothing unless someone wired it up, which is
+   * still the default. So an empty feed is overwhelmingly "not instrumented"
+   * and only rarely "nothing happened", and the two are not distinguishable
+   * from the counts. Drawing an unreporting-but-busy coordinator as a calm
+   * empty feed is precisely the lie a heartbeat tells when nobody is home —
+   * a failure this project has already paid for repeatedly. Hence: the panel
+   * branches on `reporting` BEFORE rendering anything else, and in the
+   * unreported case it shows NO COUNTERS AT ALL. A zero you cannot trust is
+   * worse than no number, because a zero looks like a measurement.
+   *
+   * Two further numbers carry caveats, and the caveats travel WITH the number
+   * rather than sitting in a footnote nobody scrolls to:
+   *
+   *   - `toolCalls` is held in memory only and resets whenever the server
+   *     restarts — which it does every time its own source changes, i.e.
+   *     constantly. It is always rendered scoped ("since <time>"), never as a
+   *     lifetime total, so a restart cannot read as "it stopped working".
+   *   - `capped` means the feed has already dropped its oldest entries. Said
+   *     out loud, because a truncated list that looks complete lies about
+   *     history.
+   *
+   * Subagent starts and finishes are durable and survive restarts; tool calls
+   * do not. That split is the server's design, and the panel labels the two
+   * halves differently rather than averaging them into one confident number.
+   */
+  var actView = document.getElementById('actview');
+  var actBody = document.getElementById('actbody');
+  var actOpenBtn = document.getElementById('actopen');
+  var actCloseBtn = document.getElementById('actclose');
+  var actTitle = document.getElementById('acttitle');
+  var actTimer = null;
+  var actOn = false;
+  var actConv = null;          // the conversation this panel is showing
+  var ACT_MS = 5000;
+  // Long enough that a subagent still running is worth a second look. Not a
+  // timeout: nothing here ever hides a subagent for taking too long.
+  var GHOST_SEC = 3600;
+
+  function convById(id) {
+    for (var i = 0; i < convs.length; i++) if (convs[i].id === id) return convs[i];
+    return null;
+  }
+  /* "14:32" — a wall-clock anchor for the ephemeral counters. */
+  function clockOf(iso) {
+    var t = ms(iso);
+    if (!t) return 'an unknown time';
+    try {
+      return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return new Date(t).toISOString().slice(11, 16); }
+  }
+
+  /*
+   * A subagent that never reports `finished` stays running forever, on purpose:
+   * it is the only trace of a process that may still be holding a git worktree.
+   * Nothing here times it out or tidies it away — surfacing it IS the feature.
+   */
+  function subagentNode(s) {
+    var cls = 'subrow';
+    if (s.running) cls += ' running';
+    else if (s.ok === false) cls += ' failed';
+    else if (s.ok === null || s.ok === undefined) cls += ' noverdict';
+
+    var row = el('div', cls);
+    row.appendChild(el('span', 'sdot', s.running ? '●' : s.ok === true ? '✓' : s.ok === false ? '✗' : '?'));
+    var body = el('div', 'sbody');
+    body.appendChild(el('div', 'subname', s.name || '(unnamed subagent)'));
+    if (s.task) body.appendChild(el('div', 'subtask', s.task));
+
+    var when;
+    if (s.running) {
+      when = 'running for ' + dur(s.runningForSec);
+    } else {
+      // `runningForSec` is null once finished, so elapsed comes from the pair.
+      var span = (ms(s.finishedAt) && ms(s.startedAt))
+        ? Math.round((ms(s.finishedAt) - ms(s.startedAt)) / 1000) : null;
+      var took = span === null ? '' : ' after ' + dur(span);
+      when = s.ok === true ? 'finished' + took
+        : s.ok === false ? 'FAILED' + took
+          // Finished, but nobody said whether it worked. Not the same as "it worked".
+          : 'finished' + took + ' — outcome not reported';
+      when += ' · ' + rel(s.finishedAt);
+    }
+    body.appendChild(el('div', 'subwhen', when));
+
+    if (s.running && s.runningForSec !== null && s.runningForSec >= GHOST_SEC) {
+      body.appendChild(el('div', 'sublong',
+        'Still running after ' + dur(s.runningForSec) + '. If that is not expected it may have died without '
+        + 'saying so — a subagent only stops being "running" here when it reports that it finished, and one '
+        + 'that never does may still be holding a git worktree.'));
+    }
+    row.appendChild(body);
+    return row;
+  }
+
+  var ACT_VERB = {
+    spawned: 'started',
+    finished: 'finished',
+    tool: 'tool',
+    note: 'note',
+    worktree: 'worktree'
+  };
+
+  function feedLine(e) {
+    var line = el('div', 'sline' + (e.ok === false ? ' bad' : ''));
+    var verb = ACT_VERB[e.kind] || e.kind || 'activity';
+    var head = verb;
+    if (e.kind === 'spawned' || e.kind === 'finished') {
+      head = (e.subagent || 'a subagent') + ' ' + verb;
+      if (e.kind === 'finished') head += e.ok === false ? ' — failed' : e.ok === true ? ' — ok' : ' — outcome not reported';
+    } else if (e.kind === 'tool') {
+      head = e.tool ? 'tool · ' + e.tool : 'tool';
+    }
+    line.appendChild(el('div', 'w', head + ' · ' + rel(e.at)));
+    var text = e.text || (e.kind === 'spawned' ? e.task : '') || '';
+    if (text) line.appendChild(el('div', 't', text));
+    return line;
+  }
+
+  function renderActivity(a) {
+    actBody.textContent = '';
+    var frag = document.createDocumentFragment();
+    var c = convById(actConv);
+    var who = (c && c.agent) || 'This coordinator';
+
+    /*
+     * BRANCH ONE, before anything else. No counters are drawn in this state —
+     * not even zeroes — because every number the endpoint returns here is an
+     * artefact of nothing having been posted, not a measurement of the work.
+     */
+    if (!a.reporting) {
+      var un = el('div', 'shead unknown');
+      un.appendChild(el('div', null, 'Not instrumented — no activity is reported here.'));
+      un.appendChild(el('div', 'ssub',
+        who + ' has never reported any activity, so this panel cannot tell you what it is doing — '
+        + 'including whether it is doing anything at all. This is NOT the same as idle: it may be '
+        + 'working hard right now. Reporting is opt-in, and nothing has opted in for this conversation.'));
+      frag.appendChild(un);
+
+      var how = scard('Why this is empty');
+      how.appendChild(el('p', 'snote',
+        'Coordinators report subagents and tool calls by posting them to the queue, and most have never '
+        + 'been asked to. Until one does, there is nothing to show — so nothing is shown, rather than a '
+        + 'row of zeroes that would look like a reading.'));
+      how.appendChild(el('p', 'snote',
+        'Whether the agent is alive is a different question, answered by Status — heartbeats and real '
+        + 'work are tracked there and do not depend on any of this.'));
+      frag.appendChild(how);
+
+      actBody.appendChild(frag);
+      return;
+    }
+
+    /*
+     * BRANCH TWO: this coordinator does report. Now — and only now — quiet is
+     * real information, and is allowed to look calm.
+     */
+    var running = a.running || 0;
+    var head = el('div', 'shead ' + (running ? 'ok' : 'idle'));
+    head.appendChild(el('div', null, running
+      ? running + (running === 1 ? ' subagent running now.' : ' subagents running now.')
+      : 'Nothing running right now.'));
+    head.appendChild(el('div', 'ssub',
+      who + ' does report its activity' + (a.lastAt ? ', last heard ' + rel(a.lastAt) + ' ago' : '')
+      + '. ' + (running ? '' : 'It has nothing running at the moment — this one really is quiet.')));
+    frag.appendChild(head);
+
+    // --- the roster ---
+    var roster = a.subagents || [];
+    var rc = scard('Subagents');
+    if (!roster.length) {
+      rc.appendChild(el('div', 'sempty', 'No subagents have been reported in this conversation.'));
+    } else {
+      for (var i = 0; i < roster.length; i++) rc.appendChild(subagentNode(roster[i]));
+    }
+    rc.appendChild(el('p', 'snote',
+      'Subagent starts and finishes are recorded durably: they survive a server restart, so anything '
+      + 'left running stays visible until it says it finished.'));
+    frag.appendChild(rc);
+
+    // --- tool calls, always scoped to this server process ---
+    var tc = scard('Tool calls');
+    srow(tc, 'Recorded since ' + clockOf(a.ephemeralSince), String(a.toolCalls || 0));
+    if (a.toolCallsAreEphemeral) {
+      tc.appendChild(el('p', 'scaveat',
+        'This is a live view, not a total. Tool calls are kept in memory only and reset to zero every '
+        + 'time the server restarts — which it does whenever its own code changes. The count above covers '
+        + 'only since ' + clockOf(a.ephemeralSince) + ' (' + rel(a.ephemeralSince) + ' ago), so a low or '
+        + 'zero number here can mean a recent restart rather than an agent that stopped working.'));
+    }
+    frag.appendChild(tc);
+
+    // --- the feed ---
+    var fc = scard('Reported activity');
+    if (a.capped) {
+      fc.appendChild(el('p', 'scaveat',
+        'Truncated. Only the most recent ' + (a.cap || a.count) + ' entries are kept — older activity has '
+        + 'been dropped and cannot be recovered. What follows is the end of the story, not all of it.'));
+    }
+    var entries = a.entries || [];
+    if (!entries.length) {
+      fc.appendChild(el('div', 'sempty', 'Nothing reported yet.'));
+    } else {
+      // Already newest-first from the server: a panel opens on what just happened.
+      for (var j = 0; j < entries.length && j < 60; j++) fc.appendChild(feedLine(entries[j]));
+      if (entries.length > 60) {
+        fc.appendChild(el('p', 'snote', 'Showing the 60 most recent of ' + entries.length + ' entries held.'));
+      }
+    }
+    frag.appendChild(fc);
+
+    actBody.appendChild(frag);
+  }
+
+  /*
+   * Unreachable is its own state, and it is emphatically not "quiet". If the
+   * panel cannot load, it says so in the loudest register it has, because an
+   * empty panel that failed to fetch is indistinguishable from an idle agent —
+   * the exact confusion this screen exists to prevent.
+   */
+  function renderActivityError(msg) {
+    actBody.textContent = '';
+    var head = el('div', 'shead alarm', 'Could not load activity.');
+    head.appendChild(el('div', 'ssub',
+      'This panel could not read the activity feed — ' + msg + '. That means it does not know what '
+      + 'this coordinator is doing; it does not mean the coordinator is idle.'));
+    actBody.appendChild(head);
+  }
+
+  function loadActivity() {
+    var id = actConv;
+    if (!id) return Promise.resolve(false);
+    return fetch('/conversations/' + encodeURIComponent(id) + '/activity',
+      { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (a) {
+        // A conversation switch mid-flight must not paint the wrong panel.
+        if (!actOn || id !== actConv) return false;
+        renderActivity(a);
+        return true;
+      })
+      .catch(function (err) {
+        if (!actOn || id !== actConv) return false;
+        renderActivityError((err && err.message) || 'network error');
+        return false;
+      });
+  }
+
+  function showActivity() {
+    if (!actView) return;
+    actConv = activeConv;
+    actOn = true;
+    actView.hidden = false;
+    var c = convById(actConv);
+    if (actTitle) actTitle.textContent = 'Activity — ' + ((c && (c.title || c.agent)) || 'this conversation');
+    closeDrawer();
+    actBody.textContent = '';
+    actBody.appendChild(el('div', 'sempty', 'Checking…'));
+    loadActivity();
+    clearInterval(actTimer);
+    actTimer = setInterval(function () { if (actOn && !document.hidden) loadActivity(); }, ACT_MS);
+    uiSync();
+  }
+
+  function hideActivity() {
+    if (!actView || !actOn) return;
+    actOn = false;
+    actView.hidden = true;
+    clearInterval(actTimer);
+    actTimer = null;
+    uiSync();
+  }
+
+  function initActivity() {
+    if (actOpenBtn) actOpenBtn.addEventListener('click', showActivity);
+    if (actCloseBtn) actCloseBtn.addEventListener('click', hideActivity);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideActivity(); });
   }
 
   /*
@@ -4525,7 +4947,7 @@
   var uiPending = 0;     // history.back() calls whose popstate has not arrived
 
   function uiSync() {
-    var open = !!statusOn || !!drawerOpen;
+    var open = !!statusOn || !!actOn || !!drawerOpen;
     if (open === uiMarked) return; // includes drawer -> status, which re-uses it
     if (open) {
       // Same URL on purpose: a marker must not look like a conversation change,
@@ -4548,8 +4970,9 @@
     if (uiPending > 0) { uiPending--; return; }  // the echo of our own back()
     if (!uiMarked) return;                       // not ours: let it be a conversation move
     uiMarked = false;
-    // Topmost first. Both call uiSync(), which sees the marker already spent.
-    if (statusOn) hideStatus();
+    // Topmost first. All of them call uiSync(), which sees the marker spent.
+    if (actOn) hideActivity();
+    else if (statusOn) hideStatus();
     else if (drawerOpen) closeDrawer();
   }
 
@@ -4567,6 +4990,7 @@
   setInterval(refreshTimes, 30000);
   initConvs();
   initStatus();
+  initActivity();
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is
   // load-bearing for reading and sending messages.
