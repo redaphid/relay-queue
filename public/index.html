@@ -1304,7 +1304,30 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ index: index, on: !!on, by: checkAuthor() })
     }).then(function (r) {
+      /*
+       * A CHALLENGE IS NOT AN ANSWER. An expired Cloudflare Access session does
+       * not answer 4xx — it redirects to a login page, so what lands here is a
+       * 200 full of HTML. `r.ok` says yes to that, and a branch that reads only
+       * the status files a login screen as a successful write: the tick is
+       * deleted from the outbox, the row loses its mark, and a mark-less row
+       * means "settled, the server agrees". Silently wrong, with nothing left
+       * to retry — strictly worse than the failure this outbox was built for.
+       *
+       * So only THIS SERVER'S JSON is allowed to settle a tick or to kill one.
+       * Anything else in the path — a login page, a captive portal, a proxy's
+       * error page — is "not now": kept, shown, and retried once the way back
+       * is open. The service worker already refuses to cache a login page as
+       * the app shell (`x-relay-app`); this is the same guard on the write.
+       */
+      var ourJson = /^application\/json/i.test(String(r.headers.get('content-type') || ''));
       return r.json().catch(function () { return null; }).then(function (j) {
+        if (!ourJson || !j || typeof j !== 'object' || r.redirected) {
+          var ch = new Error(r.redirected
+            ? 'not saved — a login page answered instead of the server'
+            : 'not saved — HTTP ' + r.status + ' did not come from the server');
+          ch.permanent = false; // signing back in fixes it, so it must keep trying
+          throw ch;
+        }
         if (!r.ok) {
           var err = new Error((j && j.error) || ('HTTP ' + r.status));
           // 4xx is the server saying "never, stop asking"; 5xx is "not now".
