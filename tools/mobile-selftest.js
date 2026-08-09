@@ -29,9 +29,18 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ICONS = require('../icons.js');
+const { listenEphemeral } = require('./harness-lib');
 
 const PAGE = path.join(__dirname, '..', 'public', 'index.html');
-const PORT = Number(process.env.PORT || 3995);
+/*
+ * 0 means "any free port". A fixed one is a bet that nothing else on the
+ * machine — including a leaked server from a previous run of this very file —
+ * got there first, and losing that bet used to mean serving the page from a
+ * stranger. PORT still pins it for a deliberate run. The port actually bound
+ * is read back below; it is never assumed.
+ */
+const PORT = Number(process.env.PORT || 0);
+let boundPort = null;
 // A phone, not a small desktop window. iPhone/Pixel-class portrait.
 const VIEWPORT = { width: 390, height: 844 };
 const UA = 'Mozilla/5.0 (Android 16; Mobile; rv:153.0) Gecko/153.0 Firefox/153.0';
@@ -316,10 +325,16 @@ async function netDown(ctx) {
 }
 
 async function netUp(ctx) {
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(PORT, '127.0.0.1', resolve);
-  });
+  /*
+   * Back onto the SAME port, deliberately: the browser has an origin, a cache
+   * and a service worker keyed to it, and coming back up somewhere else would
+   * be a different site as far as any of that is concerned. listenEphemeral
+   * rejects if it cannot be had, which is the loud failure we want — silently
+   * landing on a different port would make every offline assertion below
+   * meaningless.
+   */
+  const got = await listenEphemeral(server, '127.0.0.1', boundPort);
+  if (got !== boundPort) throw new Error(`came back up on port ${got}, not ${boundPort}`);
   await ctx.setOffline(false);
 }
 
@@ -355,8 +370,9 @@ function REACHABLE(sel) {
 }
 
 (async () => {
-  await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
-  const base = `http://127.0.0.1:${PORT}/`;
+  boundPort = await listenEphemeral(server, '127.0.0.1', PORT);
+  const base = `http://127.0.0.1:${boundPort}/`;
+  console.log(`serving the page on ${base}`);
   const browser = await firefox.launch({ headless: true });
   const ctx = await browser.newContext({ viewport: VIEWPORT, userAgent: UA });
   /*
