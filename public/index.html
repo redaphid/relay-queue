@@ -2557,6 +2557,12 @@
     for (var i = 0; i < convs.length; i++) if (convs[i].id === id) return convs[i];
     return null;
   }
+  /* `rel()` returns a bare "now", which reads as nonsense with "ago" bolted on. */
+  function relAgo(iso) {
+    var r = rel(iso);
+    if (!r) return 'an unknown time ago';
+    return r === 'now' ? 'just now' : r + ' ago';
+  }
   /* "14:32" — a wall-clock anchor for the ephemeral counters. */
   function clockOf(iso) {
     var t = ms(iso);
@@ -2658,6 +2664,18 @@
         'Coordinators report subagents and tool calls by posting them to the queue, and most have never '
         + 'been asked to. Until one does, there is nothing to show — so nothing is shown, rather than a '
         + 'row of zeroes that would look like a reading.'));
+      /*
+       * This state is also reachable BACKWARDS, and it looks alarming if you do
+       * not know why: "reporting" is recomputed on every read, and tool calls
+       * are memory-only. A coordinator that only ever posted tool calls is
+       * reporting one minute and not the next, purely because the server
+       * restarted. Nothing has broken, so this does not get an alarm — it gets
+       * an explanation.
+       */
+      how.appendChild(el('p', 'snote',
+        'A coordinator that reported only tool calls also lands here after a restart, since tool calls '
+        + 'are not kept across one. That is not a fault and nothing was lost — subagent starts and '
+        + 'finishes would have survived.'));
       how.appendChild(el('p', 'snote',
         'Whether the agent is alive is a different question, answered by Status — heartbeats and real '
         + 'work are tracked there and do not depend on any of this.'));
@@ -2677,7 +2695,7 @@
       ? running + (running === 1 ? ' subagent running now.' : ' subagents running now.')
       : 'Nothing running right now.'));
     head.appendChild(el('div', 'ssub',
-      who + ' does report its activity' + (a.lastAt ? ', last heard ' + rel(a.lastAt) + ' ago' : '')
+      who + ' does report its activity' + (a.lastAt ? ', last heard ' + relAgo(a.lastAt) : '')
       + '. ' + (running ? '' : 'It has nothing running at the moment — this one really is quiet.')));
     frag.appendChild(head);
 
@@ -2701,7 +2719,7 @@
       tc.appendChild(el('p', 'scaveat',
         'This is a live view, not a total. Tool calls are kept in memory only and reset to zero every '
         + 'time the server restarts — which it does whenever its own code changes. The count above covers '
-        + 'only since ' + clockOf(a.ephemeralSince) + ' (' + rel(a.ephemeralSince) + ' ago), so a low or '
+        + 'only since ' + clockOf(a.ephemeralSince) + ' (' + relAgo(a.ephemeralSince) + '), so a low or '
         + 'zero number here can mean a recent restart rather than an agent that stopped working.'));
     }
     frag.appendChild(tc);
@@ -2719,8 +2737,15 @@
     } else {
       // Already newest-first from the server: a panel opens on what just happened.
       for (var j = 0; j < entries.length && j < 60; j++) fc.appendChild(feedLine(entries[j]));
+      /*
+       * `count` is the length of the whole feed the server holds; `entries` is
+       * what this request actually received. They are different quantities and
+       * conflating them would put a confident denominator under a number that
+       * does not share it, so each is named for what it is.
+       */
       if (entries.length > 60) {
-        fc.appendChild(el('p', 'snote', 'Showing the 60 most recent of ' + entries.length + ' entries held.'));
+        fc.appendChild(el('p', 'snote', 'Showing the 60 most recent of ' + entries.length + ' loaded'
+          + (a.count && a.count !== entries.length ? ', out of ' + a.count + ' held by the server' : '') + '.'));
       }
     }
     frag.appendChild(fc);
