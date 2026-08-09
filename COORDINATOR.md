@@ -224,6 +224,35 @@ outright, not because anyone recognised the danger in the moment. Do your
 archaeology in a worktree: `git worktree add ../probe <sha>` costs one command
 and cannot deploy anything.
 
+**Front-end merges deploy INSTANTLY — there is no restart to hide behind.** The
+whole working tree is bind-mounted read-only into the container
+(`D:/projects/relay-queue:/app:ro`), and `public/index.html` is served straight
+off the disk. So the moment your merge writes that file, the next request gets
+it. `server.js` at least needs a process cycle; the front end does not get even
+that much of a gap.
+
+There is therefore **no window in which to notice a mistake** and no "deploy
+step" to hold back. Merging front-end work *is* shipping it to his phone. Finish
+the checks before the merge, not after — that ordering is the only safety margin
+that exists.
+
+**Verify a front-end deploy at `/`, never at `/index.html`.** `/index.html` is
+not a route: it falls through and returns `{"error":"no route for GET
+/index.html"}` — 46 bytes of JSON. Grep that for your change and you find
+nothing, which looks exactly like a failed deploy and has already convinced one
+agent that a live data-loss fix had not shipped when it had.
+
+```sh
+curl -s http://127.0.0.1:3901/ | grep -c 'YOUR MARKER'   # the real page
+curl -s http://127.0.0.1:3901/ | wc -c                   # compare to the file
+wc -c < public/index.html                                # ...on disk
+```
+
+Matching byte counts plus the marker is proof. The instinct — check rather than
+trust the report — was right; it was aimed at the wrong URL. Note how neatly this
+is the impostor pattern again: the wrong URL did not error out, it returned a
+confident, well-formed, entirely misleading answer.
+
 **Declare what you hold.** Put `holds: <path>` (or `holds: nothing`) in your
 heartbeat `note`, so `/status` doubles as a noticeboard of who is in which repo.
 Advisory, not a lock — it will not stop a collision, but it lets a cold-started
@@ -437,25 +466,32 @@ matter of taste is that **`spawned` and `finished` pair on the subagent NAME** �
 one key, holding the whole roster together — so a stray `spawned` does not add
 noise, it corrupts an existing row.
 
-*What today's server does with a violation, probed on 2026-08-08. The panel
-owner is weighing whether to reject these outright, so treat this as the cost of
-breaking the contract, not as behaviour to rely on:*
+*What the server does with a violation, re-probed against the merged code on
+2026-08-08 after the panel work landed. Half of this is now fixed:*
 
-- Two `spawned` under one name do **not** produce two rows. They produce one
-  row, and the later spawn **silently overwrites the task text** — `"the real
-  task"` became `"I spawned myself"`, with no error and no trace in the roster.
-- Worse, a self-announcement arriving *after* the coordinator's `finished`
-  **resurrects the row**: `running` returns to `true`, `ok` to `null`, and it can
-  never finish again, because the coordinator already sent its single `finished`.
-  The result is a permanent phantom worker that looks like it is still holding a
-  worktree.
+- **FIXED — a backfilled `spawned` no longer resurrects a finished worker.**
+  Pairing now sorts by `at` rather than by arrival, so a `spawned` carrying an
+  older explicit timestamp settles *before* the `finished` it belongs to, even
+  though it arrived after. Verified: `finished` first, then a backfilled
+  `spawned` an hour older, gives `running: false`, `ok: true`, one spawn, no
+  collision. A coordinator resuming mid-flight can safely backfill its roster.
+- **STILL TRUE — a second `spawned` under a live name overwrites the row**, and
+  if that name had already finished, it *does* go back to running and can never
+  finish again, because the coordinator already sent its single `finished`.
+  Verified: a late self-announcement with no explicit `at` left `running: true`,
+  `ok: null`, and the task text replaced by `"I spawned myself"`.
+  **The difference now is that it is no longer silent.** That row carries
+  `spawns: 2` and `nameCollision: true`, and the UI warns on it. The overwrite is
+  deliberate — the latest run is usually the useful one — so this is disclosed,
+  not prevented.
 
-Read that last one twice, because it is the whole argument: **a well-meaning
-worker announcing itself makes the panel manufacture the very ghost the panel
-was built to expose.** The feature's one job is telling a live agent from an
-abandoned one, and a stray `spawned` fabricates exactly the lie it exists to
-catch — a reassuring, plausible signal produced by a failure, which is the
-impostor pattern from "The rules" appearing inside our own data.
+Read the second one twice, because it is the whole argument for the contract:
+**a well-meaning worker announcing itself makes the panel manufacture the very
+ghost the panel was built to expose.** The feature's one job is telling a live
+agent from an abandoned one, and a stray `spawned` fabricates exactly the lie it
+exists to catch. What changed is that the lie now arrives wearing a label; the
+fix was to stop it being *silent*, not to stop it happening. Honour the contract
+and it never happens at all.
 
 **Post `spawned` at spawn time.** The server timestamps on arrival, so a roster
 posted after the fact carries the *backfill* time, not the true start — and a
