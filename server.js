@@ -396,6 +396,20 @@ function applyEvent(ev) {
     subscriptions.delete(ev.id);
   } else if (ev.t === 'pushcfg') {
     pushConfig = { ...pushConfig, ...ev.cfg };
+  } else if (ev.t === 'image') {
+    /*
+     * One posting of one blob. The bytes live on disk under the content hash;
+     * this is the record that it was posted, by whom, and into which
+     * conversation. Two maps because those are two different lifetimes — the
+     * file is shared, the posting is not.
+     */
+    const im = ev.image;
+    if (im && typeof im.id === 'string' && typeof im.blob === 'string') {
+      images.set(im.id, im);
+      const meta = blobs.get(im.blob);
+      if (meta) meta.posts++;
+      else blobs.set(im.blob, { type: im.type, bytes: im.bytes, width: im.width, height: im.height, posts: 1 });
+    }
   } else if (ev.t === 'check') {
     // One tick. Last write wins, and the record keeps who and when, because
     // "who ticked this" is the first question asked of a shared list.
@@ -605,10 +619,16 @@ function entriesOf(t) {
   // Only ever added, never removed: an entry without an author is exactly the
   // shape every client was already written against.
   if (t.author) first.author = t.author;
+  /*
+   * Attached pictures. Added only when there are some, so an entry for a
+   * message with none is byte-for-byte the shape every existing client was
+   * written against — including the copy the service worker saved yesterday.
+   */
+  if (Array.isArray(t.images) && t.images.length) first.images = t.images.slice();
   const out = [first];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
-    out.push({
+    const reply = {
       id: `${t.id}:r`,
       role: 'agent',
       text: asText(t.result),
@@ -617,7 +637,9 @@ function entriesOf(t) {
       rev: new Date(Math.max(msOf(at), createdMs)).toISOString(),
       replyTo: t.id,
       conversationId,
-    });
+    };
+    if (Array.isArray(t.resultImages) && t.resultImages.length) reply.images = t.resultImages.slice();
+    out.push(reply);
   }
   /*
    * A tick is a change to the entry, so it has to move `rev` — a client polling
@@ -2854,6 +2876,329 @@ function sendIcon(res, name) {
   res.end(buf);
 }
 
+// ---------------------------------------------------------------- images
+/*
+ * THE GALLERY. Agents make pictures; he is on a phone in another country and
+ * could not see a single one. In one night 198 sprites were generated across
+ * six subjects and none of them reached him, because every file sat in a temp
+ * directory on a desktop he was thousands of miles from. The generation worked.
+ * The *showing* did not exist. This is the showing.
+ *
+ * CONTENT-ADDRESSED, AND THAT IS THE SECURITY DESIGN RATHER THAN AN OPTIMISATION.
+ *
+ * This server has no authentication and answers anything that can reach the
+ * port. The obvious API — "here is a path on disk, serve me that" — is a
+ * file-disclosure hole: every device on his network could read every file on
+ * his desktop, and the request would look exactly like a legitimate one. So no
+ * client-supplied path is ever joined to a filesystem path. An agent POSTs the
+ * BYTES; this process hashes them, names the file after its own hash, and
+ * serves it back by that hash. Traversal is not filtered here, it is
+ * UNREPRESENTABLE — the only characters that can occur in one of these
+ * filenames are 64 hex digits that this process computed itself.
+ *
+ * The type is SNIFFED FROM THE BYTES and the client's `content-type` is
+ * ignored, for the same reason: a caller must not be able to talk this server
+ * into labelling an arbitrary blob as something a browser will treat as script.
+ * Combined with `x-content-type-options: nosniff` on the way out, the type a
+ * browser sees is one of four values this file chose.
+ *
+ * TWO MAPS FROM ONE EVENT, because a blob and a *posting* of a blob are
+ * different things. The same contact sheet posted into two conversations is one
+ * file on disk and two rows in the gallery. Keying the gallery by content hash
+ * instead would silently drop the second post — the image would appear in
+ * whichever conversation happened to get there first, and be missing from the
+ * one he was actually looking at.
+ */
+const IMAGE_DIR = path.join(DATA_DIR, 'images');
+// A contact sheet of several dozen candidates is the dominant artefact here and
+// is far bigger than a message. Deliberately its own limit rather than MAX_BODY,
+// which stays 1 MiB for JSON: a route that accepts megabytes of arbitrary bytes
+// should say so in one obvious place.
+const MAX_IMAGE = Number(process.env.MAX_IMAGE || 8 * 1024 * 1024);
+// What this process itself produces from crypto.createHash('sha256'). Anything
+// that fails this never becomes a filename.
+const IMAGE_ID_RE = /^[a-f0-9]{64}$/;
+const MAX_ALT = 300;
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+/** @type {Map<string, object>} sha256 -> { type, bytes, width, height } */
+const blobs = new Map();
+/** @type {Map<string, object>} post id -> image record (insertion order == post order) */
+const images = new Map();
+
+/*
+ * WHAT THESE BYTES ACTUALLY ARE, decided by looking at them.
+ *
+ * Dimensions are read out of the header too, and they are not decoration: the
+ * page reserves the right box before the bytes arrive, so a thread full of
+ * images does not shudder as each one loads. Every format here puts its size in
+ * the first few bytes, so this needs no decoder and no dependency — which is
+ * the only reason it is worth doing at all.
+ *
+ * `width`/`height` are null rather than guessed when the header is truncated or
+ * unusual. A missing dimension makes the page fall back to a flexible box; a
+ * WRONG one would lay the thread out around a lie.
+ */
+function sniffImage(buf) {
+  if (!buf || buf.length < 12) return null;
+  const tag = (a, b) => buf.toString('latin1', a, b);
+
+  // PNG: the 8-byte signature, then IHDR carrying width and height as BE u32.
+  if (buf.length >= 24 && tag(0, 8) === '\x89PNG\r\n\x1a\n') {
+    if (tag(12, 16) === 'IHDR') {
+      return { type: 'image/png', width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    return { type: 'image/png', width: null, height: null };
+  }
+
+  // GIF: 'GIF87a'/'GIF89a', then the logical screen size as LE u16.
+  if (tag(0, 6) === 'GIF87a' || tag(0, 6) === 'GIF89a') {
+    return { type: 'image/gif', width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+  }
+
+  // WebP: a RIFF container whose form type is WEBP. Three sub-formats, each
+  // storing the size differently, and the extended one (VP8X) is what anything
+  // with animation or alpha uses.
+  if (tag(0, 4) === 'RIFF' && buf.length >= 16 && tag(8, 12) === 'WEBP') {
+    const form = tag(12, 16);
+    if (form === 'VP8 ' && buf.length >= 30) {
+      return { type: 'image/webp', width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+    }
+    if (form === 'VP8L' && buf.length >= 25) {
+      const bits = buf.readUInt32LE(21);
+      return { type: 'image/webp', width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+    if (form === 'VP8X' && buf.length >= 30) {
+      return {
+        type: 'image/webp',
+        width: 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)),
+        height: 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16)),
+      };
+    }
+    return { type: 'image/webp', width: null, height: null };
+  }
+
+  // JPEG: walk the marker segments to the start-of-frame, which is the only
+  // place the size is recorded. EXIF thumbnails and comment blocks sit in front
+  // of it, so this cannot be read at a fixed offset.
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    let i = 2;
+    while (i + 9 < buf.length) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      // Padding, and the standalone markers that carry no length field.
+      if (marker === 0xff) { i++; continue; }
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      const len = buf.readUInt16BE(i + 2);
+      if (len < 2) break; // malformed: stop rather than loop forever
+      // SOF0-SOF15, excluding the three that share the range but are not frames.
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { type: 'image/jpeg', height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+      }
+      i += 2 + len;
+    }
+    return { type: 'image/jpeg', width: null, height: null };
+  }
+
+  return null;
+}
+
+/** The public shape. `url` is derived, never stored, so it cannot go stale. */
+const imageView = (im) => ({ ...im, url: `/images/${im.blob}` });
+
+function imagePath(blob) {
+  return path.join(IMAGE_DIR, blob);
+}
+
+/*
+ * POST /images — the bytes themselves, with the metadata in the query string.
+ *
+ *   curl --data-binary @sheet.png 'http://127.0.0.1:3901/images?conversationId=main&alt=crates'
+ *
+ * Raw rather than JSON base64 on purpose: base64 inflates by a third against a
+ * cap that a contact sheet is already testing, and `--data-binary @file` is one
+ * flag. The metadata rides in the query string because the body is not JSON and
+ * cannot carry it.
+ */
+async function imageUploadRoute(req, res, q) {
+  let buf;
+  try {
+    buf = await readRawBody(req, MAX_IMAGE);
+  } catch (err) {
+    return fail(res, err.code || 400, err.message || 'could not read the request body', {
+      maxBytes: MAX_IMAGE,
+    });
+  }
+  if (!buf.length) {
+    return fail(res, 400, 'empty body: POST the image bytes themselves, e.g. curl --data-binary @file.png');
+  }
+
+  const kind = sniffImage(buf);
+  if (!kind) {
+    return fail(res, 415, 'these bytes are not an image format this server recognises', {
+      supported: IMAGE_TYPES,
+      // Said explicitly because a caller who set content-type correctly and was
+      // still refused will otherwise assume the header was the problem.
+      note: 'the format is read from the bytes; the content-type header is ignored',
+      firstBytesHex: buf.slice(0, 8).toString('hex'),
+    });
+  }
+
+  const alt = readString(q.get('alt'), 'alt', MAX_ALT);
+  if (alt instanceof Error) return fail(res, 400, alt.message);
+  const agent = readString(q.get('agent'), 'agent', MAX_AUTHOR);
+  if (agent instanceof Error) return fail(res, 400, agent.message);
+
+  const convRaw = q.get('conversationId') || q.get('conversation');
+  const conversationId = convRaw || DEFAULT_CONV;
+  if (!conversations.has(conversationId)) {
+    return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
+  }
+
+  const blob = crypto.createHash('sha256').update(buf).digest('hex');
+
+  /*
+   * Write the bytes BEFORE logging the event, so the log never describes a file
+   * that is not there. The reverse order would survive a crash as a permanent
+   * broken image in his thread with no way to tell it from a bug.
+   */
+  try {
+    fs.mkdirSync(IMAGE_DIR, { recursive: true });
+    // Identical content is identical bytes, so a re-post is a no-op rather than
+    // a rewrite — and a rewrite of a file a request may be streaming is exactly
+    // the kind of race worth not having.
+    if (!fs.existsSync(imagePath(blob))) {
+      const tmp = imagePath(blob) + '.part';
+      fs.writeFileSync(tmp, buf);
+      fs.renameSync(tmp, imagePath(blob)); // atomic within the directory
+    }
+  } catch (err) {
+    return fail(res, 500, `could not store the image: ${err.message}`, { dir: IMAGE_DIR });
+  }
+
+  const image = {
+    id: newId(),
+    blob,
+    type: kind.type,
+    bytes: buf.length,
+    width: kind.width === undefined ? null : kind.width,
+    height: kind.height === undefined ? null : kind.height,
+    alt,
+    agent,
+    conversationId,
+    ts: nowIso(),
+  };
+  appendEvent({ t: 'image', image });
+  send(res, 201, {
+    ok: true,
+    image: imageView(image),
+    // Same bytes as something already here. Worth saying: an agent looping over
+    // a directory of near-identical renders wants to know two of them matched.
+    deduplicated: blobs.get(blob) ? blobs.get(blob).posts > 1 : false,
+    markdown: `![${(alt || 'image').replace(/[[\]]/g, '')}](/images/${blob})`,
+  });
+}
+
+/*
+ * GET /images/:blob — the bytes.
+ *
+ * Immutable caching is honest here in a way it almost never is: the name IS the
+ * hash of the content, so this URL cannot ever mean different bytes. That is
+ * what makes a phone on hotel wifi bearable.
+ */
+function imageBytesRoute(req, res, blob) {
+  if (!IMAGE_ID_RE.test(blob)) {
+    return fail(res, 404, 'not an image id', {
+      // The shape is named rather than the mistake, because the most likely
+      // caller here is someone who put a filename or a path in the URL.
+      expected: 'the 64-character sha256 this server returned from POST /images',
+    });
+  }
+  const meta = blobs.get(blob);
+  if (!meta) return fail(res, 404, `no image with id "${blob}"`);
+
+  let buf;
+  try {
+    buf = fs.readFileSync(imagePath(blob));
+  } catch (err) {
+    /*
+     * The log remembers the image and the bytes are gone — a DATA_DIR restored
+     * without its images directory, or a manual tidy-up. Say precisely that.
+     * Serving a placeholder, or a 200 with nothing in it, would leave him
+     * looking at a broken square with no way to tell it from a bug in the page.
+     */
+    return fail(res, 410, 'this image is in the log but its bytes are no longer on disk', {
+      id: blob, expectedAt: imagePath(blob), reason: err.code || 'unreadable',
+    });
+  }
+
+  res.writeHead(200, {
+    'content-type': meta.type,
+    'content-length': buf.length,
+    'cache-control': 'public, max-age=31536000, immutable',
+    'x-content-type-options': 'nosniff',
+    // Belt and braces on a route that returns caller-supplied bytes: even if
+    // the sniffer were ever fooled, nothing here may act as a document.
+    'content-disposition': 'inline',
+    'content-security-policy': "default-src 'none'; sandbox",
+  });
+  if (req.method === 'HEAD') return res.end();
+  res.end(buf);
+}
+
+/** GET /images — the gallery listing, newest first. */
+function imageListRoute(res, q) {
+  const conversationId = q.get('conversationId') || q.get('conversation');
+  let list = [...images.values()];
+  if (conversationId) list = list.filter((im) => im.conversationId === conversationId);
+  list.sort((a, b) => msOf(b.ts) - msOf(a.ts));
+  const limit = Math.max(1, Math.min(Number(q.get('limit')) || 200, 500));
+  const page = list.slice(0, limit);
+  send(res, 200, {
+    count: page.length,
+    total: list.length,
+    conversationId: conversationId || null,
+    images: page.map(imageView),
+  });
+}
+
+/*
+ * Images attached to a message, as opposed to written into its text.
+ *
+ * Both work and they are for different things: markdown `![](/images/<id>)`
+ * puts a picture at a chosen point in a sentence, while this hangs a strip of
+ * them under the message, which is what "here are the twelve crates" wants.
+ *
+ * Validated against what has actually been uploaded, not merely shape-checked.
+ * An id that names nothing would render as a broken square in his thread, and a
+ * broken square is indistinguishable from a bug in the page — so it is refused
+ * at the point where the caller can still fix it.
+ */
+const MAX_ATTACH = 24;
+
+function readImages(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) return new Error('images must be an array of image ids');
+  if (raw.length > MAX_ATTACH) {
+    return new Error(`too many images: ${raw.length}, max ${MAX_ATTACH} on one message`);
+  }
+  const out = [];
+  for (const v of raw) {
+    if (typeof v !== 'string') return new Error('every entry in images must be a string id');
+    // A caller who pastes back the `url` this server handed them is doing the
+    // obvious thing, so accept it rather than making them slice the prefix off.
+    const id = v.trim().replace(/^\/?images\//, '');
+    if (!IMAGE_ID_RE.test(id)) {
+      return new Error(`"${v}" is not an image id: expected the 64-character sha256 returned by POST /images`);
+    }
+    if (!blobs.has(id)) {
+      return new Error(`no image with id "${id}" — upload the bytes first with POST /images`);
+    }
+    if (out.indexOf(id) < 0) out.push(id); // the same picture twice is a typo, not a layout
+  }
+  return out.length ? out : null;
+}
+
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
   // `text` is the UI's field name and an alias for `instruction`; both are accepted.
@@ -2872,6 +3217,8 @@ function createTask(res, body) {
   if (!conversations.has(conversationId)) {
     return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
   }
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
   const task = {
     id: newId(),
     role: DEFAULT_ROLE, // server-set, never taken from the client
@@ -2887,6 +3234,7 @@ function createTask(res, body) {
     relayed: false,
     relayedAt: null,
   };
+  if (imgs) task.images = imgs; // a reference picture sent TO an agent
   appendEvent({ t: 'create', task });
   notify('task', task, readNotifyHint(body));
   send(res, 201, task);
@@ -2984,6 +3332,8 @@ function createMessage(res, body) {
   if (author instanceof Error) return fail(res, 400, author.message);
   const to = readString(body.to, 'to', MAX_AUTHOR);
   if (to instanceof Error) return fail(res, 400, to.message);
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
 
   const channelRaw = readString(body.channel, 'channel', MAX_CHANNEL);
   if (channelRaw instanceof Error) return fail(res, 400, channelRaw.message);
@@ -3006,6 +3356,7 @@ function createMessage(res, body) {
     relayedAt: ts,
   };
   if (to) task.to = to;
+  if (imgs) task.images = imgs;
 
   if (internal) {
     const channel = channelRaw === null ? DEFAULT_CHANNEL : channelRaw;
@@ -3115,8 +3466,19 @@ function resultTask(res, id, body) {
   if (body.result === null) {
     return fail(res, 400, 'result is null: a null answer is not an answer. Send the text the human should read.');
   }
+  /*
+   * Pictures attached to the ANSWER, which is the path that actually matters:
+   * an agent asked for twelve crates claims the task, renders them, and hands
+   * them back here. Kept under `resultImages` rather than `images` so a task
+   * that was SENT with a reference picture and ANSWERED with renders does not
+   * have one overwrite the other — they are two different sets on one record.
+   */
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
   // A result may be posted straight to a pending task; no claim required.
-  appendEvent({ t: 'patch', id, patch: { status: 'done', result: body.result, resultTs: nowIso() } });
+  const patch = { status: 'done', result: body.result, resultTs: nowIso() };
+  if (imgs) patch.resultImages = imgs;
+  appendEvent({ t: 'patch', id, patch });
   notify('result', task, readNotifyHint(body));
   send(res, 200, task);
 }
@@ -3738,6 +4100,23 @@ async function route(req, res) {
       if (!need('POST')) return;
       return pushTestRoute(res, await readBody(req));
     }
+  }
+
+  /*
+   * /images — the gallery. A new top-level segment that shadows nothing: no
+   * existing route, icon name or static path begins with it, so every request
+   * that worked before this feature still reaches exactly the handler it did.
+   */
+  if (seg.length === 1 && seg[0] === 'images') {
+    if (m === 'GET') return imageListRoute(res, q);
+    if (m === 'POST') return imageUploadRoute(req, res, q);
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+  if (seg.length === 2 && seg[0] === 'images') {
+    if (m !== 'GET' && m !== 'HEAD') {
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, HEAD' });
+    }
+    return imageBytesRoute(req, res, seg[1]);
   }
 
   // /events — Server-Sent Events push of every change
