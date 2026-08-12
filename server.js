@@ -16,6 +16,17 @@ const NAME = 'relay-queue';
 const VERSION = '1.5.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
+/*
+ * A one-shot token a test harness passes in, echoed back on /health.
+ *
+ * The harness learns WHERE its child is from the "listening on" line the child
+ * prints below. This answers the other half: whether the server ANSWERING at
+ * that address is still that child. A harness whose child died at birth
+ * otherwise interrogates whoever else holds the port and reports the findings
+ * as fact. Unset in production, where it reads as null. See
+ * tools/harness-lib.js.
+ */
+const BOOT_NONCE = process.env.RELAY_BOOT_NONCE || null;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'events.jsonl');
 // Where the UI page is read from, first match wins. `public/index.html` is the source of
@@ -124,7 +135,15 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:relay@hypnodroid.com'
 const KEYS_FILE = path.join(DATA_DIR, 'push-keys.json');
 const MAX_SUBS = 20;
 const MAX_PUSH_BODY = 140; // chars of preview; the rest is on the page
-const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 20);
+/*
+ * The hourly ceiling — the last line of defence, not the first. It was 20,
+ * which is far too generous for his bar: the 16 "done" pushes of 2026-08-08
+ * fit inside it comfortably and `suppressedBudget` stayed 0, so the ceiling
+ * never fired once during the incident it should have caught. 6 an hour is
+ * about the most a human wants from a channel he cannot walk away from. The
+ * env override is intact for an operator who disagrees.
+ */
+const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 6);
 
 const CATEGORIES = ['needs-you', 'done', 'broken'];
 const NOTIFY_VALUES = new Set([...CATEGORIES, 'none']);
@@ -140,9 +159,24 @@ const PUSH_DEBOUNCE_MS = { 'needs-you': 15000, done: 15000, broken: 3000 };
 const PUSH_DEBOUNCE_OVERRIDE = Number(process.env.PUSH_DEBOUNCE_MS || 0) || null;
 const PUSH_TTL_SEC = { 'needs-you': 6 * 3600, done: 6 * 3600, broken: 3600 };
 const PUSH_URGENCY = { 'needs-you': 'high', done: 'normal', broken: 'high' };
-// The page labels its own posts, so this is how "he typed it" is told apart
-// from "an agent handed him something". Never buzz the phone that sent it.
-const PAGE_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
+/*
+ * The page labels its own posts, so this is how "he typed it" is told apart
+ * from "an agent handed him something". Never buzz the phone that sent it.
+ *
+ * ADDING A UI ACTION? ADD ITS ORIGIN HERE, IN THE SAME COMMIT.
+ *
+ * This is an allowlist whose default is *notify*, which makes forgetting it
+ * silent and self-inflicted rather than merely wrong. `checklist` was missing:
+ * ticking a box on his own phone posts a task with from:'checklist', fell
+ * through to `return 'needs-you'`, and pushed a notification back at the very
+ * phone that had just sent it. He ticked a box and got buzzed about it, by
+ * himself. Every future UI origin will do exactly the same until it is listed.
+ *
+ * The safer shape is the inverse — treat everything as his unless it is a known
+ * agent — but `from` is a free-text field that agents also set, so there is no
+ * reliable way to invert it today. Hence the shouting comment.
+ */
+const PAGE_ORIGINS = new Set(['web', 'voice', 'voice-conversation', 'checklist']);
 
 /** @type {Map<string, object>} id -> { id, endpoint, p256dh, auth, ua, label, createdAt } */
 const subscriptions = new Map();
@@ -164,9 +198,122 @@ let vapidKeys = null;
 const tasks = new Map();
 /** @type {Map<string, object>} id -> conversation (insertion order == creation order) */
 const conversations = new Map();
+/*
+ * Ticked checkboxes, keyed by THREAD ENTRY id rather than task id — a checklist
+ * usually arrives as an agent's *result*, which projects to the derived entry
+ * `<taskId>:r`, and a single task can therefore carry two independent lists.
+ * Value: { [index]: { on, by, at } }. The message text stays the source of truth
+ * for the items themselves; this only records the ticks made from a page, which
+ * is the one thing the append-only text can never be rewritten to express.
+ */
+const checks = new Map();
 let logFd = null;
 let mutations = 0; // bumped on every applied event; memoisation keys off it
 
+/* ------------------------------------------------------------ activity feed
+ * What is this coordinator actually doing right now: which subagents it spawned,
+ * which finished, and — if something is bothering to report them — which tools
+ * it ran. An append-only ring per conversation, capped, oldest dropped first.
+ *
+ * DURABILITY IS SPLIT ON PURPOSE, and the split is the whole design:
+ *
+ *   - subagent spawned/finished and worktree claims are DURABLE. They are rare,
+ *     and they are the only record of what is still running and what is still
+ *     holding a git worktree when this process restarts. This server restarts
+ *     itself whenever server.js changes, i.e. constantly, and forgetting "there
+ *     are three subagents out there holding trees" across a restart would
+ *     recreate the exact ghost the stop fields above exist to prevent.
+ *
+ *   - tool calls are EPHEMERAL, memory only. They are high volume and would
+ *     bury the actual history in `events.jsonl` — the same reason heartbeats
+ *     are not logged. A live view is allowed to start empty after a restart;
+ *     the queue's own record of what happened is not.
+ *
+ * NOTHING HERE FEEDS LIVENESS. A tool call is not proof of useful work: an agent
+ * sitting in a poll loop emits them forever while achieving nothing, which is
+ * precisely the lie a heartbeat tells. `lastActedAt` keeps coming from claims
+ * and results only. This feed is colour, not evidence.
+ */
+const ACTIVITY = new Map(); // conversationId -> entry[] (oldest first)
+const ACTIVITY_CAP = Number(process.env.ACTIVITY_CAP || 200); // per conversation
+const ACTIVITY_CONVS = 50; // distinct conversations tracked before the quietest is dropped
+const DURABLE_KINDS = new Set(['spawned', 'finished', 'worktree']);
+// How far back an explicit `at` may reach. Backfill is for a coordinator
+// resumed mid-flight, which is hours; anything older is a caller bug and is
+// rejected rather than quietly accepted into a feed that cannot hold it.
+const ACT_AT_MAX_AGE_MS = Number(process.env.ACT_AT_MAX_AGE_MS || 30 * 86400000);
+
+/*
+ * WHERE A TIMESTAMP CAME FROM, in three states rather than two.
+ *
+ *   false — the server stamped it when the POST arrived. Observed.
+ *   true  — the client supplied `at`. Reconstructed, and possibly a guess.
+ *   null  — UNKNOWN. The entry pre-dates this field.
+ *
+ * `null` is not tidiness, it is the honest answer for entries already in the
+ * append-only log. Some of those ARE backfills — a coordinator resumed
+ * mid-flight recorded six subagents with the backfill time as their start, so
+ * one that had been running an hour reported ten seconds. Nothing in the log
+ * distinguishes those from genuinely observed ones, and the log must not be
+ * rewritten to pretend otherwise. Defaulting them to `false` would launder a
+ * guess into an observation, which is the exact defect this field exists to
+ * expose. So they normalise to `null` and every consumer can see it does not
+ * know.
+ *
+ * Normalised HERE because every entry reaches the ring through this function —
+ * fresh from a POST and replayed from the log alike — so the key is always
+ * present on the way out, and no consumer ever needs an existence check.
+ */
+function actProvenance(v) {
+  return v === true ? true : v === false ? false : null;
+}
+
+function pushActivity(entry) {
+  if (!entry || typeof entry.conversationId !== 'string') return null;
+  entry.reconstructed = actProvenance(entry.reconstructed);
+  let feed = ACTIVITY.get(entry.conversationId);
+  if (!feed) {
+    if (ACTIVITY.size >= ACTIVITY_CONVS) {
+      // Drop whichever feed has been quiet longest, not whichever was created
+      // first — a long-lived busy conversation must not be evicted by churn.
+      let oldestId = null;
+      let oldestAt = Infinity;
+      for (const [id, f] of ACTIVITY) {
+        // The NEWEST timestamp in the feed, not the last one appended: a
+        // backfilled entry carries an older `at`, and reading arrival order as
+        // time order here would let a busy conversation be evicted for having
+        // just corrected its own history.
+        let at = 0;
+        for (const e of f) { const t = msOf(e.at); if (t > at) at = t; }
+        if (at < oldestAt) { oldestAt = at; oldestId = id; }
+      }
+      if (oldestId !== null) ACTIVITY.delete(oldestId);
+    }
+    feed = [];
+    ACTIVITY.set(entry.conversationId, feed);
+  }
+  feed.push(entry);
+  while (feed.length > ACTIVITY_CAP) feed.shift();
+  return entry;
+}
+
+/*
+ * THE STOP FIELDS, AND THE LIE THEY EXIST TO PREVENT.
+ *
+ * A coordinator is two separate things: this row, and a Claude agent running in
+ * some session. The UI can only reach the row. Archiving or deleting it does
+ * NOT stop the agent — it keeps running, keeps holding git worktrees, and may
+ * keep posting into a conversation that now looks closed. That is strictly
+ * worse than leaving it alone, because it *looks* resolved.
+ *
+ * So there is no kill here, and deliberately never will be. `stopRequested` is
+ * a note pinned to the door: the agent reads it the next time it happens to
+ * wake, and stops itself. Nothing in this process can make that happen sooner,
+ * because an agent cannot be woken from outside — a Monitor event is only
+ * delivered at the start of a turn. The acknowledgement fields exist purely so
+ * the difference between "asked" and "actually stopped" stays visible instead
+ * of being assumed, and they are only ever written by the agent itself.
+ */
 function newConversation(id, title, agent) {
   return {
     id,
@@ -175,7 +322,35 @@ function newConversation(id, title, agent) {
     createdAt: nowIso(),
     archived: false,
     archivedAt: null,
+    stopRequested: false,
+    stopRequestedAt: null,
+    stopRequestedBy: null,
+    // Written by the agent, from inside a turn. `null` means it has not been
+    // heard from since the request — the normal state, not an error.
+    stopAck: null,        // null | 'stopping' | 'stopped'
+    stopAckAt: null,
+    stoppedAt: null,
+    stopNote: null,
+    // What the agent says it was holding when it wound down. Reported, never
+    // observed: this server does not touch git and cannot verify a word of it.
+    worktrees: null,
   };
+}
+
+/*
+ * Conversations written before the stop fields existed replay as bare objects.
+ * Normalising on the way in keeps every reader free of `undefined` checks and,
+ * more importantly, stops "never asked to stop" and "asked, no answer yet" from
+ * both arriving as `undefined` at the point where the UI picks a badge.
+ */
+function normaliseConv(conv) {
+  const base = {
+    archived: false, archivedAt: null,
+    stopRequested: false, stopRequestedAt: null, stopRequestedBy: null,
+    stopAck: null, stopAckAt: null, stoppedAt: null, stopNote: null, worktrees: null,
+  };
+  for (const [k, v] of Object.entries(base)) if (conv[k] === undefined) conv[k] = v;
+  return conv;
 }
 
 /*
@@ -205,10 +380,14 @@ function applyEvent(ev) {
     const task = tasks.get(ev.id);
     if (task) Object.assign(task, ev.patch);
   } else if (ev.t === 'conv') {
-    conversations.set(ev.conv.id, ev.conv);
+    conversations.set(ev.conv.id, normaliseConv(ev.conv));
   } else if (ev.t === 'convpatch') {
     const conv = conversations.get(ev.id);
     if (conv) Object.assign(conv, ev.patch);
+  } else if (ev.t === 'act') {
+    // The durable half of the activity feed — see the feed section below for
+    // why only some kinds get a line in the log at all.
+    pushActivity(ev.entry);
   } else if (ev.t === 'sub') {
     // One row per browser. Firefox and Chrome are separate subscriptions with
     // separate push services, so this is a set and never a single value.
@@ -217,6 +396,36 @@ function applyEvent(ev) {
     subscriptions.delete(ev.id);
   } else if (ev.t === 'pushcfg') {
     pushConfig = { ...pushConfig, ...ev.cfg };
+  } else if (ev.t === 'image') {
+    /*
+     * One posting of one blob. The bytes live on disk under the content hash;
+     * this is the record that it was posted, by whom, and into which
+     * conversation. Two maps because those are two different lifetimes — the
+     * file is shared, the posting is not.
+     */
+    const im = ev.image;
+    if (im && typeof im.id === 'string' && typeof im.blob === 'string') {
+      images.set(im.id, im);
+      const meta = blobs.get(im.blob);
+      if (meta) {
+        meta.posts++;
+        // The first description of a picture wins. Later postings of the same
+        // bytes are usually a re-send, and letting one silently retitle a
+        // picture already on his screen is a change he never asked for.
+        if (!meta.alt && im.alt) meta.alt = im.alt;
+      } else {
+        blobs.set(im.blob, {
+          type: im.type, bytes: im.bytes, width: im.width, height: im.height,
+          alt: im.alt || null, posts: 1,
+        });
+      }
+    }
+  } else if (ev.t === 'check') {
+    // One tick. Last write wins, and the record keeps who and when, because
+    // "who ticked this" is the first question asked of a shared list.
+    let row = checks.get(ev.entryId);
+    if (!row) { row = {}; checks.set(ev.entryId, row); }
+    row[String(ev.index)] = { on: !!ev.on, by: ev.by || null, at: ev.at };
   }
   // An unknown `t` is ignored, as it always has been: a log written by a newer
   // build replays on an older one without tripping it.
@@ -232,6 +441,7 @@ function appendEvent(ev) {
   // Push to live pages, post-durability.
   if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
   else if (ev.t === 'sub' || ev.t === 'unsub' || ev.t === 'pushcfg') { /* not thread state; nothing to stream */ }
+  else if (ev.t === 'check') broadcast(taskIdOfEntry(ev.entryId));
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
   // An agent acting is what clears the deadman banner, and it must clear at once
   // rather than up to a tick later — recovery has to feel immediate to be trusted.
@@ -399,6 +609,28 @@ const counts = () => {
  * `since=` filters on, so a status change (pending -> claimed -> done) also
  * reaches an incrementally polling client.
  */
+/*
+ * An attached picture, as the thread hands it to a page.
+ *
+ * Expanded from the bare id the record stores, because the page needs the
+ * DIMENSIONS to reserve the right box before the bytes arrive — a thread full
+ * of images that resizes as each one lands is unreadable on a phone, and he
+ * reads this on a phone. Width and height are whatever the header said and may
+ * legitimately be null; a page that gets null lays out flexibly, where a page
+ * given a guess would lay out around a wrong number.
+ */
+const imageRef = (blob) => {
+  const meta = blobs.get(blob) || {};
+  return {
+    id: blob,
+    url: `/images/${blob}`,
+    type: meta.type || null,
+    width: meta.width === undefined ? null : meta.width,
+    height: meta.height === undefined ? null : meta.height,
+    alt: meta.alt || null,
+  };
+};
+
 const msOf = (v) => { const n = Date.parse(v || ''); return Number.isNaN(n) ? 0 : n; };
 const asText = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : JSON.stringify(v));
 
@@ -419,10 +651,16 @@ function entriesOf(t) {
   // Only ever added, never removed: an entry without an author is exactly the
   // shape every client was already written against.
   if (t.author) first.author = t.author;
+  /*
+   * Attached pictures. Added only when there are some, so an entry for a
+   * message with none is byte-for-byte the shape every existing client was
+   * written against — including the copy the service worker saved yesterday.
+   */
+  if (Array.isArray(t.images) && t.images.length) first.images = t.images.map(imageRef);
   const out = [first];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
-    out.push({
+    const reply = {
       id: `${t.id}:r`,
       role: 'agent',
       text: asText(t.result),
@@ -431,13 +669,275 @@ function entriesOf(t) {
       rev: new Date(Math.max(msOf(at), createdMs)).toISOString(),
       replyTo: t.id,
       conversationId,
-    });
+    };
+    if (Array.isArray(t.resultImages) && t.resultImages.length) reply.images = t.resultImages.map(imageRef);
+    out.push(reply);
+  }
+  /*
+   * A tick is a change to the entry, so it has to move `rev` — a client polling
+   * `since=<rev>` would otherwise never be told, and his second device would sit
+   * showing a stale list until something unrelated happened in the thread.
+   */
+  for (const e of out) {
+    const row = checks.get(e.id);
+    if (!row) continue;
+    const cl = checklistOf(e.id);
+    if (!cl) continue;
+    e.checklist = { total: cl.total, done: cl.done, items: cl.items };
+    let latest = msOf(e.rev);
+    for (const k of Object.keys(row)) latest = Math.max(latest, msOf(row[k].at));
+    e.rev = new Date(latest).toISOString();
   }
   return out;
 }
 
 /** A task's conversation, defaulting for records written before they existed. */
 const convIdOf = (t) => (typeof t.conversationId === 'string' && t.conversationId ? t.conversationId : DEFAULT_CONV);
+
+// ---------------------------------------------------------------- checklists
+/*
+ * A ticked box has to survive a reload, a second device, and a server restart,
+ * so it is stored here rather than in one browser's localStorage — and it has
+ * to be READABLE BY AN AGENT, which is the whole point of the feature: "check
+ * things off and have Claude notice."
+ *
+ * The items themselves are never stored. They are parsed out of the message
+ * text on demand, so there is exactly one source of truth for *what is on the
+ * list* (the message, which is append-only and cannot be rewritten) and exactly
+ * one for *what is ticked* (the `check` events). Those two cannot drift apart,
+ * because neither is a copy of the other. Editing is impossible by
+ * construction; a corrected list is a new message, which correctly starts with
+ * fresh ticks rather than inheriting stale ones.
+ *
+ * The index is the ordinal of the task line within the message, counted exactly
+ * as the browser counts it — the client and the server MUST agree here, so the
+ * fence-skipping below mirrors the page's renderer line for line. A checkbox
+ * inside a fenced code block is sample text, not a task, on both sides.
+ */
+const RE_TASKLINE = /^(\s*)[-*+]\s+\[([ xX])\]\s*(.*)$/;
+const RE_FENCELINE = /^\s*(?:```|~~~)/;
+
+/** Task-list items in a message, in document order. Fenced code is not a list. */
+function parseChecklist(text) {
+  const out = [];
+  const lines = String(text == null ? '' : text).split(/\r?\n/);
+  let fenced = false;
+  for (const line of lines) {
+    if (RE_FENCELINE.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = RE_TASKLINE.exec(line);
+    if (!m) continue;
+    out.push({
+      index: out.length,
+      depth: Math.floor(m[1].replace(/\t/g, '    ').length / 2),
+      label: m[3].trim(),
+      checkedInText: /x/i.test(m[2]),
+    });
+  }
+  return out;
+}
+
+/** `abc-123:r` -> `abc-123`. A derived reply entry belongs to its own task. */
+const taskIdOfEntry = (entryId) => String(entryId || '').replace(/:r$/, '');
+
+/**
+ * The text an entry id names, or null if there is no such entry. `<id>` is the
+ * instruction, `<id>:r` the agent's result — the two halves `entriesOf` builds.
+ */
+function entryTextOf(entryId) {
+  const id = String(entryId || '');
+  const isReply = /:r$/.test(id);
+  const task = tasks.get(taskIdOfEntry(id));
+  if (!task) return null;
+  if (isReply) {
+    if (task.result === null || task.result === undefined) return null;
+    return { task, text: asText(task.result), role: 'agent' };
+  }
+  return { task, text: asText(task.instruction), role: task.role === 'agent' ? 'agent' : 'user' };
+}
+
+/**
+ * The live state of one entry's checklist: the parsed items, with any tick that
+ * a page has made laid over the text's own `[x]`. Returns null when the entry
+ * has no task list at all, so "no checklist here" is distinguishable from "an
+ * empty one".
+ */
+function checklistOf(entryId) {
+  const found = entryTextOf(entryId);
+  if (!found) return null;
+  const items = parseChecklist(found.text);
+  if (!items.length) return null;
+  const row = checks.get(String(entryId)) || {};
+  let done = 0;
+  const out = items.map((it) => {
+    const rec = row[String(it.index)];
+    const checked = rec ? !!rec.on : it.checkedInText;
+    if (checked) done++;
+    return {
+      index: it.index,
+      label: it.label,
+      depth: it.depth,
+      checked,
+      // Where this value came from, so an agent can tell "he ticked it" from
+      // "it was written already ticked" without guessing.
+      source: rec ? 'checked' : 'text',
+      by: rec ? rec.by || null : null,
+      at: rec ? rec.at || null : null,
+    };
+  });
+  return {
+    entryId: String(entryId),
+    taskId: found.task.id,
+    conversationId: convIdOf(found.task),
+    role: found.role,
+    total: out.length,
+    done,
+    remaining: out.length - done,
+    items: out,
+  };
+}
+
+/** Every checklist in the queue, newest task last. Optionally one conversation. */
+function allChecklists(conversationId) {
+  const out = [];
+  for (const t of tasks.values()) {
+    if (isInternal(t)) continue;
+    if (conversationId && convIdOf(t) !== conversationId) continue;
+    for (const entryId of [t.id, `${t.id}:r`]) {
+      const cl = checklistOf(entryId);
+      if (cl) out.push(cl);
+    }
+  }
+  return out;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * HOW AN AGENT FINDS OUT — and why this is debounced rather than immediate.
+ *
+ * Ticking a box has to reach an agent, because "check it off and have Claude
+ * notice" is the feature; a checkbox that only a browser knows about is a
+ * to-do app, and he already has one of those. But a coordinator only wakes on
+ * *pending work in its own conversation*, and the human's thread is for things
+ * he needs to read — so one message per tap would be both the only thing that
+ * works and completely unusable. Six items ticked while packing is six
+ * interruptions in the thread he reads on his phone.
+ *
+ * So a burst of taps settles into ONE notification. The timer restarts on every
+ * tick, so it fires after he stops, not on a fixed schedule, and a list worked
+ * through steadily produces a single line at the end of it.
+ *
+ * Two things are written, deliberately:
+ *   - a `checklist` CHANNEL message, always. Internal, excluded from his thread
+ *     and from SSE, so it costs him nothing and gives an agent a durable, `since`
+ *     -pollable record of exactly what changed.
+ *   - a PENDING task in the conversation, which is the only construct that
+ *     actually wakes that conversation's coordinator. Terse and worth reading:
+ *     what he ticked, and what is left.
+ *
+ * It never pushes and never speaks. He performed this action himself, seconds
+ * ago, with his own thumb — notifying him of it would be pure noise, and the
+ * push budget is spent on things he does not already know.
+ * ---------------------------------------------------------------------------
+ */
+const CHECK_SETTLE_MS = Number(process.env.CHECK_SETTLE_MS || 20000);
+const CHECK_CHANNEL = 'checklist';
+/** conversationId -> { timer, changes: Map<string, {label, on, by, entryId}> } */
+const checkNotices = new Map();
+
+/** One line of a summary, flattened so a label can never become markup itself. */
+function safeLabel(s) {
+  return String(s || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^[\s>#*+-]+/, '')   // cannot open a list, heading or quote
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || '(untitled item)';
+}
+
+function noticeText(conversationId, changes) {
+  const on = changes.filter((c) => c.on);
+  const off = changes.filter((c) => !c.on);
+  const lines = [];
+  if (on.length) lines.push(`Ticked off: ${on.map((c) => safeLabel(c.label)).join('; ')}`);
+  if (off.length) lines.push(`Un-ticked: ${off.map((c) => safeLabel(c.label)).join('; ')}`);
+  // Where each touched list now stands, so the agent does not have to go and ask.
+  const seen = new Set(changes.map((c) => c.entryId));
+  for (const entryId of seen) {
+    const cl = checklistOf(entryId);
+    if (!cl) continue;
+    const left = cl.items.filter((i) => !i.checked).map((i) => safeLabel(i.label));
+    lines.push(`List ${entryId}: ${cl.done}/${cl.total} done` +
+      (left.length ? `, still open: ${left.slice(0, 12).join('; ')}${left.length > 12 ? ` (+${left.length - 12} more)` : ''}` : ', all done'));
+  }
+  return lines.join('\n').slice(0, MAX_TEXT);
+}
+
+function flushCheckNotice(conversationId) {
+  const rec = checkNotices.get(conversationId);
+  if (!rec) return;
+  checkNotices.delete(conversationId);
+  if (rec.timer) clearTimeout(rec.timer);
+  const changes = [...rec.changes.values()];
+  if (!changes.length) return;
+  const body = noticeText(conversationId, changes);
+  const ts = nowIso();
+
+  // 1. The durable, thread-free record. An agent polls
+  //    /messages?channel=checklist&since=… and sees every change with no noise.
+  appendEvent({
+    t: 'create',
+    task: {
+      id: newId(),
+      role: 'agent',
+      instruction: body,
+      from: 'checklist',
+      author: 'checklist',
+      ts,
+      status: 'done',
+      claimedBy: null, claimedAt: null, result: null, resultTs: null,
+      relayed: true, relayedAt: ts,
+      visibility: 'internal',
+      channel: CHECK_CHANNEL,
+      conversationId: `#${CHECK_CHANNEL}`,
+      // Kept so a channel reader can tell which real conversation this came from.
+      about: conversationId,
+    },
+  });
+
+  // 2. The wake-up. Only a pending task in the conversation rouses its
+  //    coordinator, so this is the half that makes "Claude notices" true.
+  if (conversations.has(conversationId)) {
+    const ts2 = nowIso();
+    appendEvent({
+      t: 'create',
+      task: {
+        id: newId(),
+        role: DEFAULT_ROLE, // he did this; it is his action, not an agent's
+        conversationId,
+        instruction: body,
+        from: 'checklist',
+        ts: ts2,
+        status: 'pending',
+        claimedBy: null, claimedAt: null, result: null, resultTs: null,
+        relayed: false, relayedAt: null,
+      },
+    });
+    // Deliberately no notify(): see the comment above. He just did this.
+  }
+}
+
+/** Record one tick for the batch, and (re)arm the settle timer. */
+function queueCheckNotice(conversationId, entryId, index, label, on) {
+  let rec = checkNotices.get(conversationId);
+  if (!rec) { rec = { timer: null, changes: new Map() }; checkNotices.set(conversationId, rec); }
+  // Keyed by item: ticking and un-ticking the same box before it settles is one
+  // net change, and settles to whatever it ended up as — usually nothing at all.
+  rec.changes.set(`${entryId}#${index}`, { entryId, index, label, on });
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => flushCheckNotice(conversationId), CHECK_SETTLE_MS);
+  if (rec.timer.unref) rec.timer.unref(); // never hold the process open for this
+}
 
 function threadEntries(conversationId) {
   const out = [];
@@ -585,9 +1085,112 @@ function agentLiveness(c) {
   return { ...base, state: 'idle' };
 }
 
+/*
+ * THE LIFECYCLE VALUE — one field, and the only one a badge should switch on.
+ *
+ * Liveness (is it there?) and stopping (has it been asked to go?) are two
+ * independent axes, and both are kept in the payload. But a UI needs a single
+ * value to render, and if each client recombines the axes itself they will
+ * disagree — so the combination is made here, once.
+ *
+ * The precedence exists to keep five things that are genuinely different from
+ * ever rendering the same:
+ *
+ *   unassigned      no agent has ever been assigned. Nothing to stop.
+ *   never           assigned, but has not acted or checked in even once.
+ *   idle/watching   assigned, acted recently, nothing waiting or being handled.
+ *   stale/silent/stuck  assigned, work is waiting, nothing is happening.
+ *   stop-requested  asked to stop, HAS NOT ANSWERED. Still running, as far as
+ *                   anyone here knows. This is the state people will misread as
+ *                   "done", so it carries the loudest wording in the payload.
+ *   stopping        it answered, and is winding down.
+ *   stopped         it said it was finished and stood itself down. The ONLY
+ *                   state that means the agent is actually gone.
+ *
+ * `stopped` outranks `unassigned` deliberately: a stopped agent unassigns itself
+ * as its last act, so without this a clean shutdown would be indistinguishable
+ * from a conversation that never had an agent at all.
+ */
+function stopStateOf(c) {
+  const requestedAgoSec = secSince(c.stopRequestedAt);
+  const ackAgoSec = secSince(c.stopAckAt);
+  const phase = c.stopAck === 'stopped' ? 'stopped'
+    : c.stopAck === 'stopping' ? 'stopping'
+      : c.stopRequested ? 'requested' : null;
+
+  // Did the agent do any real queue work AFTER being asked? Proof it is alive
+  // and has not read the note — the difference between "winding down" and
+  // "carrying on regardless", which no timeout could tell you.
+  const actedSince = c.stopRequestedAt && c.lastActedAt
+    ? msOf(c.lastActedAt) > msOf(c.stopRequestedAt) : false;
+
+  return {
+    phase,
+    requested: !!c.stopRequested,
+    requestedAt: c.stopRequestedAt || null,
+    requestedAgoSec,
+    requestedBy: c.stopRequestedBy || null,
+    ack: c.stopAck || null,
+    ackAt: c.stopAckAt || null,
+    ackAgoSec,
+    stoppedAt: c.stoppedAt || null,
+    note: c.stopNote || null,
+    worktrees: c.worktrees || null,
+    worktreesAreSelfReported: true,
+    actedSinceRequest: actedSince,
+    /*
+     * Nobody is listening. A stop request on a conversation with no agent is a
+     * note pinned to a door with no room behind it — it will sit `requested`
+     * forever, and that must not be mistaken for "any moment now".
+     */
+    willNeverBeSeen: !!c.stopRequested && !c.agent && !c.stopAck,
+    // Asked a while ago, still nothing back. Not necessarily broken — an agent
+    // is only able to notice at the start of a turn — but worth showing plainly.
+    unacknowledgedForSec: c.stopRequested && !c.stopAck ? requestedAgoSec : null,
+  };
+}
+
+function agentLifecycle(c) {
+  const live = agentLiveness(c);
+  const stop = stopStateOf(c);
+  const lifecycle = stop.phase === 'stopped' ? 'stopped'
+    : stop.phase === 'stopping' ? 'stopping'
+      : stop.phase === 'requested' ? 'stop-requested'
+        : live.state;
+  return {
+    ...live,
+    lifecycle,
+    stop,
+    /*
+     * Carried on every row, not just on the ones being stopped, because the UI
+     * has to be able to explain the limit at the moment he reaches for the
+     * control — not after he has already assumed it worked.
+     */
+    forceKill: FORCE_KILL_NOTE,
+  };
+}
+
 /** Summaries plus live agent state — what the conversation list actually renders. */
 const conversationsWithLiveness = () =>
-  conversationSummaries().map((c) => ({ ...c, agentState: agentLiveness(c) }));
+  conversationSummaries().map((c) => ({
+    ...c,
+    agentState: agentLifecycle(c),
+    // Compact enough to ride along on the list; the full feed has its own route.
+    activity: activitySummary(c.id),
+  }));
+
+/** Just the counters, for the conversation list. The entries are the big part. */
+function activitySummary(id) {
+  const a = activityOf(id);
+  return {
+    running: a.running,
+    subagents: a.subagents.length,
+    toolCalls: a.toolCalls,
+    lastAt: a.lastAt,
+    reporting: a.reporting,
+    count: a.count,
+  };
+}
 
 // ---------------------------------------------------------------- live stream
 /*
@@ -1425,6 +2028,40 @@ function probeEngine(name, host, port) {
   });
 }
 
+/*
+ * Every conversation that has, or recently had, an agent — plus the ones that
+ * were asked to stop and never answered, which are the whole reason this exists.
+ * A conversation nobody was ever assigned to is left out; it is not a
+ * coordinator and would only pad the list.
+ */
+function coordinatorRoster() {
+  const rows = [];
+  for (const c of conversationsWithLiveness()) {
+    if (!c.agent && !c.stopRequested && !c.stopAck) continue;
+    rows.push({
+      id: c.id,
+      title: c.title,
+      agent: c.agent,
+      archived: c.archived,
+      lifecycle: c.agentState.lifecycle,
+      lastActedAt: c.lastActedAt,
+      actedAgoSec: c.agentState.actedAgoSec,
+      stop: c.agentState.stop,
+      activity: c.activity,
+    });
+  }
+  // Anything mid-stop first: those are the rows a human is waiting on.
+  const rank = (r) => (r.lifecycle === 'stop-requested' ? 0 : r.lifecycle === 'stopping' ? 1 : 2);
+  rows.sort((a, b) => rank(a) - rank(b) || msOf(b.lastActedAt) - msOf(a.lastActedAt));
+  return {
+    count: rows.length,
+    awaitingStop: rows.filter((r) => r.lifecycle === 'stop-requested' || r.lifecycle === 'stopping').length,
+    // Archived, agent never confirmed stopped: invisible in the UI, possibly alive.
+    ghosts: rows.filter((r) => r.archived && r.agent && r.stop.ack !== 'stopped').length,
+    rows,
+  };
+}
+
 async function statusRoute(req, res, q) {
   const c = counts();
   const derived = derivedStatus();
@@ -1463,6 +2100,17 @@ async function statusRoute(req, res, q) {
         : null,
     },
     recent: derived.recent,
+    /*
+     * The coordinator roster. Here as well as on /conversations so a status page
+     * can render the whole lifecycle — including who has been asked to stop and
+     * has not answered — without a second request per conversation.
+     *
+     * Archived conversations are INCLUDED, unlike the conversation list, and
+     * that is the point: an archived row with a running agent is exactly the
+     * ghost worth showing, and hiding it here would hide the only evidence left.
+     */
+    coordinators: coordinatorRoster(),
+    forceKill: FORCE_KILL_NOTE,
   };
   // Probing costs a socket to each engine, so it is opt-out for callers that
   // only want the cheap half.
@@ -1885,12 +2533,57 @@ function pushConfigRoute(res, body) {
  * Categorisation. Pure and exported, because this is the rule that must never
  * regress: agent-to-agent traffic on `channel` carries visibility:'internal'
  * and must not reach his phone under any category, any hint, or any config.
+ *
+ * WHY PUSHING IS OPT-IN
+ * --------------------
+ * This function used to end `if (kind === 'result' || kind === 'message')
+ * return 'done'`, so every agent result and every agent message posted into one
+ * of his conversations buzzed his phone by default. On 2026-08-08 that
+ * delivered 17 pushes in one hour — 16 of them saying nothing more than "done"
+ * — while he was abroad. Nothing was suppressed (suppressedBudget was 0); the
+ * ceiling never even came near being hit. He had reined in the room speaker for
+ * exactly this a day earlier, and the phone is a channel he cannot walk away
+ * from. The lesson is that a default of "notify" turns ordinary agent chatter
+ * into a pager, and agents chatter constantly.
+ *
+ * His bar, made mechanical here rather than left to agent politeness. He wants
+ * to hear about: (1) things that need him, (2) things he was waiting on that
+ * finished, (3) things that are broken. NOT progress, NOT status, NOT
+ * acknowledgements. So:
+ *
+ *   message  -> null. Agent chatter never buzzes him. An agent that genuinely
+ *               needs to reach him says so, by passing notify:"done" |
+ *               "needs-you" | "broken". Saying nothing wakes nobody.
+ *   result   -> 'done' ONLY when it answers a task HE HIMSELF posted, i.e.
+ *               role:'user' AND `from` is one of his page origins. That is
+ *               precisely "something he was waiting on that finished", so it
+ *               stays. A result on an agent-posted task is one agent answering
+ *               another and is silent — that is the bulk of the 16.
+ *   task     -> unchanged: an agent asking him something is "needs you"; a task
+ *               he typed himself never buzzes the phone that sent it.
+ *
+ * An explicit `notify` hint still wins over all of it (that is the opt-in), and
+ * notify:"none" still silences everything, including rule zero's own categories.
+ * If you are about to widen a default here: don't. Add a hint at the caller.
+ *
+ * The hazard that survives all of the above is PAGE_ORIGINS, which the `task`
+ * branch consults. It is an allowlist whose default is "notify", so any new UI
+ * action that posts from an origin nobody remembered to add will buzz the very
+ * phone that sent it. That is not hypothetical: `checklist` was missing, and
+ * his own tick paged him. Read the comment on PAGE_ORIGINS before you add a
+ * posting surface — the wrong rule was never written, it was merely omitted.
  */
 function classify(kind, task, hint) {
   if (!task || isInternal(task)) return null; // rule zero, before anything else
   if (hint === 'none') return null;
   if (hint && NOTIFY_VALUES.has(hint)) return hint;
-  if (kind === 'result' || kind === 'message') return 'done';
+  // Opt-in: an agent speaking without asking to be heard is not an event.
+  if (kind === 'message') return null;
+  if (kind === 'result') {
+    // Only an answer to something he posted from the page counts as "the thing
+    // I was waiting on finished". Anything else is agent-to-agent bookkeeping.
+    return task.role === 'user' && PAGE_ORIGINS.has(task.from) ? 'done' : null;
+  }
   if (kind === 'task') {
     // He typed it himself. Never buzz the phone that just sent the message.
     if (PAGE_ORIGINS.has(task.from)) return null;
@@ -2056,6 +2749,13 @@ async function sendToAll(payload, category) {
 /*
  * POST /push/test — let him prove it works with his thumb, before he needs it.
  *
+ * SELF-TEST ONLY. Nothing routine may call this. It bypasses BOTH the debounce
+ * and quiet hours by design, it ignores the hourly budget, and it cannot carry
+ * custom text — so it is not a notification channel, it is a wiring check, and
+ * an agent reaching for it to "just let him know" would buzz his handset at
+ * 3am with the word "Test". Use POST /messages with an explicit `notify` hint
+ * instead; that path respects the debounce, the budget and quiet hours.
+ *
  * A deliberate action, so it skips the debounce and is not silenced by quiet
  * hours; it says which it did. It reports per-device HTTP status rather than a
  * bare ok, because the entire value of this endpoint is telling him *which*
@@ -2208,6 +2908,373 @@ function sendIcon(res, name) {
   res.end(buf);
 }
 
+// ---------------------------------------------------------------- images
+/*
+ * THE GALLERY. Agents make pictures; he is on a phone in another country and
+ * could not see a single one. In one night 198 sprites were generated across
+ * six subjects and none of them reached him, because every file sat in a temp
+ * directory on a desktop he was thousands of miles from. The generation worked.
+ * The *showing* did not exist. This is the showing.
+ *
+ * CONTENT-ADDRESSED, AND THAT IS THE SECURITY DESIGN RATHER THAN AN OPTIMISATION.
+ *
+ * This server has no authentication and answers anything that can reach the
+ * port. The obvious API — "here is a path on disk, serve me that" — is a
+ * file-disclosure hole: every device on his network could read every file on
+ * his desktop, and the request would look exactly like a legitimate one. So no
+ * client-supplied path is ever joined to a filesystem path. An agent POSTs the
+ * BYTES; this process hashes them, names the file after its own hash, and
+ * serves it back by that hash. Traversal is not filtered here, it is
+ * UNREPRESENTABLE — the only characters that can occur in one of these
+ * filenames are 64 hex digits that this process computed itself.
+ *
+ * The type is SNIFFED FROM THE BYTES and the client's `content-type` is
+ * ignored, for the same reason: a caller must not be able to talk this server
+ * into labelling an arbitrary blob as something a browser will treat as script.
+ * Combined with `x-content-type-options: nosniff` on the way out, the type a
+ * browser sees is one of four values this file chose.
+ *
+ * TWO MAPS FROM ONE EVENT, because a blob and a *posting* of a blob are
+ * different things. The same contact sheet posted into two conversations is one
+ * file on disk and two rows in the gallery. Keying the gallery by content hash
+ * instead would silently drop the second post — the image would appear in
+ * whichever conversation happened to get there first, and be missing from the
+ * one he was actually looking at.
+ */
+const IMAGE_DIR = path.join(DATA_DIR, 'images');
+// A contact sheet of several dozen candidates is the dominant artefact here and
+// is far bigger than a message. Deliberately its own limit rather than MAX_BODY,
+// which stays 1 MiB for JSON: a route that accepts megabytes of arbitrary bytes
+// should say so in one obvious place.
+const MAX_IMAGE = Number(process.env.MAX_IMAGE || 8 * 1024 * 1024);
+// What this process itself produces from crypto.createHash('sha256'). Anything
+// that fails this never becomes a filename.
+const IMAGE_ID_RE = /^[a-f0-9]{64}$/;
+const MAX_ALT = 300;
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+/** @type {Map<string, object>} sha256 -> { type, bytes, width, height } */
+const blobs = new Map();
+/** @type {Map<string, object>} post id -> image record (insertion order == post order) */
+const images = new Map();
+
+/*
+ * WHAT THESE BYTES ACTUALLY ARE, decided by looking at them.
+ *
+ * Dimensions are read out of the header too, and they are not decoration: the
+ * page reserves the right box before the bytes arrive, so a thread full of
+ * images does not shudder as each one loads. Every format here puts its size in
+ * the first few bytes, so this needs no decoder and no dependency — which is
+ * the only reason it is worth doing at all.
+ *
+ * `width`/`height` are null rather than guessed when the header is truncated or
+ * unusual. A missing dimension makes the page fall back to a flexible box; a
+ * WRONG one would lay the thread out around a lie.
+ */
+function sniffImage(buf) {
+  if (!buf || buf.length < 12) return null;
+  const tag = (a, b) => buf.toString('latin1', a, b);
+
+  // PNG: the 8-byte signature, then IHDR carrying width and height as BE u32.
+  if (buf.length >= 24 && tag(0, 8) === '\x89PNG\r\n\x1a\n') {
+    if (tag(12, 16) === 'IHDR') {
+      return { type: 'image/png', width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    return { type: 'image/png', width: null, height: null };
+  }
+
+  // GIF: 'GIF87a'/'GIF89a', then the logical screen size as LE u16.
+  if (tag(0, 6) === 'GIF87a' || tag(0, 6) === 'GIF89a') {
+    return { type: 'image/gif', width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+  }
+
+  // WebP: a RIFF container whose form type is WEBP. Three sub-formats, each
+  // storing the size differently, and the extended one (VP8X) is what anything
+  // with animation or alpha uses.
+  if (tag(0, 4) === 'RIFF' && buf.length >= 16 && tag(8, 12) === 'WEBP') {
+    const form = tag(12, 16);
+    if (form === 'VP8 ' && buf.length >= 30) {
+      return { type: 'image/webp', width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+    }
+    if (form === 'VP8L' && buf.length >= 25) {
+      const bits = buf.readUInt32LE(21);
+      return { type: 'image/webp', width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+    if (form === 'VP8X' && buf.length >= 30) {
+      return {
+        type: 'image/webp',
+        width: 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)),
+        height: 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16)),
+      };
+    }
+    return { type: 'image/webp', width: null, height: null };
+  }
+
+  // JPEG: walk the marker segments to the start-of-frame, which is the only
+  // place the size is recorded. EXIF thumbnails and comment blocks sit in front
+  // of it, so this cannot be read at a fixed offset.
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    let i = 2;
+    while (i + 9 < buf.length) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      // Padding, and the standalone markers that carry no length field.
+      if (marker === 0xff) { i++; continue; }
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      const len = buf.readUInt16BE(i + 2);
+      if (len < 2) break; // malformed: stop rather than loop forever
+      // SOF0-SOF15, excluding the three that share the range but are not frames.
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { type: 'image/jpeg', height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+      }
+      i += 2 + len;
+    }
+    return { type: 'image/jpeg', width: null, height: null };
+  }
+
+  return null;
+}
+
+/*
+ * Reading the upload, with a refusal the caller can actually READ.
+ *
+ * Deliberately not `readRawBody`, and the difference is the whole reason this
+ * exists: that one calls `req.destroy()` the instant the cap is passed, which
+ * resets the connection before the 413 can be written. The caller sees "fetch
+ * failed" — a message that says nothing about a limit and sends them looking
+ * for a network fault. For an agent pushing a contact sheet that is over the
+ * cap, "too large, here is the number" is the entire difference between one
+ * more try and an hour of confusion. `readRawBody` is left exactly as it is,
+ * because /stt depends on its behaviour.
+ */
+function readImageBody(req, max) {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > max) {
+      // Answered before a byte is read. Nothing has been consumed, so the
+      // response is certain to be deliverable.
+      reject(httpErr(413, `image too large: ${declared} bytes, max ${max}`));
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) {
+        // Stop keeping it, but let the request finish so the answer can be
+        // sent. Only a caller that ignores the limit outright gets cut off.
+        over = true;
+        chunks.length = 0;
+        if (size > max * 4) req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('error', () => reject(httpErr(400, 'request stream error')));
+    req.on('end', () => {
+      if (over) return reject(httpErr(413, `image too large: more than ${max} bytes`));
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
+/** The public shape. `url` is derived, never stored, so it cannot go stale. */
+const imageView = (im) => ({ ...im, url: `/images/${im.blob}` });
+
+function imagePath(blob) {
+  return path.join(IMAGE_DIR, blob);
+}
+
+/*
+ * POST /images — the bytes themselves, with the metadata in the query string.
+ *
+ *   curl --data-binary @sheet.png 'http://127.0.0.1:3901/images?conversationId=main&alt=crates'
+ *
+ * Raw rather than JSON base64 on purpose: base64 inflates by a third against a
+ * cap that a contact sheet is already testing, and `--data-binary @file` is one
+ * flag. The metadata rides in the query string because the body is not JSON and
+ * cannot carry it.
+ */
+async function imageUploadRoute(req, res, q) {
+  let buf;
+  try {
+    buf = await readImageBody(req, MAX_IMAGE);
+  } catch (err) {
+    return fail(res, err.code || 400, err.message || 'could not read the request body', {
+      maxBytes: MAX_IMAGE,
+    });
+  }
+  if (!buf.length) {
+    return fail(res, 400, 'empty body: POST the image bytes themselves, e.g. curl --data-binary @file.png');
+  }
+
+  const kind = sniffImage(buf);
+  if (!kind) {
+    return fail(res, 415, 'these bytes are not an image format this server recognises', {
+      supported: IMAGE_TYPES,
+      // Said explicitly because a caller who set content-type correctly and was
+      // still refused will otherwise assume the header was the problem.
+      note: 'the format is read from the bytes; the content-type header is ignored',
+      firstBytesHex: buf.slice(0, 8).toString('hex'),
+    });
+  }
+
+  const alt = readString(q.get('alt'), 'alt', MAX_ALT);
+  if (alt instanceof Error) return fail(res, 400, alt.message);
+  const agent = readString(q.get('agent'), 'agent', MAX_AUTHOR);
+  if (agent instanceof Error) return fail(res, 400, agent.message);
+
+  const convRaw = q.get('conversationId') || q.get('conversation');
+  const conversationId = convRaw || DEFAULT_CONV;
+  if (!conversations.has(conversationId)) {
+    return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
+  }
+
+  const blob = crypto.createHash('sha256').update(buf).digest('hex');
+
+  /*
+   * Write the bytes BEFORE logging the event, so the log never describes a file
+   * that is not there. The reverse order would survive a crash as a permanent
+   * broken image in his thread with no way to tell it from a bug.
+   */
+  try {
+    fs.mkdirSync(IMAGE_DIR, { recursive: true });
+    // Identical content is identical bytes, so a re-post is a no-op rather than
+    // a rewrite — and a rewrite of a file a request may be streaming is exactly
+    // the kind of race worth not having.
+    if (!fs.existsSync(imagePath(blob))) {
+      const tmp = imagePath(blob) + '.part';
+      fs.writeFileSync(tmp, buf);
+      fs.renameSync(tmp, imagePath(blob)); // atomic within the directory
+    }
+  } catch (err) {
+    return fail(res, 500, `could not store the image: ${err.message}`, { dir: IMAGE_DIR });
+  }
+
+  const image = {
+    id: newId(),
+    blob,
+    type: kind.type,
+    bytes: buf.length,
+    width: kind.width === undefined ? null : kind.width,
+    height: kind.height === undefined ? null : kind.height,
+    alt,
+    agent,
+    conversationId,
+    ts: nowIso(),
+  };
+  appendEvent({ t: 'image', image });
+  send(res, 201, {
+    ok: true,
+    image: imageView(image),
+    // Same bytes as something already here. Worth saying: an agent looping over
+    // a directory of near-identical renders wants to know two of them matched.
+    deduplicated: blobs.get(blob) ? blobs.get(blob).posts > 1 : false,
+    markdown: `![${(alt || 'image').replace(/[[\]]/g, '')}](/images/${blob})`,
+  });
+}
+
+/*
+ * GET /images/:blob — the bytes.
+ *
+ * Immutable caching is honest here in a way it almost never is: the name IS the
+ * hash of the content, so this URL cannot ever mean different bytes. That is
+ * what makes a phone on hotel wifi bearable.
+ */
+function imageBytesRoute(req, res, blob) {
+  if (!IMAGE_ID_RE.test(blob)) {
+    return fail(res, 404, 'not an image id', {
+      // The shape is named rather than the mistake, because the most likely
+      // caller here is someone who put a filename or a path in the URL.
+      expected: 'the 64-character sha256 this server returned from POST /images',
+    });
+  }
+  const meta = blobs.get(blob);
+  if (!meta) return fail(res, 404, `no image with id "${blob}"`);
+
+  let buf;
+  try {
+    buf = fs.readFileSync(imagePath(blob));
+  } catch (err) {
+    /*
+     * The log remembers the image and the bytes are gone — a DATA_DIR restored
+     * without its images directory, or a manual tidy-up. Say precisely that.
+     * Serving a placeholder, or a 200 with nothing in it, would leave him
+     * looking at a broken square with no way to tell it from a bug in the page.
+     */
+    return fail(res, 410, 'this image is in the log but its bytes are no longer on disk', {
+      id: blob, expectedAt: imagePath(blob), reason: err.code || 'unreadable',
+    });
+  }
+
+  res.writeHead(200, {
+    'content-type': meta.type,
+    'content-length': buf.length,
+    'cache-control': 'public, max-age=31536000, immutable',
+    'x-content-type-options': 'nosniff',
+    // Belt and braces on a route that returns caller-supplied bytes: even if
+    // the sniffer were ever fooled, nothing here may act as a document.
+    'content-disposition': 'inline',
+    'content-security-policy': "default-src 'none'; sandbox",
+  });
+  if (req.method === 'HEAD') return res.end();
+  res.end(buf);
+}
+
+/** GET /images — the gallery listing, newest first. */
+function imageListRoute(res, q) {
+  const conversationId = q.get('conversationId') || q.get('conversation');
+  let list = [...images.values()];
+  if (conversationId) list = list.filter((im) => im.conversationId === conversationId);
+  list.sort((a, b) => msOf(b.ts) - msOf(a.ts));
+  const limit = Math.max(1, Math.min(Number(q.get('limit')) || 200, 500));
+  const page = list.slice(0, limit);
+  send(res, 200, {
+    count: page.length,
+    total: list.length,
+    conversationId: conversationId || null,
+    images: page.map(imageView),
+  });
+}
+
+/*
+ * Images attached to a message, as opposed to written into its text.
+ *
+ * Both work and they are for different things: markdown `![](/images/<id>)`
+ * puts a picture at a chosen point in a sentence, while this hangs a strip of
+ * them under the message, which is what "here are the twelve crates" wants.
+ *
+ * Validated against what has actually been uploaded, not merely shape-checked.
+ * An id that names nothing would render as a broken square in his thread, and a
+ * broken square is indistinguishable from a bug in the page — so it is refused
+ * at the point where the caller can still fix it.
+ */
+const MAX_ATTACH = 24;
+
+function readImages(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) return new Error('images must be an array of image ids');
+  if (raw.length > MAX_ATTACH) {
+    return new Error(`too many images: ${raw.length}, max ${MAX_ATTACH} on one message`);
+  }
+  const out = [];
+  for (const v of raw) {
+    if (typeof v !== 'string') return new Error('every entry in images must be a string id');
+    // A caller who pastes back the `url` this server handed them is doing the
+    // obvious thing, so accept it rather than making them slice the prefix off.
+    const id = v.trim().replace(/^\/?images\//, '');
+    if (!IMAGE_ID_RE.test(id)) {
+      return new Error(`"${v}" is not an image id: expected the 64-character sha256 returned by POST /images`);
+    }
+    if (!blobs.has(id)) {
+      return new Error(`no image with id "${id}" — upload the bytes first with POST /images`);
+    }
+    if (out.indexOf(id) < 0) out.push(id); // the same picture twice is a typo, not a layout
+  }
+  return out.length ? out : null;
+}
+
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
   // `text` is the UI's field name and an alias for `instruction`; both are accepted.
@@ -2226,6 +3293,8 @@ function createTask(res, body) {
   if (!conversations.has(conversationId)) {
     return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
   }
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
   const task = {
     id: newId(),
     role: DEFAULT_ROLE, // server-set, never taken from the client
@@ -2241,9 +3310,52 @@ function createTask(res, body) {
     relayed: false,
     relayedAt: null,
   };
+  if (imgs) task.images = imgs; // a reference picture sent TO an agent
   appendEvent({ t: 'create', task });
   notify('task', task, readNotifyHint(body));
   send(res, 201, task);
+}
+
+/*
+ * POST /tasks/:entryId/checks — one checkbox changed.
+ *
+ * Idempotent by value: sending `on: true` twice is one state, not two events,
+ * and the second is a no-op that still answers 200 with the current list. That
+ * matters because the page retries this call after being offline, and a retry
+ * must never be able to double-toggle a box he only touched once.
+ */
+function setCheckRoute(res, entryId, body) {
+  const cl = checklistOf(entryId);
+  if (!cl) {
+    return fail(res, 404, `no checklist on entry "${entryId}"`, {
+      hint: 'the entry must exist and its text must contain at least one "- [ ]" line',
+    });
+  }
+  const index = Number(body.index);
+  if (!Number.isInteger(index) || index < 0 || index >= cl.total) {
+    return fail(res, 400, `index must be an integer 0..${cl.total - 1}`, { total: cl.total });
+  }
+  if (typeof body.on !== 'boolean') return fail(res, 400, 'on is required and must be true or false');
+  const by = readString(body.by !== undefined ? body.by : body.who, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  const before = cl.items[index];
+  if (before.checked === body.on && before.source === 'checked') {
+    // Already exactly this, and already recorded. Nothing to log, nothing to
+    // tell an agent — but the caller still gets the truth back.
+    return send(res, 200, { changed: false, checklist: checklistOf(entryId) });
+  }
+
+  appendEvent({
+    t: 'check',
+    entryId: String(entryId),
+    index,
+    on: body.on,
+    by: by || 'web',
+    at: nowIso(),
+  });
+  queueCheckNotice(cl.conversationId, String(entryId), index, before.label, body.on);
+  return send(res, 200, { changed: true, checklist: checklistOf(entryId) });
 }
 
 /** Is this claim old enough that another agent may take it? See CLAIM_LEASE_MS. */
@@ -2296,6 +3408,8 @@ function createMessage(res, body) {
   if (author instanceof Error) return fail(res, 400, author.message);
   const to = readString(body.to, 'to', MAX_AUTHOR);
   if (to instanceof Error) return fail(res, 400, to.message);
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
 
   const channelRaw = readString(body.channel, 'channel', MAX_CHANNEL);
   if (channelRaw instanceof Error) return fail(res, 400, channelRaw.message);
@@ -2318,6 +3432,7 @@ function createMessage(res, body) {
     relayedAt: ts,
   };
   if (to) task.to = to;
+  if (imgs) task.images = imgs;
 
   if (internal) {
     const channel = channelRaw === null ? DEFAULT_CHANNEL : channelRaw;
@@ -2427,8 +3542,19 @@ function resultTask(res, id, body) {
   if (body.result === null) {
     return fail(res, 400, 'result is null: a null answer is not an answer. Send the text the human should read.');
   }
+  /*
+   * Pictures attached to the ANSWER, which is the path that actually matters:
+   * an agent asked for twelve crates claims the task, renders them, and hands
+   * them back here. Kept under `resultImages` rather than `images` so a task
+   * that was SENT with a reference picture and ANSWERED with renders does not
+   * have one overwrite the other — they are two different sets on one record.
+   */
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
   // A result may be posted straight to a pending task; no claim required.
-  appendEvent({ t: 'patch', id, patch: { status: 'done', result: body.result, resultTs: nowIso() } });
+  const patch = { status: 'done', result: body.result, resultTs: nowIso() };
+  if (imgs) patch.resultImages = imgs;
+  appendEvent({ t: 'patch', id, patch });
   notify('result', task, readNotifyHint(body));
   send(res, 200, task);
 }
@@ -2492,11 +3618,371 @@ function updateConversation(res, id, body) {
     }
     patch.archived = body.archived;
     patch.archivedAt = body.archived ? nowIso() : null;
+    /*
+     * Archiving says nothing whatsoever about the agent, and must not be allowed
+     * to imply otherwise. It files the conversation away; the agent carries on.
+     * If you want it to wind down you have to ask, separately and explicitly,
+     * with `stopRequested` — and even then see below about what that buys you.
+     */
   }
 
-  if (!Object.keys(patch).length) return fail(res, 400, 'nothing to update (title, agent or archived)');
+  if (body.stopRequested !== undefined) {
+    if (typeof body.stopRequested !== 'boolean') {
+      return fail(res, 400, 'stopRequested must be true or false');
+    }
+    if (body.stopRequested) {
+      patch.stopRequested = true;
+      patch.stopRequestedAt = nowIso();
+      patch.stopRequestedBy = typeof body.stopRequestedBy === 'string' && body.stopRequestedBy.trim()
+        ? body.stopRequestedBy.trim().slice(0, MAX_AGENT)
+        : 'human';
+      // A fresh request clears any previous acknowledgement: an agent that
+      // stopped, was reassigned, and is now being asked again must not still be
+      // wearing the last round's "stopped" badge.
+      patch.stopAck = null;
+      patch.stopAckAt = null;
+      patch.stoppedAt = null;
+    } else {
+      // Withdrawing the request. The agent may already have acted on it — there
+      // is no recall — so this only clears the ask, never the acknowledgement.
+      patch.stopRequested = false;
+      patch.stopRequestedAt = null;
+      patch.stopRequestedBy = null;
+    }
+  }
+
+  if (!Object.keys(patch).length) {
+    return fail(res, 400, 'nothing to update (title, agent, archived or stopRequested)');
+  }
   appendEvent({ t: 'convpatch', id, patch });
+  /*
+   * Answer with the honest truth about what just happened, so no client can
+   * render this as a kill by accident. Asking is not stopping, and the reply
+   * says so in words a UI can put straight on the screen.
+   */
+  if (patch.stopRequested === true) {
+    return send(res, 200, { ...conv, stopRequestEffect: stopRequestEffect(conv) });
+  }
+  /*
+   * Filing away a conversation whose agent never stood down leaves a process
+   * running that nothing on screen can see any more. That is a legitimate
+   * choice — sometimes you just want the row gone — but it has to be a CHOSEN
+   * one, so the reply always names the cost. Silence here is how a ghost gets
+   * made by accident.
+   */
+  if (patch.archived === true) {
+    return send(res, 200, { ...conv, ghost: ghostWarning(conv) });
+  }
   send(res, 200, conv);
+}
+
+/** null when there is genuinely nothing left running; otherwise, the bad news. */
+function ghostWarning(conv) {
+  if (!conv.agent || conv.stopAck === 'stopped') return null;
+  return {
+    agentStillAssigned: conv.agent,
+    stopped: false,
+    summary: `Archived, but "${conv.agent}" was never confirmed stopped.`,
+    detail: 'Archiving hides the conversation. It does not stop the agent, which may still '
+      + 'be running, still holding git worktrees, and still able to post here — where you '
+      + 'will no longer see it. Ask it to stop first if you want it wound down.',
+    forceKill: FORCE_KILL_NOTE,
+  };
+}
+
+/*
+ * The paragraph the UI should show after asking a coordinator to stop. It lives
+ * here rather than in the page because every client must say the same thing,
+ * and because the one sentence that must never be dropped in a redesign is the
+ * last one.
+ */
+function stopRequestEffect(conv) {
+  const live = conv.agent
+    ? `"${conv.agent}" will see this the next time something wakes it.`
+    : 'No agent is assigned to this conversation, so nothing will read it.';
+  return {
+    requested: true,
+    stopped: false,
+    agent: conv.agent || null,
+    summary: `Asked to stop. ${live}`,
+    detail: 'This is a request, not a kill. The queue cannot start, signal or stop an '
+      + 'agent: it can only leave a note that the agent reads the next time it wakes on '
+      + 'its own. Until it acknowledges, assume it is still running and still holding any '
+      + 'git worktrees it checked out.',
+    forceKill: FORCE_KILL_NOTE,
+  };
+}
+
+/*
+ * Said in exactly one place so it cannot drift between the API and the page.
+ * A UI that shows a stop control MUST be able to tell him where the real kill
+ * switch is, because it is not here and never will be.
+ */
+const FORCE_KILL_NOTE = {
+  availableHere: false,
+  where: 'top-level Claude session',
+  how: 'Only the top-level Claude session that spawned the agent can actually terminate '
+    + 'it (TaskStop, or ending the session). Nothing in relay-queue — archiving, deleting, '
+    + 'or unassigning — will stop a running agent.',
+};
+
+/*
+ * POST /conversations/:id/stop-ack — the agent answering the note on the door.
+ *
+ * Two phases, and both matter. `stopping` means "I have seen it and I am winding
+ * down": claims released, worktrees being handed back. `stopped` means the agent
+ * is done, and is the ONLY thing in this system entitled to say so. It unassigns
+ * itself as its last act, because an `agent` still set on a stopped conversation
+ * is the ghost all over again.
+ *
+ * This is a write only an agent can make, from inside a turn, which is why it is
+ * trustworthy in a way no timeout could be. There is no server-side fallback
+ * that marks a conversation stopped after N minutes of silence: that would be
+ * inventing the very confirmation this endpoint exists to require.
+ */
+function stopAckRoute(res, id, body) {
+  const conv = conversations.get(id);
+  if (!conv) return fail(res, 404, `no conversation with id "${id}"`);
+
+  const phase = typeof body.phase === 'string' ? body.phase.trim() : '';
+  if (phase !== 'stopping' && phase !== 'stopped') {
+    return fail(res, 400, 'phase must be "stopping" (winding down) or "stopped" (finished)');
+  }
+  if (conv.stopAck === 'stopped' && phase === 'stopping') {
+    return fail(res, 409, 'this conversation is already marked stopped; a stopped agent cannot go back to stopping', {
+      stopAck: conv.stopAck, stoppedAt: conv.stoppedAt,
+    });
+  }
+
+  const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : null;
+  let worktrees = null;
+  if (body.worktrees !== undefined && body.worktrees !== null) {
+    if (!Array.isArray(body.worktrees)) return fail(res, 400, 'worktrees must be an array of strings');
+    worktrees = body.worktrees
+      .filter((w) => typeof w === 'string' && w.trim())
+      .map((w) => w.trim().slice(0, 300))
+      .slice(0, 50);
+  }
+
+  const at = nowIso();
+  const patch = { stopAck: phase, stopAckAt: at, stopNote: note };
+  if (worktrees !== null) patch.worktrees = worktrees;
+  if (phase === 'stopped') {
+    patch.stoppedAt = at;
+    // Its last act: stand down from the conversation. Recorded first so that
+    // even if this is the final thing the agent ever does, the row is honest.
+    patch.agent = null;
+  }
+  appendEvent({ t: 'convpatch', id, patch });
+
+  /*
+   * Worktrees are REPORTED, not verified — this server does not touch git and
+   * has no way to know whether they were really released. Say so, so nobody
+   * reads the list as a guarantee that the disk is clean.
+   */
+  send(res, 200, {
+    ...conv,
+    worktreesAreSelfReported: true,
+    releasedBy: typeof body.agent === 'string' ? body.agent.slice(0, MAX_AGENT) : null,
+  });
+}
+
+/*
+ * POST /conversations/:id/activity — a coordinator narrating its own work.
+ *
+ * Deliberately tiny, and deliberately not required: an agent that reports
+ * nothing behaves exactly as it does today, and the panel simply shows that
+ * nothing was reported. The distinction between "quiet" and "not instrumented"
+ * is carried by `reporting` in the feed response rather than being guessed at.
+ */
+const ACT_KINDS = new Set(['spawned', 'finished', 'tool', 'note']);
+
+function activityRoute(res, id, body) {
+  const conv = conversations.get(id);
+  if (!conv) return fail(res, 404, `no conversation with id "${id}"`);
+
+  const kind = typeof body.kind === 'string' ? body.kind.trim() : '';
+  if (!ACT_KINDS.has(kind)) {
+    return fail(res, 400, `kind must be one of: ${[...ACT_KINDS].join(', ')}`, { got: kind || null });
+  }
+  const str = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+  const subagent = str(body.subagent, 100);
+  if ((kind === 'spawned' || kind === 'finished') && !subagent) {
+    return fail(res, 400, `kind "${kind}" needs a subagent name, so the panel can pair the two halves`);
+  }
+
+  /*
+   * An explicit `at`, for backfill — and the entry is MARKED when one is used.
+   *
+   * A coordinator resumed mid-flight reports subagents it spawned before it was
+   * instrumented. Stamping those with the arrival time made a worker that had
+   * been running the better part of an hour report `runningForSec: 10`: a
+   * plausible number that is wrong, which is the one thing this feed exists to
+   * refuse. So the true start may be supplied — and never silently, because a
+   * reconstructed timestamp that looks observed is the same defect wearing a
+   * better disguise.
+   *
+   * Validated and REJECTED rather than coerced. Clamping a bad timestamp to now
+   * would resurrect the original bug and hide it behind a 201.
+   */
+  let at = nowIso();
+  let reconstructed = false;
+  if (body.at !== undefined && body.at !== null) {
+    if (typeof body.at !== 'string') {
+      return fail(res, 400, 'at must be an ISO 8601 string', { got: typeof body.at });
+    }
+    const t = Date.parse(body.at);
+    if (Number.isNaN(t)) {
+      return fail(res, 400, 'at is not a date this server can parse', { got: body.at });
+    }
+    // A few seconds of tolerance for clock skew; beyond that a "start" in the
+    // future is a bug in the caller, and accepting it would make a subagent
+    // report a negative age.
+    if (t > Date.now() + 5000) {
+      return fail(res, 400, 'at is in the future — a subagent cannot have started after now', {
+        got: body.at, now: nowIso(),
+      });
+    }
+    if (t < Date.now() - ACT_AT_MAX_AGE_MS) {
+      return fail(res, 400,
+        `at is more than ${Math.round(ACT_AT_MAX_AGE_MS / 86400000)} days old, which is further back than this feed keeps anything`,
+        { got: body.at });
+    }
+    at = new Date(t).toISOString();
+    reconstructed = true;
+  }
+
+  const entry = {
+    at,
+    conversationId: id,
+    kind,
+    agent: str(body.agent, MAX_AGENT),   // who is reporting
+    subagent,                            // who it is about, for spawned/finished
+    task: str(body.task, 200),           // what that subagent was asked to do
+    tool: str(body.tool, 80),
+    text: str(body.text, 300),
+    ok: typeof body.ok === 'boolean' ? body.ok : null,
+    // true = client-supplied `at`, false = server-stamped, null = pre-dates
+    // this field. See actProvenance().
+    reconstructed,
+  };
+
+  if (DURABLE_KINDS.has(kind)) {
+    appendEvent({ t: 'act', entry }); // applyEvent pushes it into the ring
+  } else {
+    pushActivity(entry);
+  }
+  send(res, 201, { ok: true, entry, durable: DURABLE_KINDS.has(kind) });
+}
+
+/*
+ * The panel's data. Subagents are folded up into a roster here rather than in
+ * the browser, because pairing spawned/finished is the only part with a rule to
+ * get wrong: a subagent is "running" until a `finished` with the same name
+ * arrives, and one that never finishes stays visible forever on purpose.
+ */
+function activityOf(conversationId) {
+  const feed = ACTIVITY.get(conversationId) || [];
+  /*
+   * ORDER BY TIME, NOT BY ARRIVAL, and this is load-bearing now that `at` can
+   * be supplied by the client.
+   *
+   * The ring is in append order. Backfill deliberately carries an OLDER `at`
+   * than the entries around it, so the two orders diverge — and pairing over
+   * arrival order gets the answer wrong in a way that is not subtle: a
+   * coordinator that reports `finished` for a worker and only afterwards
+   * backfills its `spawned` would have the late-arriving spawn reset
+   * `finishedAt` to null, and a subagent that completed successfully would sit
+   * in the roster as "running" forever.
+   *
+   * Sorting first fixes the pairing, the feed order, and `lastAt` together. The
+   * sort is stable in Node, so entries sharing a timestamp keep arrival order.
+   */
+  const ordered = feed.slice().sort((a, b) => msOf(a.at) - msOf(b.at));
+  const subagents = new Map();
+  let tools = 0;
+  for (const e of ordered) {
+    if (e.kind === 'tool') tools++;
+    if (e.kind !== 'spawned' && e.kind !== 'finished') continue;
+    const cur = subagents.get(e.subagent) || {
+      name: e.subagent, task: null, startedAt: null, finishedAt: null, ok: null,
+      startedAtReconstructed: null, finishedAtReconstructed: null,
+      spawns: 0, finishes: 0,
+    };
+    if (e.kind === 'spawned') {
+      /*
+       * A SECOND `spawned` UNDER A NAME THAT ALREADY HAS ONE.
+       *
+       * The roster is keyed by name, so this row is about to be overwritten:
+       * the task text is replaced, and if the name had already finished, the
+       * verdict is cleared and it goes back to "running" — permanently, since
+       * the coordinator already sent its one `finished`. That manufactures a
+       * phantom worker that looks like it is still holding a worktree, which
+       * is precisely the ghost this feature exists to expose. A well-meaning
+       * worker announcing itself under a name already in use is enough.
+       *
+       * The overwrite is kept — the latest run is the useful one — but it is
+       * COUNTED and disclosed rather than done silently, because a row that
+       * quietly means something other than what it says is the same failure as
+       * a heartbeat with nobody home. The UI warns on `nameCollision`.
+       */
+      cur.spawns++;
+      cur.startedAt = e.at; cur.task = e.task || cur.task; cur.finishedAt = null; cur.ok = null;
+      // Carried onto the roster so a consumer cannot read an inferred age as an
+      // observed one. `runningForSec` below is derived from exactly this.
+      cur.startedAtReconstructed = actProvenance(e.reconstructed);
+      cur.finishedAtReconstructed = null;
+    } else {
+      cur.finishes++;
+      cur.finishedAt = e.at; cur.ok = e.ok; if (e.task && !cur.task) cur.task = e.task;
+      cur.finishedAtReconstructed = actProvenance(e.reconstructed);
+    }
+    subagents.set(e.subagent, cur);
+  }
+  const roster = [...subagents.values()].map((s) => ({
+    ...s,
+    running: s.finishedAt === null && s.startedAt !== null,
+    runningForSec: s.finishedAt === null ? secSince(s.startedAt) : null,
+    /*
+     * The duration is only as trustworthy as the start it was measured from.
+     * `false` means observed, `true` means the coordinator reconstructed the
+     * start, `null` means the entry pre-dates the field and nothing here knows.
+     */
+    runningForSecIsApprox: s.finishedAt === null && s.startedAtReconstructed !== false,
+    /*
+     * The name was used by more than one run, so this row is the most recent
+     * of them and the earlier ones are not separately recoverable — the feed
+     * still has their entries, but the roster cannot tell them apart. Said out
+     * loud so "running" under a reused name is not read as one worker that has
+     * been going the whole time.
+     */
+    nameCollision: s.spawns > 1 || s.finishes > 1,
+  }));
+  return {
+    entries: ordered,
+    count: feed.length,
+    capped: feed.length >= ACTIVITY_CAP,
+    cap: ACTIVITY_CAP,
+    subagents: roster,
+    running: roster.filter((s) => s.running).length,
+    toolCalls: tools,
+    /*
+     * The MAXIMUM timestamp, not the last one appended. Those were the same
+     * thing until `at` became client-supplied; now a backfill arriving last
+     * would have dragged "last heard" backwards into the past, so a busy
+     * coordinator would look like it had gone quiet the moment it tidied up
+     * its own history.
+     */
+    lastAt: ordered.length ? ordered[ordered.length - 1].at : null,
+    /*
+     * Empty means one of two very different things and the UI must not guess:
+     * either this coordinator has done nothing, or nobody taught it to report.
+     * Agents report nothing by default, so "never" is overwhelmingly the latter.
+     */
+    reporting: feed.length > 0,
+    toolCallsAreEphemeral: true,
+    ephemeralSince: new Date(STARTED_AT).toISOString(),
+  };
 }
 
 /*
@@ -2555,6 +4041,8 @@ async function route(req, res) {
       status: 'ok',
       name: NAME,
       version: VERSION,
+      boot: BOOT_NONCE, // null in production; a harness's proof of identity
+      port: server.address() ? server.address().port : PORT,
       counts: counts(),
       conversations: conversations.size,
       streams: streams.size,
@@ -2604,6 +4092,27 @@ async function route(req, res) {
     }
     if (m === 'POST') return updateConversation(res, seg[1], await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /conversations/:id/stop-ack — the agent, and only the agent, answering a
+  // stop request. /conversations/:id/activity — what it is doing meanwhile.
+  if (seg.length === 3 && seg[0] === 'conversations') {
+    if (seg[2] === 'stop-ack') {
+      if (!need('POST')) return;
+      return stopAckRoute(res, seg[1], await readBody(req));
+    }
+    if (seg[2] === 'activity') {
+      if (m === 'POST') return activityRoute(res, seg[1], await readBody(req));
+      if (m === 'GET') {
+        if (!conversations.has(seg[1])) return fail(res, 404, `no conversation with id "${seg[1]}"`);
+        const a = activityOf(seg[1]);
+        const limit = Math.max(1, Math.min(Number(q.get('limit')) || ACTIVITY_CAP, ACTIVITY_CAP));
+        // Newest first: a panel opens on what just happened, not on history.
+        return send(res, 200, { ...a, entries: a.entries.slice(-limit).reverse() });
+      }
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
+    return fail(res, 404, `no such conversation route "${seg[2]}"`, { known: ['stop-ack', 'activity'] });
   }
 
   // /status — is anything actually listening?
@@ -2667,6 +4176,23 @@ async function route(req, res) {
       if (!need('POST')) return;
       return pushTestRoute(res, await readBody(req));
     }
+  }
+
+  /*
+   * /images — the gallery. A new top-level segment that shadows nothing: no
+   * existing route, icon name or static path begins with it, so every request
+   * that worked before this feature still reaches exactly the handler it did.
+   */
+  if (seg.length === 1 && seg[0] === 'images') {
+    if (m === 'GET') return imageListRoute(res, q);
+    if (m === 'POST') return imageUploadRoute(req, res, q);
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+  if (seg.length === 2 && seg[0] === 'images') {
+    if (m !== 'GET' && m !== 'HEAD') {
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, HEAD' });
+    }
+    return imageBytesRoute(req, res, seg[1]);
   }
 
   // /events — Server-Sent Events push of every change
@@ -2751,9 +4277,30 @@ async function route(req, res) {
     return send(res, 200, { count: list.length, now: nowIso(), entries: list });
   }
 
-  // /tasks/:id/(claim|result|relayed)
+  // /checklists — every task list in the queue, or in one conversation.
+  // This is the "what is on his list right now" question, answerable by an agent
+  // in one call without parsing the thread itself.
+  if (seg.length === 1 && seg[0] === 'checklists') {
+    if (!need('GET')) return;
+    const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+    let list = allChecklists(conv || null);
+    const open = q.get('open');
+    if (open !== null && open !== 'false' && open !== '0') list = list.filter((c) => c.remaining > 0);
+    return send(res, 200, { count: list.length, checklists: list });
+  }
+
+  // /tasks/:id/(claim|result|relayed|checks)
   if (seg.length === 3 && seg[0] === 'tasks') {
     const [, id, action] = seg;
+    if (action === 'checks') {
+      if (m === 'GET') {
+        const cl = checklistOf(id);
+        if (!cl) return fail(res, 404, `no checklist on entry "${id}"`);
+        return send(res, 200, cl);
+      }
+      if (m === 'POST') return setCheckRoute(res, id, await readBody(req));
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
     if (action === 'claim' || action === 'result' || action === 'relayed') {
       if (!need('POST')) return;
       const body = await readBody(req);
@@ -2800,7 +4347,17 @@ ensureDefaultConv(); // ...and after, in case the log somehow removed it
 if (PUSH_ON) vapidKeys = loadVapidKeys(); // after mkdir: the key file lives in DATA_DIR
 server.listen(PORT, HOST, () => {
   const c = counts();
-  console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
+  /*
+   * The port we ASKED for is not necessarily the port we GOT: PORT=0 means "any
+   * free one", which is how the selftests avoid fighting each other over a fixed
+   * number. Print what the socket actually bound, because a harness reads this
+   * line to learn where its own child is listening — and a log that echoed the
+   * request back would hand it "0" and, worse, would keep looking correct on the
+   * day the two ever differed.
+   */
+  const bound = server.address();
+  const boundPort = bound && typeof bound === 'object' ? bound.port : PORT;
+  console.log(`${NAME} v${VERSION} listening on http://${HOST}:${boundPort}`);
   console.log(`log: ${LOG_FILE} (${replayed.events} events replayed, ${replayed.skipped} skipped)`);
   const ui = findUiFile();
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);

@@ -3,17 +3,25 @@
 /*
  * push-selftest — the parts of web push that cannot be checked by looking.
  *
- * Three things here would otherwise only be discovered on his phone, abroad:
+ * Four things here would otherwise only be discovered on his phone, abroad:
  *   1. the payload encryption, which is either byte-exact or completely broken;
  *   2. quiet hours, which is where the watchdog's `--nudge-until` bug lives;
- *   3. the rule that agent-to-agent `channel` traffic never reaches him.
+ *   3. the rule that agent-to-agent `channel` traffic never reaches him;
+ *   4. the rule that pushing is opt-in — the 17-in-an-hour regression.
  *
- * No server, no browser, no network. Run: node tools/push-selftest.js
+ * The last section boots a real server.js on a spare port with a throwaway
+ * DATA_DIR; everything above it is pure and needs no network.
+ *
+ * Run: node tools/push-selftest.js
  */
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const wp = require('../push.js');
 const { classify, browserLabel } = require('../server.js');
+const { startServer } = require('./harness-lib');
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -270,23 +278,75 @@ console.log('\nagent-to-agent channel traffic NEVER reaches his phone');
 
 console.log('\nthe page never buzzes the phone that just sent the message');
 {
-  for (const from of ['web', 'voice', 'voice-conversation']) {
+  /*
+   * `checklist` is in this list for a reason. It was missing: ticking a box on
+   * his own phone posts a task with from:'checklist', which fell through to
+   * 'needs-you' and pushed a notification back at the phone that had just sent
+   * it — he ticked a box and got buzzed about it, by himself. PAGE_ORIGINS is
+   * an allowlist that defaults to NOTIFY, so every posting surface the UI grows
+   * must be added here or it will do this again. Any new origin belongs in this
+   * loop on the same day it is invented.
+   */
+  for (const from of ['web', 'voice', 'voice-conversation', 'checklist']) {
     check(`a task he typed from "${from}" does not notify`, classify('task', { from, conversationId: 'main' }, null) === null);
   }
   check('a task from an agent does notify', classify('task', { from: 'vega', conversationId: 'main' }, null) === 'needs-you');
   check('a task from nobody notifies', classify('task', { from: null, conversationId: 'main' }, null) === 'needs-you');
+  // The result side reads the same list, so a tick he is waiting on still lands.
+  check('...and the answer to a checklist tick is still "done"',
+    classify('result', { role: 'user', from: 'checklist', conversationId: 'main' }, null) === 'done');
 }
 
-console.log('\nthe three categories are chosen sensibly, and hints win');
+console.log('\npushing is OPT-IN: an agent that says nothing wakes nobody');
 {
-  const t = { conversationId: 'main', from: 'vega' };
-  check('a result is "done"', classify('result', t, null) === 'done');
-  check('an agent message is "done"', classify('message', t, null) === 'done');
-  check('an explicit "broken" wins', classify('result', t, 'broken') === 'broken');
-  check('an explicit "needs-you" wins', classify('result', t, 'needs-you') === 'needs-you');
-  check('an explicit "none" silences it', classify('result', t, 'none') === null);
+  /*
+   * The 2026-08-08 incident, pinned. classify() used to end
+   *   if (kind === 'result' || kind === 'message') return 'done';
+   * so every agent result and every agent message in one of his conversations
+   * buzzed his phone: 17 pushes in an hour, 16 of them the word "done", while
+   * he was abroad and could not walk away from the channel. If any of the
+   * `=== null` checks below ever go green as 'done' again, that hour is back.
+   */
+  const agentTask = { role: 'user', conversationId: 'main', from: 'vega' }; // an agent posted it
+  const hisTask = { role: 'user', conversationId: 'main', from: 'web' };    // he typed it on the page
+  const agentMsg = { role: 'agent', conversationId: 'main', from: 'agent' }; // POST /messages
+
+  check('an agent message is silent', classify('message', agentMsg, null) === null);
+  check('...whoever it claims to be from', classify('message', { ...agentMsg, from: 'web' }, null) === null);
+  check('...and an unknown hint does not revive the old default',
+    classify('message', agentMsg, 'whatever') === null);
+  check('a result on an agent-posted task is silent', classify('result', agentTask, null) === null);
+  check('...ditto a task from nobody', classify('result', { role: 'user', from: null }, null) === null);
+  check('...ditto a task the message route created', classify('result', agentMsg, null) === null);
+  check('...and an unknown hint does not revive it either',
+    classify('result', agentTask, 'whatever') === null);
+}
+
+console.log('\n...but the answer to something HE asked for is exactly what he wants');
+{
+  // "Things I was waiting on that finished" — the one surviving default.
+  for (const from of ['web', 'voice', 'voice-conversation']) {
+    check(`a result on a task he posted from "${from}" is "done"`,
+      classify('result', { role: 'user', conversationId: 'main', from }, null) === 'done');
+  }
+  check('an unknown hint falls back to that same default',
+    classify('result', { role: 'user', from: 'web' }, 'whatever') === 'done');
+  // role is the belt to PAGE_ORIGINS' braces: a page origin is not enough on
+  // its own if the record was not the human speaking.
+  check('a page origin alone is not enough without role:"user"',
+    classify('result', { role: 'agent', from: 'web' }, null) === null);
+}
+
+console.log('\nan explicit hint still wins, and "none" still silences everything');
+{
+  const t = { role: 'user', conversationId: 'main', from: 'vega' };
+  const his = { role: 'user', conversationId: 'main', from: 'web' };
+  check('an explicit "broken" wins over silence', classify('result', t, 'broken') === 'broken');
+  check('an explicit "needs-you" wins over silence', classify('result', t, 'needs-you') === 'needs-you');
+  check('an explicit "done" wins over silence', classify('message', t, 'done') === 'done');
+  check('an explicit "none" silences a result', classify('result', t, 'none') === null);
+  check('...even one he was waiting for', classify('result', his, 'none') === null);
   check('"none" silences a task too', classify('task', t, 'none') === null);
-  check('an unknown hint falls back to the default', classify('result', t, 'whatever') === 'done');
   check('a missing task notifies nothing', classify('result', null, null) === null);
   check('an unknown kind notifies nothing', classify('mystery', t, null) === null);
 }
@@ -299,5 +359,195 @@ console.log('\nbrowsers are named, so he can tell which one is armed');
   check('nothing at all', browserLabel(null) === 'this browser');
 }
 
-console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
-process.exit(failures ? 1 : 0);
+// ------------------------------------------------- the same rule, over HTTP
+
+/*
+ * classify() is the rule; this is the proof that the rule is wired to the wire.
+ * A real server.js, a real socket, and the counters /push/config already
+ * exposes — `queued` moves the instant something is accepted for sending, so a
+ * delta of zero across a POST is proof that the POST buzzed nobody.
+ *
+ * SAFETY, deliberately, because this test lives one typo away from his pocket:
+ *
+ *  - Push is left ENABLED. With PUSH=0 the notify path returns before `queued`
+ *    is ever incremented, so every assertion below would pass vacuously and
+ *    prove precisely nothing. Enabled counters are the only meaningful ones.
+ *  - Nothing can leave the machine regardless: sendToAll() returns immediately
+ *    while `subscriptions.size === 0`, and a throwaway DATA_DIR has no
+ *    subscriptions in it. The first check asserts that the device list is
+ *    empty and the run ABORTS if it is not, so this can never fire at his
+ *    phone even if pointed at the wrong directory.
+ *  - `delivered` is asserted to be 0 at the end: nothing was ever sent.
+ *  - POST /push/test is never called. It bypasses the debounce AND quiet hours
+ *    by design and would buzz his handset. It is a wiring check for his thumb.
+ *  - A scratch PORT, never 3901. The live instance is never touched.
+ */
+
+// The server under test is started through tools/harness-lib.js, which owns
+// the path, the port, and the proof of identity.
+const TEST_PORT = Number(process.env.PUSH_TEST_PORT || 0);
+const DEBOUNCE_MS = 40;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The scratch instance, set by overHttp(). Everything reads srv.base. */
+let srv = null;
+
+const getJson = async (p) => (await fetch(srv.base + p)).json();
+async function post(p, body) {
+  const res = await fetch(srv.base + p, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body === undefined ? {} : body),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+/*
+ * How many notifications did this action put on the wire? Waits out the
+ * debounce afterwards so consecutive steps cannot coalesce into one slot and
+ * make a later step look silent when it was merely folded into an earlier one.
+ */
+async function queuedBy(fn) {
+  const before = (await getJson('/push/config')).stats.queued;
+  await fn();
+  await sleep(DEBOUNCE_MS * 5);
+  return (await getJson('/push/config')).stats.queued - before;
+}
+
+async function overHttp() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-push-'));
+  srv = await startServer({
+    dir,
+    port: TEST_PORT,
+    label: 'push',
+    env: {
+      WATCH_TICK_MS: '600000',  // the deadman must not queue a 'broken' mid-run
+      PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
+    },
+    // PUSH must be ON, or the counters never move (see above); the hourly
+    // ceiling must be the compiled-in default, because that is what is asserted.
+    unsetEnv: ['PUSH', 'PUSH_PER_HOUR'],
+  });
+
+  try {
+    /*
+     * The port is the OS's choice, so it is stated rather than promised — and
+     * whatever it is, the server answering on it has already proved it is the
+     * child spawned two lines up. Which matters more here than anywhere: the
+     * safety argument for this file rests on the instance under test having no
+     * subscriptions, and that argument is void if it is not the instance being
+     * measured.
+     */
+    console.log(`\nover HTTP: a scratch instance on ${srv.port} that can reach nobody`);
+    const cfg0 = await getJson('/push/config');
+    if (!Array.isArray(cfg0.devices) || cfg0.devices.length !== 0) {
+      throw new Error('ABORT: this instance has subscribed devices — refusing to run, it could buzz a real phone');
+    }
+    check('no browser is subscribed, so nothing can be delivered', cfg0.devices.length === 0);
+    check('push is enabled, so the counters mean something', cfg0.enabled === true);
+    check('no notification has been queued yet', cfg0.stats.queued === 0, JSON.stringify(cfg0.stats));
+    check('quiet hours are unset, so nothing is suppressed for the wrong reason', cfg0.quiet.configured === false);
+    check('the hourly ceiling defaults to 6, not 20', cfg0.budgetLeft === 6, String(cfg0.budgetLeft));
+
+    console.log('\nover HTTP: agent chatter queues NOTHING');
+    check('an agent message with no hint queues nothing',
+      await queuedBy(() => post('/messages', { text: 'done, boss', agent: 'vega', conversationId: 'main' })) === 0);
+    check('...a hundred of them would still queue nothing',
+      await queuedBy(() => post('/messages', { text: 'still working on it', agent: 'rune', conversationId: 'main' })) === 0);
+    check('a channel message still queues nothing',
+      await queuedBy(() => post('/messages', { text: 'internal chatter', agent: 'vega', channel: 'agents' })) === 0);
+    check('...not even hinted "broken"',
+      await queuedBy(() => post('/messages', { text: 'internal alarm', agent: 'vega', channel: 'agents', notify: 'broken' })) === 0);
+
+    console.log('\nover HTTP: a result only buzzes when HE was the one waiting');
+    let agentTaskId = null;
+    check('a task posted BY an agent queues one "needs you"',
+      await queuedBy(async () => {
+        agentTaskId = (await post('/tasks', { text: 'please confirm the plan', from: 'vega' })).body.id;
+      }) === 1);
+    check('...but the result answering it queues nothing',
+      await queuedBy(() => post(`/tasks/${agentTaskId}/result`, { result: 'confirmed' })) === 0);
+
+    let hisTaskId = null;
+    check('a task HE typed on the page queues nothing',
+      await queuedBy(async () => {
+        hisTaskId = (await post('/tasks', { text: 'what is the status', from: 'web' })).body.id;
+      }) === 0);
+    check('...and the result answering it DOES queue one',
+      await queuedBy(() => post(`/tasks/${hisTaskId}/result`, { result: 'here you go' })) === 1);
+
+    /*
+     * The tick-buzzes-himself bug, over the wire. from:'checklist' was not in
+     * PAGE_ORIGINS, so his own tick fell through to 'needs-you' and pushed
+     * straight back at the phone that had just sent it.
+     */
+    check('ticking a checklist box on his own phone queues nothing',
+      await queuedBy(() => post('/tasks', {
+        text: 'Checked off: “buy milk” — please tick it off in Vikunja.', from: 'checklist',
+      })) === 0);
+
+    console.log('\nover HTTP: and that one is specifically the "done" category');
+    {
+      /*
+       * queueNotify() drops a category he has switched off *before* bumping
+       * `queued`, so switching exactly one category off and watching the same
+       * action fall to zero names the category the counters cannot name.
+       */
+      await post('/push/config', { categories: { done: false } });
+      const n = await queuedBy(async () => {
+        const id = (await post('/tasks', { text: 'and now?', from: 'voice' })).body.id;
+        await post(`/tasks/${id}/result`, { result: 'answered' });
+      });
+      check('with "done" switched off, the same result queues nothing', n === 0, String(n));
+      await post('/push/config', { categories: { done: true } });
+    }
+
+    console.log('\nover HTTP: an explicit hint is how an agent opts in');
+    const msg = (text, notify) => post('/messages', { text, agent: 'vega', conversationId: 'main', notify });
+    check('a message hinted "broken" queues one', await queuedBy(() => msg('the disk is full', 'broken')) === 1);
+    check('a message hinted "needs-you" queues one', await queuedBy(() => msg('which branch?', 'needs-you')) === 1);
+    check('a message hinted "done" queues one', await queuedBy(() => msg('the build you asked about is green', 'done')) === 1);
+
+    console.log('\nover HTTP: "none" still silences everything');
+    check('a message hinted "none" queues nothing', await queuedBy(() => msg('nothing to see here', 'none')) === 0);
+    check('a task from an agent hinted "none" queues nothing',
+      await queuedBy(() => post('/tasks', { text: 'do not buzz him for this', from: 'vega', notify: 'none' })) === 0);
+    check('a result he WAS waiting for, hinted "none", queues nothing',
+      await queuedBy(async () => {
+        const id = (await post('/tasks', { text: 'quietly, please', from: 'web' })).body.id;
+        await post(`/tasks/${id}/result`, { result: 'done quietly', notify: 'none' });
+      }) === 0);
+
+    console.log('\nover HTTP: the counters add up, and nothing left the machine');
+    const end = await getJson('/push/config');
+    check('exactly 5 notifications were ever queued', end.stats.queued === 5, JSON.stringify(end.stats));
+    check('all of them flushed', end.stats.flushed === 5, String(end.stats.flushed));
+    check('none were suppressed by quiet hours (none are set)', end.stats.suppressedQuiet === 0);
+    check('none were suppressed by the hourly budget', end.stats.suppressedBudget === 0);
+    check('the budget spent matches the flushes', end.budgetLeft === 6 - end.stats.flushed,
+      `${end.budgetLeft} left after ${end.stats.flushed} flushes`);
+    check('NOTHING was delivered — there was never a device to deliver to', end.stats.delivered === 0);
+    check('the server never tried the network', srv.out.indexOf('[push] sent') === -1);
+  } catch (e) {
+    failures++;
+    console.log(`  FAIL the HTTP section did not run — ${e && e.message}`);
+    if (srv.out) console.log(srv.out.split('\n').slice(-8).map((l) => `       | ${l}`).join('\n'));
+  } finally {
+    await srv.stop();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows can hold it briefly */ }
+  }
+}
+
+overHttp().then(() => {
+  console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
+  process.exit(failures ? 1 : 0);
+}).catch((err) => {
+  /*
+   * A server that never booted lands here, carrying the child's own output in
+   * the message. It must exit non-zero: a run that aborted before its first
+   * assertion prints no verdict at all, and "no failures" and "never ran" are
+   * indistinguishable to anything reading the log rather than the exit code.
+   */
+  console.error(`\nFAIL — the push selftest could not run\n${err && err.message ? err.message : err}\n`);
+  process.exit(1);
+});

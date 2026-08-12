@@ -888,6 +888,62 @@ Dictation, conversation mode and spoken replies all operate on the **active** co
 
 ---
 
+## Pictures
+
+Agents make things you have to *look* at — sprites, contact sheets, screenshots, charts. Before
+this, they could not be shown: the files sat on the machine that made them, and the person who
+needed to judge them was on a phone somewhere else. In one night 198 renders were generated and not
+one of them was ever seen.
+
+**Send the bytes. Never a path.**
+
+```sh
+# 1. upload — the response tells you the id and hands you the markdown line
+curl -s --data-binary @crate.png \
+  'http://127.0.0.1:3901/images?conversationId=main&alt=crate,%20third%20pass&agent=rune'
+# -> {"ok":true,"image":{"id":"…","blob":"9f2a…","url":"/images/9f2a…","type":"image/png",
+#     "width":32,"height":32,…},"markdown":"![crate, third pass](/images/9f2a…)"}
+
+# 2a. put it in a message, in the middle of a sentence if you like
+curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/json' \
+  -d '{"text":"Third pass ![crate](/images/9f2a…) — I think the lid reads now.","agent":"rune"}'
+
+# 2b. or hang a strip of them under the message
+curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/json' \
+  -d '{"text":"Twelve candidates.","agent":"rune","images":["9f2a…","7c11…"]}'
+
+# 2c. answering a task works the same way
+curl -s -X POST http://127.0.0.1:3901/tasks/$ID/result -H 'content-type: application/json' \
+  -d '{"result":"Here they are.","images":["9f2a…"]}'
+```
+
+In the app, a picture appears where it was said, and the menu's **Gallery** shows every picture in
+the conversation. Tapping one opens it full size, where **Actual size** switches to real pixels with
+smoothing off — a 32-pixel sprite scaled up and interpolated is a blur, and "is this any good" is
+usually the entire question.
+
+**Why bytes and not a path**, since a path would be so much easier: this server has no
+authentication and answers anything that can reach the port. A route that read a file named by the
+caller would let every device on the network read every file on the machine — and the request would
+look exactly like a legitimate one. So no caller-supplied string is ever joined to a filesystem
+path. The bytes are hashed, the hash is the filename, and the hash is the URL. Traversal is not
+filtered, it is unrepresentable.
+
+Consequences worth knowing:
+
+- **The format is read from the bytes**, and the `content-type` header is ignored. PNG, JPEG, GIF
+  and WebP; anything else is `415`. This is also why you cannot use it to serve arbitrary files.
+- **Identical bytes are one file.** Posting the same picture twice gives the same `blob` and stores
+  one copy — but two *postings*, so the same sheet posted into two conversations shows up in both.
+- **`/images/<hash>` is immutable** and cached for a year. The URL cannot ever mean different bytes.
+- **8 MiB per upload** (`MAX_IMAGE`), which is a contact sheet, not a video. Over that is a `413`
+  that says the number rather than dropping the connection.
+- **The bytes live in `DATA_DIR/images/`**, beside `events.jsonl`, and are covered by the same
+  `data/` gitignore. If a record outlives its file the route answers `410` and says so, rather than
+  a `404` you would mistake for a typo.
+
+---
+
 ## The thread model
 
 There is **one** record type and **one** write path. A message from the human *is* the task; the
@@ -1154,6 +1210,9 @@ JSON
 | POST   | `/conversations`      | **new** — create one (`title`, optional `agent`)                 |
 | GET    | `/conversations/:id`  | **new** — one conversation with its counts                       |
 | POST   | `/conversations/:id`  | **new** — rename / reassign / archive (`title`, `agent`, `archived`) |
+| POST   | `/images`             | **new** — the raw bytes of a picture; `?conversationId=` `?alt=` `?agent=` (`415` if the bytes are not an image, `413` over 8 MiB) |
+| GET    | `/images`             | **new** — the gallery listing; `conversationId` `limit`           |
+| GET    | `/images/:sha256`     | **new** — the bytes back (`410` if the record outlived the file)  |
 | GET    | `/events`             | **new** — Server-Sent Events; every change pushed as it happens  |
 | POST   | `/stt`                | raw PCM in, `{text}` out, via the local Whisper engine           |
 | POST   | `/tts`                | **new** — `{text}` in, a WAV out, via the local piper engine     |

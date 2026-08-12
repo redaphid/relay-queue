@@ -2,7 +2,16 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  `user-scalable=no` because pinch-zooming a full-bleed chat detaches the page
+  from the screen edges and strands you somewhere you cannot get back from;
+  `viewport-fit=cover` because the safe-area insets below depend on it; and
+  `interactive-widget=resizes-content` because otherwise the on-screen keyboard
+  shrinks only the VISUAL viewport, leaving this fixed-height layout — and the
+  composer pinned to the bottom of it — behind the keyboard. See initNoZoom()
+  and fitToKeyboard() for the halves of this no browser will honour from here.
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
 <title>relay</title>
@@ -79,8 +88,17 @@
     background: var(--bg); color: var(--fg);
     font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     -webkit-text-size-adjust: 100%;
+    /* Kills double-tap-to-zoom, and the 300ms tap delay that comes with it,
+       without touching one-finger scrolling or text selection. */
+    touch-action: manipulation;
     display: flex; flex-direction: column;
-    height: 100vh; height: 100dvh;
+    /* `svh`, not `dvh`: the SMALL viewport is the smallest the visible area
+       ever gets — browser chrome fully extended — so the app can be shorter
+       than what is on screen but never taller than it. Only the second of
+       those can hide the composer, and hiding the composer is the bug this
+       page has now shipped twice. `vh` first, for browsers with neither. The
+       keyboard is a separate mechanism again: see fitToKeyboard(). */
+    height: 100vh; height: 100svh;
     overflow: hidden;
   }
   header {
@@ -266,6 +284,90 @@
   .sline .t { overflow-wrap: anywhere; }
   .snote { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
   .sempty { font-size: 15px; color: var(--muted); }
+
+  /* ---- the subagent activity panel ----
+   *
+   * Shares the status view's vocabulary (.shead/.scard/.srow/.sline) on purpose:
+   * this is the same kind of screen answering a different question, and giving
+   * it its own look would imply the two disagree about what a card means.
+   */
+  #actview {
+    position: fixed; inset: 0; z-index: 31;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #actview[hidden] { display: none; }
+  #actclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #acttitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #actopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #06b6d4, #6366f1, #a855f7) 1 / 0 0 0 4px;
+  }
+
+  /*
+   * THE IMPORTANT ONE. "Nobody taught this coordinator to report" is not a
+   * status — it is the absence of one, and it must borrow the vocabulary of
+   * neither health nor failure. It gets a DASHED edge, because a dashed border
+   * reads as "no signal here" where every solid one on this screen reads as a
+   * measurement that was actually taken. It is not `.ok` and not `.idle`: an
+   * unreporting coordinator may be working flat out, and rendering that as a
+   * calm empty feed is the same lie as a heartbeat with nobody home.
+   */
+  .shead.unknown {
+    color: var(--fg);
+    border: 1px dashed var(--muted);
+    background: var(--panel);
+  }
+  .shead.unknown .ssub { opacity: 1; color: var(--muted); }
+
+  /* One subagent. Never removed when it fails to finish — see renderActivity. */
+  .subrow { display: flex; gap: 8px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--line); }
+  .subrow:first-of-type { border-top: 0; }
+  .subrow .sdot { flex: 0 0 auto; width: 1.2em; text-align: center; font-size: 12px; color: var(--muted); }
+  .subrow .sbody { flex: 1 1 auto; min-width: 0; }
+  .subname { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+  .subtask { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .subwhen { margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .subrow.running .sdot { color: #1a7f4b; }
+  .subrow.running .subwhen { color: #1a7f4b; }
+  .subrow.failed .sdot, .subrow.failed .subwhen { color: var(--rec); font-weight: 650; }
+  /* Finished, but nobody said whether it worked. Not the same as "it worked". */
+  .subrow.noverdict .subwhen { color: var(--off); }
+  /* Running far longer than a subagent plausibly should: possibly a ghost still
+     holding a git worktree. Surfaced, never timed out or tidied away. */
+  .sublong { margin-top: 3px; font-size: 12px; color: var(--off); overflow-wrap: anywhere; }
+  /* Where a timestamp came from. Quieter than .sublong: an inferred start is a
+     caveat on a number, not a problem with the worker. */
+  .subprov { margin-top: 3px; font-size: 12px; color: var(--muted); font-style: italic; overflow-wrap: anywhere; }
+  @media (prefers-color-scheme: dark) {
+    .subrow.running .sdot, .subrow.running .subwhen { color: #4ade80; }
+  }
+
+  /* A caveat attached to a specific number, rather than buried in a footnote. */
+  .scaveat {
+    margin: 8px 0 0; padding: 8px 10px;
+    font-size: 12px; line-height: 1.4; color: var(--off);
+    background: #c2410c10; border: 1px dashed currentColor; border-radius: 10px;
+  }
+  .afeed .sline .t { overflow-wrap: anywhere; }
+  .afeed .sline.bad .w { color: var(--rec); }
+
+  /* The collapsed badge in the conversation list. Costs no extra request: the
+     summary already rides along on /conversations. */
+  .convact { display: flex; gap: 6px; align-items: baseline; margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .convact .acount { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .convact.live { color: #1a7f4b; font-weight: 650; }
+  @media (prefers-color-scheme: dark) { .convact.live { color: #4ade80; } }
+
   /* ---- alerts: web push, quiet hours, and what is actually armed ---- */
   .nbtn {
     display: block; width: 100%; min-height: 48px; margin-top: 8px; padding: 0 14px;
@@ -283,8 +385,10 @@
   @media (prefers-color-scheme: dark) { .nstate.on .dot { background: #4ade80; } }
   .nrow { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 15px; }
   .nrow label { flex: 1 1 auto; min-width: 0; }
+  /* 16px is a hard floor on every text-entry control, not a taste: below it,
+     mobile Safari and Chrome zoom the page in on focus and never zoom back. */
   .nrow input[type="time"], .nrow select {
-    font: inherit; font-size: 15px; color: var(--fg); background: var(--bg);
+    font: inherit; font-size: 16px; color: var(--fg); background: var(--bg);
     border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 44px;
     -webkit-appearance: none; appearance: none; max-width: 58%;
   }
@@ -336,6 +440,52 @@
   .mdlist, .mdtasks { margin: 0 0 8px; padding-left: 22px; }
   .mdtasks { list-style: none; padding-left: 0; }
   .mdlist li { margin: 2px 0; }
+  /* A nested list is a continuation of the row above it, not a new block, so it
+     loses the trailing gap. A sub-list of tasks keeps a small indent of its own,
+     since it has no bullet to sit under. */
+  .mdlist .mdlist, .mdlist .mdtasks, .mdtasks .mdlist, .mdtasks .mdtasks { margin-bottom: 0; }
+  .mdtasks .mdtasks, .mdlist .mdtasks { padding-left: 16px; }
+  .msg .body hr {
+    border: 0; height: 1px; margin: 11px 0;
+    background: var(--line); opacity: .8;
+  }
+
+  /* ---- tables -----------------------------------------------------------
+     An itinerary is a table, and a phone is 390px wide. A wide table gets its
+     own horizontal scroller so it can never push the thread — or the composer —
+     sideways: `max-width:100%` on the wrapper plus `min-width:0` on the flex
+     parents is what actually contains it. `-webkit-overflow-scrolling` keeps
+     the scroll feeling native under a thumb. */
+  .mdtablewrap {
+    max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    margin: 0 0 9px; border-radius: 10px;
+    border: 1px solid var(--line);
+    /* A faint edge, so it is discoverable that there is more to the right. */
+    background: rgba(127, 127, 127, .06);
+  }
+  .mdtablewrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mdtable { border-collapse: collapse; width: auto; min-width: 100%; font-size: 14px; }
+  .mdtable th, .mdtable td {
+    padding: 7px 10px; text-align: left; vertical-align: top;
+    border-bottom: 1px solid var(--line);
+    white-space: normal; min-width: 44px;
+    /*
+     * The bubble sets `overflow-wrap: anywhere` so a pasted URL cannot burst it.
+     * Inside a table that rule is actively wrong: it rendered "09:15" as "09:1"
+     * then "5" on the next line, and a departure time split across two lines is
+     * worse than a table you have to scroll. Cells wrap BETWEEN words only, and
+     * the wrapper's scroller absorbs whatever that costs in width.
+     */
+    overflow-wrap: normal; word-break: normal; hyphens: none;
+  }
+  /* A cell that is only a time, a date or a number never wraps at all. */
+  .mdtable td:first-child, .mdtable th:first-child { white-space: nowrap; }
+  .mdtable thead th {
+    font-weight: 680; white-space: nowrap;
+    background: rgba(127, 127, 127, .12);
+    position: sticky; top: 0;
+  }
+  .mdtable tbody tr:last-child td { border-bottom: 0; }
   .mdquote {
     margin: 0 0 8px; padding: 2px 0 2px 10px;
     border-left: 3px solid var(--line); opacity: .85;
@@ -358,17 +508,30 @@
      this list is read while walking around a bedroom holding a suitcase. */
   .mdtask {
     display: flex; align-items: flex-start; gap: 10px;
-    margin: 0; padding: 5px 0; min-height: 34px;
+    margin: 0; padding: 2px 0; min-height: 44px;
+    /* A task row is a flex container, so a NESTED list inside it would otherwise
+       become a flex sibling and sit *beside* the label — which squeezed the
+       parent's tap target from 287px to 113px at 390px wide. Wrapping, and
+       forcing a sub-list to a full-width line, puts it underneath where it
+       belongs. Caught by tools/mobile-selftest.js, which is the entire reason
+       that suite exists. */
+    flex-wrap: wrap;
   }
+  .mdtask > .mdtasks, .mdtask > .mdlist { flex: 0 0 100%; width: 100%; }
   .mdtask label {
-    display: flex; align-items: flex-start; gap: 10px;
+    display: flex; align-items: center; gap: 12px;
     flex: 1 1 auto; min-width: 0; cursor: pointer;
-    padding: 4px 0; /* pads the row out to a comfortable target */
+    /* The LABEL is the tap target, not the box: 44px tall and the full width of
+       the row, so a thumb aimed anywhere near the words hits it. This is read
+       while walking around holding a suitcase, one-handed. */
+    min-height: 44px; padding: 4px 0;
+    -webkit-tap-highlight-color: rgba(127, 127, 127, .18);
   }
   .mdtask input[type="checkbox"] {
-    flex: 0 0 auto; width: 22px; height: 22px; margin: 0;
+    flex: 0 0 auto; width: 24px; height: 24px; margin: 0;
     accent-color: var(--accent); cursor: pointer;
   }
+  .mdtask label:active { opacity: .7; }
   .mdtask .tlabel { flex: 1 1 auto; min-width: 0; }
   /* Done, and known to be done. Struck through as well as faded: a colour or an
      opacity on its own is not something everyone can read. */
@@ -534,6 +697,92 @@
   }
   #input:focus { border-color: var(--accent); }
   #send:disabled { opacity: .5; }
+  /* ---- pictures ----
+   *
+   * He is judging pixel art on a phone. A thumbnail alone cannot answer the
+   * question he actually has — "grey blob or good crate" — so every picture is
+   * openable at full size, and the full-size view can be switched to ACTUAL
+   * pixels with smoothing off. A 32px sprite blown up and blurred by the
+   * browser's default interpolation is unjudgeable, which would make the whole
+   * feature decorative.
+   */
+  .shots { margin-top: 8px; display: grid; gap: 6px; }
+  .shots.one { grid-template-columns: 1fr; }
+  /* Two up from the second picture on: a contact sheet and eleven sprites are
+     both browsable, and neither becomes a column of full-width scrolling. */
+  .shots.many { grid-template-columns: repeat(2, 1fr); }
+  .shots img, img.relimg {
+    display: block; background: var(--line);
+    border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in;
+  }
+  .shots.one img, img.relimg { width: 100%; height: auto; max-height: 60vh; object-fit: contain; }
+  .shots.many img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; }
+  img.relimg { margin: 8px 0; }
+  /* The alt text, shown when the bytes do not arrive. Without this a failed
+     image is an empty box that looks identical to a bug in this page. */
+  .shots img, img.relimg { color: var(--muted); font-size: 12px; }
+
+  /* ---- the full-size view ---- */
+  #lightbox {
+    position: fixed; inset: 0; z-index: 60; background: #000;
+    display: flex; flex-direction: column;
+  }
+  #lightbox[hidden] { display: none; }
+  #lbbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: calc(6px + env(safe-area-inset-top)) 10px 6px;
+    color: #e6e8ec; font-size: 13px;
+  }
+  #lbcap { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #lbbar a, #lbbar button {
+    flex: 0 0 auto; min-height: 40px; padding: 0 10px;
+    font: inherit; color: #e6e8ec; background: transparent;
+    border: 1px solid #333a45; border-radius: 10px; cursor: pointer; text-decoration: none;
+    display: inline-flex; align-items: center;
+  }
+  #lbclose { width: 44px; justify-content: center; font-size: 24px; border-color: transparent; }
+  #lbwrap {
+    flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain;
+    display: flex; align-items: center; justify-content: center;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  #lbimg { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
+  /* Actual pixels, unsmoothed, and free to overflow into a scroll. This is the
+     mode in which a 32x32 sprite can actually be judged. */
+  #lbwrap.actual { display: block; }
+  #lbwrap.actual #lbimg {
+    max-width: none; max-height: none; width: auto; height: auto;
+    image-rendering: pixelated; image-rendering: crisp-edges; cursor: zoom-out;
+  }
+
+  /* ---- the gallery ---- */
+  #galview {
+    position: fixed; inset: 0; z-index: 32;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #galview[hidden] { display: none; }
+  #galclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #galtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #galopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #f59e0b, #ec4899, #8b5cf6) 1 / 0 0 0 4px;
+  }
+  #galgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 6px; }
+  #galgrid img {
+    width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block;
+    background: var(--line); border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in;
+  }
+  .galempty { padding: 16px 0; color: var(--muted); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -588,6 +837,8 @@
       <p id="converr"></p>
       <div id="convlist"></div>
       <button id="statusopen" type="button">Status &mdash; is anything listening?</button>
+      <button id="actopen" type="button">Activity &mdash; what are its subagents doing?</button>
+      <button id="galopen" type="button">Gallery &mdash; every picture in this conversation</button>
     </nav>
   </div>
 
@@ -604,6 +855,49 @@
     -->
     <div id="notifybody"></div>
   </section>
+
+  <!--
+    The subagent activity panel. Per-conversation, not global: it answers "what
+    is THIS coordinator doing right now", which is a different question from
+    "is the server alive" that #statusview answers.
+  -->
+  <section id="actview" hidden aria-label="Subagent activity">
+    <div class="prow">
+      <b id="acttitle">Activity</b>
+      <button id="actclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="actbody" aria-live="polite"></div>
+  </section>
+
+  <!--
+    Every picture in this conversation, newest first, whether it was attached to
+    a message or written into one as markdown. The thread shows pictures where
+    they were said; this answers "show me everything you made", which is the
+    question he actually asked and the one a thread cannot answer once the
+    conversation has moved on.
+  -->
+  <section id="galview" hidden aria-label="Gallery">
+    <div class="prow">
+      <b id="galtitle">Gallery</b>
+      <button id="galclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="galbody" aria-live="polite"><div id="galgrid"></div></div>
+  </section>
+
+  <!--
+    Full size. Deliberately not a modal over the thread but its own black
+    screen: the judgement being made here is about pixels, and anything else on
+    screen is a distraction and a source of accidental taps.
+  -->
+  <div id="lightbox" hidden role="dialog" aria-label="Full size image">
+    <div id="lbbar">
+      <span id="lbcap"></span>
+      <button id="lbzoom" type="button">Actual size</button>
+      <a id="lbraw" href="#" target="_blank" rel="noopener noreferrer">Open</a>
+      <button id="lbclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="lbwrap"><img id="lbimg" alt=""></div>
+  </div>
 
 <script>
 (function () {
@@ -661,6 +955,9 @@
   var DEFAULT_CONV = 'main';
   var activeConv = DEFAULT_CONV;
   var convs = [];
+  // Whether the last /conversations read was answered from the offline copy.
+  // Everything derived from it is then history, not news — see activityNode().
+  var convsFromCache = false;
   var convNew = Object.create(null);
   var convTimer = null;
 
@@ -744,6 +1041,36 @@
     return a;
   }
 
+  /*
+   * A picture in the thread.
+   *
+   * ONLY this server's own /images/<sha256> is ever turned into an <img>, and
+   * that is the same rule linkNode follows above rather than a new one. Two
+   * reasons, and the second is the one that matters: the page's CSP allows
+   * `img-src 'self'`, so any other source renders as a broken box — and a
+   * broken box is indistinguishable from a bug in this page, which is exactly
+   * the class of thing this codebase refuses to ship. Anything not matching
+   * falls through to the link rule and behaves precisely as it did before.
+   */
+  var IMG_URL = /^\/images\/[a-f0-9]{64}$/;
+
+  function imageNode(url, alt, w, h) {
+    var img = document.createElement('img');
+    img.className = 'relimg';
+    img.src = url;
+    /* The alt is what he sees if the bytes never arrive, so it must say what
+       the picture WAS, not merely that there was one. */
+    img.alt = alt || 'image';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    /* Given as attributes, the browser derives an aspect ratio and reserves the
+       box before the bytes land. Omitted when unknown: a flexible box is
+       correct, a guessed one lays the thread out around a wrong number. */
+    if (w > 0 && h > 0) { img.width = w; img.height = h; }
+    img.addEventListener('click', function () { showLightbox(url, alt); });
+    return img;
+  }
+
   /* Inline spans. Tried in order at each position; every branch consumes at
      least one character, so this cannot spin. */
   function inlineInto(parent, text) {
@@ -755,6 +1082,17 @@
         var code = document.createElement('code');
         code.textContent = m[1];
         parent.appendChild(code);
+        i += m[0].length; continue;
+      }
+      /*
+       * `![alt](/images/<id>)`. Tried BEFORE the link rule, which would
+       * otherwise match the `[alt](...)` part and leave a stray `!` in front of
+       * a link — which is exactly what this page did until now. Anything that
+       * is not one of our own image URLs is left to the link rule, so every
+       * `![...]()` that renders as text today still renders as text.
+       */
+      if ((m = /^!\[([^\]\n]*)\]\(\s*([^)\s]+)\s*\)/.exec(rest)) && IMG_URL.test(m[2])) {
+        parent.appendChild(imageNode(m[2], m[1], 0, 0));
         i += m[0].length; continue;
       }
       if ((m = /^\[([^\]\n]*)\]\(\s*([^)\s]+)[^)]*\)/.exec(rest))) {
@@ -785,39 +1123,115 @@
       }
       // A plain run, up to the next thing that could begin a span. The URL case
       // is matched in full rather than by its leading `h`, or every letter h in
-      // ordinary prose would end the run and cost a text node.
-      var next = rest.slice(1).search(/[`[*_~]|https?:\/\//);
+      // ordinary prose would end the run and cost a text node. `!` is matched
+      // only when an image could follow it, for exactly the same reason — and
+      // it MUST be here: without it a run swallows the `!` of a mid-sentence
+      // `![alt](/images/…)`, the next pass sees a bare `[alt](…)`, and the
+      // picture silently renders as a link instead.
+      var next = rest.slice(1).search(/[`[*_~]|!\[|https?:\/\//);
       var take = next === -1 ? rest.length : next + 1;
       parent.appendChild(document.createTextNode(rest.slice(0, take)));
       i += take;
     }
   }
 
-  var RE_FENCE = /^\s*```/;
+  /*
+   * `~~~` counts as a fence as well as ``` ``` ``` — the server's checklist
+   * parser skips both, and the two MUST agree about which lines are code, or a
+   * `- [ ]` written as an example inside a fence would be a task on one side and
+   * not the other, and every checkbox after it would be off by one.
+   */
+  var RE_FENCE = /^\s*(?:```|~~~)/;
   var RE_HEAD = /^(#{1,6})\s+(.*)$/;
   var RE_QUOTE = /^\s*>\s?(.*)$/;
-  var RE_TASK = /^\s*[-*+]\s+\[([ xX])\]\s*(.*)$/;
-  var RE_BULLET = /^\s*[-*+]\s+(.*)$/;
-  var RE_ORDER = /^\s*(\d{1,3})[.)]\s+(.*)$/;
+  /* A rule is that character and nothing else. Checked before bullets, because
+     `- - -` is a rule and would otherwise read as a one-item list. */
+  var RE_RULE = /^\s{0,3}([-*_])\s*(?:\1\s*){2,}$/;
+  var RE_TASK = /^(\s*)[-*+]\s+\[([ xX])\]\s*(.*)$/;
+  var RE_BULLET = /^(\s*)[-*+]\s+(.*)$/;
+  var RE_ORDER = /^(\s*)(\d{1,3})[.)]\s+(.*)$/;
+  /* The `|---|:--:|` line under a table's header row is what makes it a table;
+     a line full of pipes on its own is just prose about pipes. */
+  var RE_TSEP = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
 
-  function isBlockStart(line) {
+  function isTableAt(lines, i) {
+    return i + 1 < lines.length &&
+      lines[i].indexOf('|') !== -1 &&
+      RE_TSEP.test(lines[i + 1]) && lines[i + 1].indexOf('-') !== -1;
+  }
+
+  function isBlockStart(line, lines, i) {
     return RE_FENCE.test(line) || RE_HEAD.test(line) || RE_QUOTE.test(line) ||
-      RE_TASK.test(line) || RE_BULLET.test(line) || RE_ORDER.test(line);
+      RE_RULE.test(line) || RE_TASK.test(line) || RE_BULLET.test(line) ||
+      RE_ORDER.test(line) || (lines ? isTableAt(lines, i) : false);
+  }
+
+  /** Cells of one table row. `\|` is an escaped pipe, not a cell boundary. */
+  function splitRow(line) {
+    var s = String(line).trim();
+    if (s.charAt(0) === '|') s = s.slice(1);
+    if (s.charAt(s.length - 1) === '|' && s.charAt(s.length - 2) !== '\\') s = s.slice(0, -1);
+    var cells = [], cur = '';
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (ch === '\\' && s.charAt(i + 1) === '|') { cur += '|'; i++; continue; }
+      if (ch === '|') { cells.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    cells.push(cur);
+    return cells.map(function (c) { return c.trim(); });
+  }
+
+  function alignsOf(sep) {
+    return splitRow(sep).map(function (c) {
+      var l = c.charAt(0) === ':', r = c.charAt(c.length - 1) === ':';
+      return l && r ? 'center' : r ? 'right' : l ? 'left' : '';
+    });
+  }
+
+  /** Leading whitespace as a column count; a tab is four columns. */
+  function indentOf(s) {
+    return /^[ \t]*/.exec(s)[0].replace(/\t/g, '    ').length;
   }
 
   function mdRender(text, entry) {
     var frag = document.createDocumentFragment();
     var lines = String(text == null ? '' : text).split(/\r?\n/);
-    var i = 0, taskIndex = 0, list = null, kind = null;
-    function endList() { list = null; kind = null; }
-    function into(k, cls) {
-      if (kind !== k) {
-        list = document.createElement(k === 'ol' ? 'ol' : 'ul');
-        list.className = cls;
-        frag.appendChild(list);
-        kind = k;
+    var i = 0, taskIndex = 0;
+    /*
+     * Open lists, outermost first. Nesting is decided by indentation rather than
+     * by a fixed step, so a list written with two spaces and one written with
+     * four both nest — which matters because an itinerary is usually pasted from
+     * somewhere else and its indentation is whatever that somewhere used.
+     */
+    var stack = [];
+    function endList() { stack.length = 0; }
+
+    function listAt(indent, kind, cls) {
+      while (stack.length && indent < stack[stack.length - 1].indent) stack.pop();
+      var top = stack[stack.length - 1];
+      if (top && indent === top.indent) {
+        if (top.kind === kind) return top;
+        stack.pop();  // bullets turning into numbers at the same level: a new list
       }
-      return list;
+      var el = document.createElement(kind === 'ol' ? 'ol' : 'ul');
+      el.className = cls;
+      var parent = stack[stack.length - 1];
+      // Hung off the parent's last item, so a sub-list indents under its owner
+      // instead of restarting at the margin.
+      if (parent && parent.lastLi) parent.lastLi.appendChild(el);
+      else if (parent) parent.el.appendChild(el);
+      else frag.appendChild(el);
+      var frame = { indent: indent, el: el, kind: kind, lastLi: null };
+      stack.push(frame);
+      return frame;
+    }
+
+    function addItem(indent, kind, cls, li) {
+      var frame = listAt(indent, kind, cls);
+      frame.el.appendChild(li);
+      frame.lastLi = li;
+      return li;
     }
 
     while (i < lines.length) {
@@ -850,6 +1264,56 @@
         i++; continue;
       }
 
+      if (RE_RULE.test(line)) {
+        endList();
+        frag.appendChild(document.createElement('hr'));
+        i++; continue;
+      }
+
+      if (isTableAt(lines, i)) {
+        endList();
+        var aligns = alignsOf(lines[i + 1]);
+        var heads = splitRow(lines[i]);
+        // A table is the one thing that genuinely cannot always fit 390px, so it
+        // gets its own scroll container rather than pushing the whole thread
+        // sideways. Overflow is contained, never inflicted on the page.
+        var twrap = document.createElement('div');
+        twrap.className = 'mdtablewrap';
+        twrap.setAttribute('role', 'region');
+        twrap.setAttribute('aria-label', 'table');
+        twrap.tabIndex = 0;   // reachable, and scrollable, by keyboard too
+        var table = document.createElement('table');
+        table.className = 'mdtable';
+        var thead = document.createElement('thead');
+        var hrow = document.createElement('tr');
+        for (var c = 0; c < heads.length; c++) {
+          var th = document.createElement('th');
+          if (aligns[c]) th.style.textAlign = aligns[c];
+          inlineInto(th, heads[c]);
+          hrow.appendChild(th);
+        }
+        thead.appendChild(hrow);
+        table.appendChild(thead);
+        var tbody = document.createElement('tbody');
+        i += 2;
+        while (i < lines.length && lines[i].trim() && lines[i].indexOf('|') !== -1) {
+          var cells = splitRow(lines[i]);
+          var tr = document.createElement('tr');
+          for (var c2 = 0; c2 < Math.max(cells.length, heads.length); c2++) {
+            var td = document.createElement('td');
+            if (aligns[c2]) td.style.textAlign = aligns[c2];
+            inlineInto(td, cells[c2] === undefined ? '' : cells[c2]);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+          i++;
+        }
+        table.appendChild(tbody);
+        twrap.appendChild(table);
+        frag.appendChild(twrap);
+        continue;
+      }
+
       if ((m = RE_QUOTE.exec(line))) {
         endList();
         var q = document.createElement('div');
@@ -865,21 +1329,22 @@
       }
 
       if ((m = RE_TASK.exec(line))) {
-        into('task', 'mdtasks').appendChild(taskNode(m[2], /x/i.test(m[1]), entry, taskIndex++));
+        addItem(indentOf(m[1]), 'task', 'mdtasks',
+          taskNode(m[3], /x/i.test(m[2]), entry, taskIndex++));
         i++; continue;
       }
 
       if ((m = RE_BULLET.exec(line))) {
         var li = document.createElement('li');
-        inlineInto(li, m[1]);
-        into('ul', 'mdlist').appendChild(li);
+        inlineInto(li, m[2]);
+        addItem(indentOf(m[1]), 'ul', 'mdlist', li);
         i++; continue;
       }
 
       if ((m = RE_ORDER.exec(line))) {
         var oli = document.createElement('li');
-        inlineInto(oli, m[2]);
-        into('ol', 'mdlist').appendChild(oli);
+        inlineInto(oli, m[3]);
+        addItem(indentOf(m[1]), 'ol', 'mdlist', oli);
         i++; continue;
       }
 
@@ -887,11 +1352,14 @@
       var p = document.createElement('p');
       p.className = 'mdp';
       var first = true;
-      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i], lines, i)) {
         if (!first) p.appendChild(document.createElement('br'));
         inlineInto(p, lines[i]);
         first = false; i++;
       }
+      // A line that is only a block *start* by lookahead must still be consumed
+      // somewhere, or this loop would never advance.
+      if (first) { inlineInto(p, lines[i]); i++; }
       frag.appendChild(p);
     }
     return frag;
@@ -899,95 +1367,198 @@
 
   // ---------------------------------------------------------------- checklists
   /*
-   * A ticked box has to survive a reload, and it has to reach Vikunja, which is
-   * where "what is left to pack" actually lives. Two sources of truth for that
-   * is the failure worth avoiding, so this does not keep its own list: the tick
-   * renders instantly from local state, and posts a message asking the
-   * conversation's agent to make the change in Vikunja. The browser never
-   * touches Vikunja and therefore never holds a Vikunja credential.
+   * A ticked box is SERVER STATE. It has to survive a reload, a second device
+   * and a restart of the server, and — the actual point of the feature — an
+   * agent has to be able to read it: "check things off and have Claude notice."
+   * A tick that only one browser knows about satisfies none of that, so
+   * localStorage is no longer where this lives. `POST /tasks/:entryId/checks`
+   * writes it to the event log, `GET` reads it back, and the state arrives with
+   * every thread poll on `entry.checklist`.
    *
-   * WHICH MEANS THE TICK CAN LIE. The agent may be idle, dead, or holding a
-   * token that Vikunja has expired — and it will expire, they always do. A
-   * checkbox that silently shows "done" when nothing was written is worse than
-   * one that is slow, so a tick that has not been confirmed does not look like
-   * one that has: it carries the word "saving", or "not confirmed", or "not
-   * saved", and the row is striped. Idle and broken must not look the same.
+   * WHICH LEAVES ONE HONEST FAILURE MODE: the write can be in flight, or he can
+   * be on a plane. The tick shows immediately either way, because waiting for a
+   * round trip to move a checkbox feels broken — but a tick that has not landed
+   * MUST NOT look like one that has. It carries a word: "saving" while in
+   * flight, "queued — offline" when there is no network, "not saved — tap to
+   * retry" when the server refused. Idle and broken never look the same.
    *
-   * Confirmation reuses machinery that already exists rather than inventing a
-   * protocol: the posted message is an ordinary queue task, so its lifecycle
-   * (pending -> claimed -> answered) is already tracked and already pushed over
-   * SSE. Answered means an agent acted. If the agent later restates the list
-   * with the box ticked, the message text itself agrees and the local record
-   * stops mattering at all.
+   * Nothing is ever silently dropped. An offline tick goes to the outbox in
+   * localStorage and is retried when the browser comes back, and on every poll
+   * after that; only a write the server actively rejects (a 4xx — a message that
+   * no longer exists, an index off the end) stops being retried, and that one
+   * says so on the row.
    */
-  var CHECKS_KEY = 'relay.checks';
-  var MAX_CHECKS = 400;      // the record is a cache, not a store; keep it bounded
-  var UNSURE_AFTER_MS = 240000; // 4 min unanswered: say so rather than keep spinning
-  var checksMem = null;
+  var OUTBOX_KEY = 'relay.checks.outbox';
+  var MAX_OUTBOX = 200;
+  var outboxMem = null;
+  /* Live checkbox rows, so a status change repaints just those rather than
+     re-rendering the thread under his thumb. Rebuilt by every render(). */
+  var taskRows = [];
 
-  function allChecks() {
-    if (checksMem) return checksMem;
-    try { checksMem = JSON.parse(pref(CHECKS_KEY) || '{}') || {}; } catch (e) { checksMem = {}; }
-    return checksMem;
+  function outbox() {
+    if (outboxMem) return outboxMem;
+    try { outboxMem = JSON.parse(pref(OUTBOX_KEY) || '{}') || {}; } catch (e) { outboxMem = {}; }
+    return outboxMem;
   }
-  function checkState(key) { return allChecks()[key] || null; }
-  function setCheck(key, val) {
-    var all = allChecks();
-    all[key] = val;
-    var keys = Object.keys(all);
-    if (keys.length > MAX_CHECKS) {
-      keys.sort(function (a, b) { return (all[a].at || 0) - (all[b].at || 0); });
-      for (var i = 0; i < keys.length - MAX_CHECKS; i++) delete all[keys[i]];
+  function saveOutbox() {
+    var box = outbox();
+    var keys = Object.keys(box);
+    if (keys.length > MAX_OUTBOX) {
+      keys.sort(function (a, b) { return (box[a].at || 0) - (box[b].at || 0); });
+      for (var i = 0; i < keys.length - MAX_OUTBOX; i++) delete box[keys[i]];
     }
-    try { pref(CHECKS_KEY, JSON.stringify(all)); } catch (e) { /* stays in memory only */ }
+    try { pref(OUTBOX_KEY, JSON.stringify(box)); } catch (e) { /* memory only */ }
+  }
+  function outKey(entryId, index) { return entryId + '#' + index; }
+  function outRec(entryId, index) { return outbox()[outKey(entryId, index)] || null; }
+
+  /* Who ticked it. There is no login here, so the honest answer is which device
+     — which is still the useful one when a list is shared with an agent. */
+  function checkAuthor() {
+    try { return 'web/' + String(deviceId()).slice(0, 8); } catch (e) { return 'web'; }
   }
 
-  /*
-   * What to say about this tick, in words. Returns null when there is nothing
-   * to say — the tick is either untouched by us or known to have landed.
-   */
-  function checkMark(key, st, agreesWithSource) {
-    if (!st) return null;                 // never touched here: the text is the truth
-    if (agreesWithSource) return null;    // the agent has restated it our way
-    if (st.done) return null;             // we watched the task get answered
-    if (st.failed) return { cls: 'failed', text: 'not saved — tap to retry' };
-    if (st.taskId) {
-      var task = entries.get(st.taskId);
-      if (task && task.status === 'done') {
-        st.done = true; setCheck(key, st);  // remember it, so eviction cannot un-confirm it
-        return null;
-      }
-      if (Date.now() - (st.at || 0) > UNSURE_AFTER_MS) {
-        return { cls: 'unsure', text: 'not confirmed' };
-      }
-      return { cls: 'saving', text: 'saving' };
-    }
+  /** The server's word on one item, when the thread has told us. */
+  function serverItem(entry, idx) {
+    var cl = entry && entry.checklist;
+    return (cl && cl.items && cl.items[idx]) || null;
+  }
+
+  /* What to say about this tick, in words. null when there is nothing to say. */
+  function checkMark(rec) {
+    if (!rec) return null;                       // settled: the server agrees
+    /* A login page came back, so there IS a network — whatever navigator.onLine
+       says. Waiting will not fix this one; signing in will, so name that. */
+    if (rec.challenge) return { cls: 'failed', text: 'not saved — sign in again' };
+    if (rec.state === 'queued') return { cls: 'unsure', text: 'queued — offline' };
+    if (rec.state === 'failed') return { cls: 'failed', text: 'not saved — tap to retry' };
     return { cls: 'saving', text: 'saving' };
   }
 
-  function paintTask(li, mark, key, st, agreesWithSource) {
-    var m = checkMark(key, st, agreesWithSource);
-    mark.className = 'tmark' + (m ? ' ' + m.cls : '');
-    mark.textContent = m ? m.text : '';
-    mark.hidden = !m;
-    li.className = 'mdtask' + ((st ? st.on : false) ? ' on' : '') +
+  function paintTask(row) {
+    var rec = outRec(row.entryId, row.index);
+    var srv = serverItem(entries.get(row.entryId), row.index);
+    var on = rec ? !!rec.on : (srv ? !!srv.checked : row.inText);
+    var m = checkMark(rec);
+    row.box.checked = on;
+    row.mark.className = 'tmark' + (m ? ' ' + m.cls : '');
+    row.mark.textContent = m ? m.text : '';
+    row.mark.hidden = !m;
+    row.li.className = 'mdtask' + (on ? ' on' : '') +
       (m && m.cls === 'failed' ? ' broken' : m ? ' unsettled' : '');
+    // Who and when, for a tick the server has recorded. Not shouted on the row —
+    // it is the answer to a question you only sometimes ask.
+    if (srv && srv.source === 'checked' && srv.by) {
+      row.lab.title = (srv.checked ? 'ticked' : 'un-ticked') + ' by ' + srv.by +
+        (srv.at ? ' · ' + absolute(srv.at) : '');
+    } else {
+      row.lab.title = '';
+    }
   }
 
+  function paintAllTasks() { for (var i = 0; i < taskRows.length; i++) paintTask(taskRows[i]); }
+
+  /** Fold a checklist the server just returned into the entry we are showing. */
+  function applyChecklist(entryId, cl) {
+    var e = entries.get(entryId);
+    if (e && cl) e.checklist = { total: cl.total, done: cl.done, items: cl.items };
+  }
+
+  function sendCheck(entryId, index, on) {
+    var k = outKey(entryId, index);
+    var box = outbox();
+    box[k] = { entryId: entryId, index: index, on: !!on, at: Date.now(), state: 'sending' };
+    saveOutbox();
+    paintAllTasks();
+    return fetch('/tasks/' + encodeURIComponent(entryId) + '/checks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ index: index, on: !!on, by: checkAuthor() })
+    }).then(function (r) {
+      /*
+       * A CHALLENGE IS NOT AN ANSWER. An expired Cloudflare Access session does
+       * not answer 4xx — it redirects to a login page, so what lands here is a
+       * 200 full of HTML. `r.ok` says yes to that, and a branch that reads only
+       * the status files a login screen as a successful write: the tick is
+       * deleted from the outbox, the row loses its mark, and a mark-less row
+       * means "settled, the server agrees". Silently wrong, with nothing left
+       * to retry — strictly worse than the failure this outbox was built for.
+       *
+       * So only THIS SERVER'S JSON is allowed to settle a tick or to kill one.
+       * Anything else in the path — a login page, a captive portal, a proxy's
+       * error page — is "not now": kept, shown, and retried once the way back
+       * is open. The service worker already refuses to cache a login page as
+       * the app shell (`x-relay-app`); this is the same guard on the write.
+       */
+      var ourJson = /^application\/json/i.test(String(r.headers.get('content-type') || ''));
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!ourJson || !j || typeof j !== 'object' || r.redirected) {
+          var ch = new Error(r.redirected
+            ? 'not saved — a login page answered instead of the server'
+            : 'not saved — HTTP ' + r.status + ' did not come from the server');
+          ch.permanent = false; // signing back in fixes it, so it must keep trying
+          ch.challenge = true;  // ...and waiting for signal will not, so say so
+          throw ch;
+        }
+        if (!r.ok) {
+          var err = new Error((j && j.error) || ('HTTP ' + r.status));
+          // 4xx is the server saying "never, stop asking"; 5xx is "not now".
+          err.permanent = r.status >= 400 && r.status < 500;
+          throw err;
+        }
+        return j;
+      });
+    }).then(function (j) {
+      delete outbox()[k];
+      saveOutbox();
+      if (j && j.checklist) applyChecklist(entryId, j.checklist);
+      paintAllTasks();
+    }).catch(function (err) {
+      var rec = outbox()[k];
+      if (!rec) return;
+      // Offline is not a failure. It is a write that has not happened yet, and
+      // saying "not saved" about it would be a lie in the alarming direction.
+      /*
+       * A challenge outranks `navigator.onLine`. That flag is a hint, not a
+       * fact — a captive portal or a limping hotspot can leave it false while a
+       * login page comes back perfectly well — and a response in hand is proof
+       * there is a network. Calling that "offline" sends him off to wait for
+       * signal he already has, which is the same lie in a quieter voice.
+       */
+      var challenge = !!err.challenge;
+      var offline = !challenge &&
+        ((typeof navigator !== 'undefined' && navigator.onLine === false) ||
+        (!err.permanent && /network|fetch|load failed/i.test(String(err && err.message))));
+      rec.state = err.permanent ? 'failed' : (offline ? 'queued' : 'failed');
+      rec.permanent = !!err.permanent;
+      rec.challenge = challenge;
+      rec.error = (err && err.message) || 'network error';
+      saveOutbox();
+      paintAllTasks();
+    });
+  }
+
+  /** Retry everything the network lost. Called on reconnect and on every poll. */
+  function flushOutbox() {
+    var box = outbox();
+    var keys = Object.keys(box);
+    for (var i = 0; i < keys.length; i++) {
+      var rec = box[keys[i]];
+      if (!rec || rec.state === 'sending' || rec.permanent) continue;
+      sendCheck(rec.entryId, rec.index, rec.on);
+    }
+  }
+  // Coming back from a tunnel is the case this is for: the ticks he made
+  // underground go up the moment there is signal, without him doing anything.
+  try { window.addEventListener('online', flushOutbox); } catch (e) { /* no matter; the poll retries too */ }
+
   function taskNode(label, checkedInSource, entry, idx) {
-    var key = (entry && entry.id ? entry.id : '?') + ':' + idx;
-    var conv = (entry && entry.conversationId) || activeConv;
-    var st = checkState(key);
-    // The message text is the source of truth until this device changes it —
-    // the queue is append-only, so a message can never be rewritten in place.
-    var on = st ? !!st.on : checkedInSource;
-    if (st) st.on = on;
+    var entryId = (entry && entry.id) ? entry.id : '?';
 
     var li = document.createElement('li');
     var lab = document.createElement('label');
     var box = document.createElement('input');
     box.type = 'checkbox';
-    box.checked = on;
 
     var span = document.createElement('span');
     span.className = 'tlabel';
@@ -1001,39 +1572,41 @@
     lab.appendChild(span);
     li.appendChild(lab);
     li.appendChild(mark);
-    paintTask(li, mark, key, st, st ? st.on === checkedInSource : true);
 
-    function send(want) {
-      var rec = { on: want, taskId: null, done: false, failed: false, at: Date.now() };
-      setCheck(key, rec);
-      paintTask(li, mark, key, rec, want === checkedInSource);
-      var plain = String(label).replace(/\s+/g, ' ').trim().slice(0, 200);
-      postTask((want ? 'Checked off: “' : 'Un-checked: “') + plain +
-        (want ? '” — please tick it off in Vikunja.'
-          : '” — please un-tick it in Vikunja.'), 'checklist', conv)
-        .then(function (j) {
-          rec.taskId = (j && j.id) || null;
-          rec.failed = false;
-          setCheck(key, rec);
-          paintTask(li, mark, key, rec, want === checkedInSource);
-          // Show the message we just posted without waiting for the next poll.
-          if (conv === activeConv) poll(false);
-        })
-        .catch(function (err) {
-          rec.failed = true;
-          rec.error = (err && err.message) || 'network error';
-          setCheck(key, rec);
-          paintTask(li, mark, key, rec, want === checkedInSource);
-        });
-    }
+    var row = { entryId: entryId, index: idx, li: li, lab: lab, box: box, mark: mark, inText: !!checkedInSource };
+    taskRows.push(row);
+    paintTask(row);
 
-    box.addEventListener('change', function () { send(!!box.checked); });
+    box.addEventListener('change', function () { sendCheck(entryId, idx, !!box.checked); });
     // A failed write is not a dead end: the marker is the retry button.
     mark.addEventListener('click', function () {
-      var cur = checkState(key);
-      if (cur && cur.failed) send(!!cur.on);
+      var cur = outRec(entryId, idx);
+      if (cur && cur.state === 'failed') sendCheck(entryId, idx, !!cur.on);
     });
     return li;
+  }
+
+  /*
+   * The strip of pictures under a message.
+   *
+   * One picture gets the full width of the bubble, because a single render is
+   * the thing being judged. Two or more go into a two-up grid of squares, so
+   * eleven candidate crates stay browsable instead of becoming eleven
+   * full-width images to scroll past. Either way a tap opens the real thing.
+   */
+  function shotsNode(list) {
+    var box = document.createElement('div');
+    box.className = 'shots ' + (list.length === 1 ? 'one' : 'many');
+    for (var i = 0; i < list.length; i++) {
+      var im = list[i] || {};
+      // Tolerant of a bare id as well as the object the server sends: the saved
+      // offline copy may predate either shape, and a picture is never worth
+      // throwing a thread away for.
+      var url = typeof im === 'string' ? ('/images/' + im) : im.url;
+      if (!url || !IMG_URL.test(url)) continue;
+      box.appendChild(imageNode(url, im.alt, im.width, im.height));
+    }
+    return box;
   }
 
   function nodeFor(e) {
@@ -1043,6 +1616,14 @@
     var body = document.createElement('div');
     body.className = 'body';
     body.appendChild(mdRender(e.text, e));   // nodes only: never innerHTML
+    /*
+     * Pictures attached to the message, as opposed to written into its text.
+     * Guarded rather than assumed: an entry from before this feature, or one
+     * restored from the service worker's saved copy, has no `images` at all,
+     * and a thread that threw here would take the whole page down over a
+     * decoration.
+     */
+    if (e && e.images && e.images.length) body.appendChild(shotsNode(e.images));
 
     var meta = document.createElement('div');
     meta.className = 'meta';
@@ -1075,6 +1656,7 @@
     var stick = !everRendered || nearBottom();
 
     var frag = document.createDocumentFragment();
+    taskRows = [];   // every row is about to be rebuilt; the old ones are detached
     for (var i = 0; i < all.length; i++) frag.appendChild(nodeFor(all[i]));
     list.textContent = '';
     list.appendChild(frag);
@@ -1412,6 +1994,9 @@
           return false;
         }
         fails = 0; setConn(true);
+        // The network is demonstrably up, so anything a tick lost to it can go
+        // now. Cheap: it does nothing at all unless something is actually stuck.
+        flushOutbox();
         return true;
       })
       .catch(function () { fails++; setConn(false); return false; });
@@ -1535,6 +2120,11 @@
   function setUrl(id, replace) {
     var h = '#/c/' + encodeURIComponent(id);
     if (location.hash === h) return;
+    // An overlay is open, so the entry on top of the stack is its marker (see
+    // uiSync). Going somewhere spends that marker rather than stacking on it —
+    // otherwise back from the new conversation lands on a ghost entry for a
+    // drawer that is already shut, and appears to do nothing.
+    if (!replace && uiMarked) { uiMarked = false; replace = true; }
     try {
       if (window.history && window.history.pushState) {
         window.history[replace ? 'replaceState' : 'pushState'](null, '', h);
@@ -1589,6 +2179,13 @@
     return fetch('/conversations', { headers: { accept: 'application/json' } })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
+        /*
+         * This read IS served from the service worker's saved copy when the
+         * network is gone, and it arrives looking exactly like a live one.
+         * Recorded so the activity badge can stop making live-sounding claims
+         * ("2 subagents running") out of a snapshot of unknown age.
+         */
+        convsFromCache = header(r, 'x-relay-from-cache') === '1';
         return r.json();
       })
       .then(function (j) {
@@ -1718,6 +2315,53 @@
     return line;
   }
 
+  /*
+   * The collapsed activity badge. Reads the summary that already rides along on
+   * /conversations, so the list costs no extra request.
+   *
+   * Three outcomes, and the difference between them is the whole point:
+   *
+   *   - no `activity` field at all — an older server, or one that does not
+   *     track this. We do not know, so we say NOTHING. Inventing a reassuring
+   *     line from absent data is the failure this panel exists to avoid.
+   *   - `reporting: false` — the coordinator was never taught to report. Say
+   *     that, in words. Never "0 running", which would read as a measurement.
+   *   - `reporting: true` — the counts are real and can be shown plainly.
+   */
+  function activityNode(c) {
+    var a = c && c.activity;
+    if (!a) return null;
+    var line = document.createElement('div');
+    /*
+     * The list came out of the offline cache, so every number in it is of
+     * unknown age. "not reported" would be a claim about the coordinator made
+     * from a stale snapshot, and a green "2 subagents running" would be worse:
+     * the most confident-looking thing in the drawer, sourced from history.
+     * Say where it came from and drop the live styling.
+     */
+    if (convsFromCache) {
+      line.className = 'convact';
+      var known = a.reporting
+        ? (a.running ? a.running + ' running' : (a.subagents || 0) + ' subagents, none running')
+        : 'nothing reported';
+      line.appendChild(el('span', 'acount', 'subagents: ' + known + ' when last saved'));
+      return line;
+    }
+    if (!a.reporting) {
+      line.className = 'convact';
+      line.appendChild(el('span', 'acount', 'subagents: not reported'));
+      return line;
+    }
+    var running = a.running || 0;
+    line.className = 'convact' + (running ? ' live' : '');
+    var bits = [];
+    if (running) bits.push(running + ' subagent' + (running === 1 ? '' : 's') + ' running');
+    else if (a.subagents) bits.push(a.subagents + ' subagent' + (a.subagents === 1 ? '' : 's') + ', none running');
+    else bits.push('reporting, no subagents yet');
+    line.appendChild(el('span', 'acount', bits.join(' · ')));
+    return line;
+  }
+
   function convNode(c) {
     var row = document.createElement('button');
     row.type = 'button';
@@ -1755,6 +2399,8 @@
 
     row.appendChild(sparkNode(c));
     row.appendChild(agentNode(c));
+    var an = activityNode(c);
+    if (an) row.appendChild(an);
 
     var bits = [];
     if (counts.pending) bits.push(counts.pending + ' waiting');
@@ -1816,6 +2462,7 @@
     setTimeout(function () { if (drawerOpen) drawer.className = 'open'; }, 0);
     if (menuBtn) menuBtn.setAttribute('aria-expanded', 'true');
     loadConvs();
+    uiSync(); // back should shut this, not leave the app
   }
 
   function closeDrawer() {
@@ -1825,6 +2472,7 @@
     if (menuBtn) menuBtn.setAttribute('aria-expanded', 'false');
     if (convErr) { convErr.className = ''; convErr.textContent = ''; }
     setTimeout(function () { if (!drawerOpen) drawer.hidden = true; }, 200);
+    uiSync();
   }
 
   function createConv() {
@@ -2095,6 +2743,7 @@
     if (nEls) { nEls.note.textContent = ''; loadPushConfig(); }
     clearInterval(statusTimer);
     statusTimer = setInterval(function () { if (statusOn && !document.hidden) loadStatus(); }, STATUS_MS);
+    uiSync();
   }
 
   function hideStatus() {
@@ -2103,12 +2752,547 @@
     statusView.hidden = true;
     clearInterval(statusTimer);
     statusTimer = null;
+    uiSync();
   }
 
   function initStatus() {
     if (statusOpen) statusOpen.addEventListener('click', showStatus);
     if (statusClose) statusClose.addEventListener('click', hideStatus);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideStatus(); });
+  }
+
+  /*
+   * ------------------------------------------------------- subagent activity
+   *
+   * What is this coordinator actually doing: which subagents it spawned, which
+   * are still running, and — if it bothers to report them — which tools it ran.
+   *
+   * THE ONE RULE, and the reason this panel is worth building at all:
+   *
+   *     `reporting: false` means NOBODY TAUGHT THIS COORDINATOR TO REPORT.
+   *     It does NOT mean the coordinator is idle.
+   *
+   * The server computes it as "has anything ever been posted here", and posting
+   * is optional — an agent reports nothing unless someone wired it up, which is
+   * still the default. So an empty feed is overwhelmingly "not instrumented"
+   * and only rarely "nothing happened", and the two are not distinguishable
+   * from the counts. Drawing an unreporting-but-busy coordinator as a calm
+   * empty feed is precisely the lie a heartbeat tells when nobody is home —
+   * a failure this project has already paid for repeatedly. Hence: the panel
+   * branches on `reporting` BEFORE rendering anything else, and in the
+   * unreported case it shows NO COUNTERS AT ALL. A zero you cannot trust is
+   * worse than no number, because a zero looks like a measurement.
+   *
+   * Two further numbers carry caveats, and the caveats travel WITH the number
+   * rather than sitting in a footnote nobody scrolls to:
+   *
+   *   - `toolCalls` is held in memory only and resets whenever the server
+   *     restarts — which it does every time its own source changes, i.e.
+   *     constantly. It is always rendered scoped ("since <time>"), never as a
+   *     lifetime total, so a restart cannot read as "it stopped working".
+   *   - `capped` means the feed has already dropped its oldest entries. Said
+   *     out loud, because a truncated list that looks complete lies about
+   *     history.
+   *
+   * Subagent starts and finishes are durable and survive restarts; tool calls
+   * do not. That split is the server's design, and the panel labels the two
+   * halves differently rather than averaging them into one confident number.
+   */
+  var actView = document.getElementById('actview');
+  var actBody = document.getElementById('actbody');
+  var actOpenBtn = document.getElementById('actopen');
+  var actCloseBtn = document.getElementById('actclose');
+  var actTitle = document.getElementById('acttitle');
+  var actTimer = null;
+  var actOn = false;
+  var actConv = null;          // the conversation this panel is showing
+  var ACT_MS = 5000;
+  // Long enough that a subagent still running is worth a second look. Not a
+  // timeout: nothing here ever hides a subagent for taking too long.
+  var GHOST_SEC = 3600;
+
+  /* `rel()` returns a bare "now", which reads as nonsense with "ago" bolted on. */
+  function relAgo(iso) {
+    var r = rel(iso);
+    if (!r) return 'an unknown time ago';
+    return r === 'now' ? 'just now' : r + ' ago';
+  }
+  /* "14:32" — a wall-clock anchor for the ephemeral counters. */
+  function clockOf(iso) {
+    var t = ms(iso);
+    if (!t) return 'an unknown time';
+    try {
+      return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return new Date(t).toISOString().slice(11, 16); }
+  }
+
+  /*
+   * A subagent that never reports `finished` stays running forever, on purpose:
+   * it is the only trace of a process that may still be holding a git worktree.
+   * Nothing here times it out or tidies it away — surfacing it IS the feature.
+   */
+  function subagentNode(s) {
+    var cls = 'subrow';
+    if (s.running) cls += ' running';
+    else if (s.ok === false) cls += ' failed';
+    else if (s.ok === null || s.ok === undefined) cls += ' noverdict';
+
+    var row = el('div', cls);
+    row.appendChild(el('span', 'sdot', s.running ? '●' : s.ok === true ? '✓' : s.ok === false ? '✗' : '?'));
+    var body = el('div', 'sbody');
+    body.appendChild(el('div', 'subname', s.name || '(unnamed subagent)'));
+    if (s.task) body.appendChild(el('div', 'subtask', s.task));
+
+    /*
+     * A DURATION IS ONLY AS GOOD AS THE START IT WAS MEASURED FROM.
+     *
+     * `startedAtReconstructed` is three-valued: false means the server saw the
+     * spawn happen, true means the coordinator reported the start after the
+     * fact, null means the entry predates the field and nothing knows. Only
+     * `false` earns an exact-looking number. The other two get "about" and a
+     * line saying why, for the same reason the panel renders no counters at
+     * all when `reporting` is false: a precise-looking figure that was inferred
+     * is worse than an admittedly vague one, because it invites decisions.
+     */
+    var startApprox = s.startedAtReconstructed !== false;
+    var endApprox = s.finishedAtReconstructed !== false;
+
+    var when;
+    if (s.running) {
+      when = (startApprox ? 'running for about ' : 'running for ') + dur(s.runningForSec);
+    } else {
+      // `runningForSec` is null once finished, so elapsed comes from the pair.
+      var span = (ms(s.finishedAt) && ms(s.startedAt))
+        ? Math.round((ms(s.finishedAt) - ms(s.startedAt)) / 1000) : null;
+      var took = span === null ? '' : (startApprox || endApprox ? ' after about ' : ' after ') + dur(span);
+      when = s.ok === true ? 'finished' + took
+        : s.ok === false ? 'FAILED' + took
+          // Finished, but nobody said whether it worked. Not the same as "it worked".
+          : 'finished' + took + ' — outcome not reported';
+      when += ' · ' + rel(s.finishedAt);
+    }
+    body.appendChild(el('div', 'subwhen', when));
+
+    // Where the start time came from, whenever it was not simply observed.
+    if (s.startedAtReconstructed === true) {
+      body.appendChild(el('div', 'subprov',
+        'Start time was reported after the fact, so this is the coordinator’s reconstruction rather than '
+        + 'something this server watched happen.'));
+    } else if (s.startedAtReconstructed === null && s.startedAt) {
+      body.appendChild(el('div', 'subprov',
+        'Start time is unverified — this entry predates the record of where timestamps came from, so it may '
+        + 'have been filled in afterwards.'));
+    }
+
+    /*
+     * The same name used by more than one run. The roster keeps only the most
+     * recent, so "running" here may be a fresh worker wearing the name of one
+     * that already finished — which would otherwise read as a single worker
+     * that has been going the whole time, and, if it never finishes, as a
+     * ghost holding a worktree.
+     */
+    if (s.nameCollision) {
+      body.appendChild(el('div', 'sublong',
+        'This name was used more than once' + (s.spawns > 1 ? ' (' + s.spawns + ' starts)' : '')
+        + '. Only the most recent run is shown, so the task and timing above may belong to a different '
+        + 'worker than an earlier one of the same name.'));
+    }
+
+    if (s.running && s.runningForSec !== null && s.runningForSec >= GHOST_SEC) {
+      body.appendChild(el('div', 'sublong',
+        'Still running after ' + dur(s.runningForSec) + '. If that is not expected it may have died without '
+        + 'saying so — a subagent only stops being "running" here when it reports that it finished, and one '
+        + 'that never does may still be holding a git worktree.'));
+    }
+    row.appendChild(body);
+    return row;
+  }
+
+  var ACT_VERB = {
+    spawned: 'started',
+    finished: 'finished',
+    tool: 'tool',
+    note: 'note',
+    worktree: 'worktree'
+  };
+
+  function feedLine(e) {
+    var line = el('div', 'sline' + (e.ok === false ? ' bad' : ''));
+    var verb = ACT_VERB[e.kind] || e.kind || 'activity';
+    var head = verb;
+    if (e.kind === 'spawned' || e.kind === 'finished') {
+      head = (e.subagent || 'a subagent') + ' ' + verb;
+      if (e.kind === 'finished') head += e.ok === false ? ' — failed' : e.ok === true ? ' — ok' : ' — outcome not reported';
+    } else if (e.kind === 'tool') {
+      head = e.tool ? 'tool · ' + e.tool : 'tool';
+    }
+    line.appendChild(el('div', 'w', head + ' · ' + rel(e.at)));
+    var text = e.text || (e.kind === 'spawned' ? e.task : '') || '';
+    if (text) line.appendChild(el('div', 't', text));
+    return line;
+  }
+
+  function renderActivity(a) {
+    actBody.textContent = '';
+    var frag = document.createDocumentFragment();
+    var c = convById(actConv);
+    var who = (c && c.agent) || 'This coordinator';
+
+    /*
+     * BRANCH ONE, before anything else. No counters are drawn in this state —
+     * not even zeroes — because every number the endpoint returns here is an
+     * artefact of nothing having been posted, not a measurement of the work.
+     */
+    if (!a.reporting) {
+      var un = el('div', 'shead unknown');
+      un.appendChild(el('div', null, 'Not instrumented — no activity is reported here.'));
+      un.appendChild(el('div', 'ssub',
+        who + ' has never reported any activity, so this panel cannot tell you what it is doing — '
+        + 'including whether it is doing anything at all. This is NOT the same as idle: it may be '
+        + 'working hard right now. Reporting is opt-in, and nothing has opted in for this conversation.'));
+      frag.appendChild(un);
+
+      var how = scard('Why this is empty');
+      how.appendChild(el('p', 'snote',
+        'Coordinators report subagents and tool calls by posting them to the queue, and most have never '
+        + 'been asked to. Until one does, there is nothing to show — so nothing is shown, rather than a '
+        + 'row of zeroes that would look like a reading.'));
+      /*
+       * This state is also reachable BACKWARDS, and it looks alarming if you do
+       * not know why: "reporting" is recomputed on every read, and tool calls
+       * are memory-only. A coordinator that only ever posted tool calls is
+       * reporting one minute and not the next, purely because the server
+       * restarted. Nothing has broken, so this does not get an alarm — it gets
+       * an explanation.
+       */
+      how.appendChild(el('p', 'snote',
+        'A coordinator that reported only tool calls also lands here after a restart, since tool calls '
+        + 'are not kept across one. That is not a fault and nothing was lost — subagent starts and '
+        + 'finishes would have survived.'));
+      how.appendChild(el('p', 'snote',
+        'Whether the agent is alive is a different question, answered by Status — heartbeats and real '
+        + 'work are tracked there and do not depend on any of this.'));
+      frag.appendChild(how);
+
+      actBody.appendChild(frag);
+      return;
+    }
+
+    /*
+     * BRANCH TWO: this coordinator does report. Now — and only now — quiet is
+     * real information, and is allowed to look calm.
+     */
+    var running = a.running || 0;
+    var head = el('div', 'shead ' + (running ? 'ok' : 'idle'));
+    head.appendChild(el('div', null, running
+      ? running + (running === 1 ? ' subagent running now.' : ' subagents running now.')
+      : 'Nothing running right now.'));
+    head.appendChild(el('div', 'ssub',
+      who + ' does report its activity' + (a.lastAt ? ', last heard ' + relAgo(a.lastAt) : '')
+      + '. ' + (running ? '' : 'It has nothing running at the moment — this one really is quiet.')));
+    frag.appendChild(head);
+
+    // --- the roster ---
+    var roster = a.subagents || [];
+    var rc = scard('Subagents');
+    if (!roster.length) {
+      rc.appendChild(el('div', 'sempty', 'No subagents have been reported in this conversation.'));
+    } else {
+      for (var i = 0; i < roster.length; i++) rc.appendChild(subagentNode(roster[i]));
+    }
+    rc.appendChild(el('p', 'snote',
+      'Subagent starts and finishes are recorded durably: they survive a server restart, so anything '
+      + 'left running stays visible until it says it finished.'));
+    frag.appendChild(rc);
+
+    // --- tool calls, always scoped to this server process ---
+    var tc = scard('Tool calls');
+    srow(tc, 'Recorded since ' + clockOf(a.ephemeralSince), String(a.toolCalls || 0));
+    if (a.toolCallsAreEphemeral) {
+      tc.appendChild(el('p', 'scaveat',
+        'This is a live view, not a total. Tool calls are kept in memory only and reset to zero every '
+        + 'time the server restarts — which it does whenever its own code changes. The count above covers '
+        + 'only since ' + clockOf(a.ephemeralSince) + ' (' + relAgo(a.ephemeralSince) + '), so a low or '
+        + 'zero number here can mean a recent restart rather than an agent that stopped working.'));
+    }
+    frag.appendChild(tc);
+
+    // --- the feed ---
+    var fc = scard('Reported activity');
+    if (a.capped) {
+      fc.appendChild(el('p', 'scaveat',
+        'Truncated. Only the most recent ' + (a.cap || a.count) + ' entries are kept — older activity has '
+        + 'been dropped and cannot be recovered. What follows is the end of the story, not all of it.'));
+    }
+    var entries = a.entries || [];
+    if (!entries.length) {
+      fc.appendChild(el('div', 'sempty', 'Nothing reported yet.'));
+    } else {
+      // Already newest-first from the server: a panel opens on what just happened.
+      for (var j = 0; j < entries.length && j < 60; j++) fc.appendChild(feedLine(entries[j]));
+      /*
+       * `count` is the length of the whole feed the server holds; `entries` is
+       * what this request actually received. They are different quantities and
+       * conflating them would put a confident denominator under a number that
+       * does not share it, so each is named for what it is.
+       */
+      if (entries.length > 60) {
+        fc.appendChild(el('p', 'snote', 'Showing the 60 most recent of ' + entries.length + ' loaded'
+          + (a.count && a.count !== entries.length ? ', out of ' + a.count + ' held by the server' : '') + '.'));
+      }
+    }
+    frag.appendChild(fc);
+
+    actBody.appendChild(frag);
+  }
+
+  /*
+   * Unreachable is its own state, and it is emphatically not "quiet". If the
+   * panel cannot load, it says so in the loudest register it has, because an
+   * empty panel that failed to fetch is indistinguishable from an idle agent —
+   * the exact confusion this screen exists to prevent.
+   */
+  function renderActivityError(msg) {
+    actBody.textContent = '';
+    var head = el('div', 'shead alarm', 'Could not load activity.');
+    head.appendChild(el('div', 'ssub',
+      'This panel could not read the activity feed — ' + msg + '. That means it does not know what '
+      + 'this coordinator is doing; it does not mean the coordinator is idle.'));
+    actBody.appendChild(head);
+  }
+
+  function loadActivity() {
+    var id = actConv;
+    if (!id) return Promise.resolve(false);
+    return fetch('/conversations/' + encodeURIComponent(id) + '/activity',
+      { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        /*
+         * The service worker does not intercept this route today — it handles
+         * only exactly /thread and /conversations, and everything else goes
+         * straight to the network. Checked anyway, because if it ever does
+         * start caching /conversations/* the failure is SILENT: a stale roster
+         * would arrive as a clean 200 and be reported as current.
+         */
+        var cached = header(r, 'x-relay-from-cache') === '1';
+        return r.json().then(function (j) { return { j: j, cached: cached }; });
+      })
+      .then(function (got) {
+        // A conversation switch mid-flight must not paint the wrong panel.
+        if (!actOn || id !== actConv) return false;
+        var a = got.j;
+        /*
+         * THREE STATES, NOT TWO: reporting, not-instrumented, and could-not-ask.
+         *
+         * A 200 with JSON in it is not proof this is an activity payload. A
+         * Cloudflare Access session that has expired answers with a login page,
+         * a proxy can answer with anything, and a cache keyed on a different
+         * route answers with a different endpoint's body entirely. Every one of
+         * those has a falsy `reporting`, and treating falsy as "nobody taught
+         * this coordinator to report" would state something confident about the
+         * coordinator on the strength of a response that was never about it.
+         * That is the impostor this whole panel is built to refuse, so the
+         * shape is checked before a single word is drawn.
+         */
+        if (!a || typeof a.reporting !== 'boolean' || !Array.isArray(a.entries)) {
+          renderActivityError('the reply was not an activity report — the session may have expired');
+          return false;
+        }
+        if (got.cached) {
+          renderActivityError('that answer came from the saved offline copy, so it cannot be trusted as current');
+          return false;
+        }
+        renderActivity(a);
+        return true;
+      })
+      .catch(function (err) {
+        if (!actOn || id !== actConv) return false;
+        renderActivityError((err && err.message) || 'network error');
+        return false;
+      });
+  }
+
+  function showActivity() {
+    if (!actView) return;
+    actConv = activeConv;
+    actOn = true;
+    actView.hidden = false;
+    var c = convById(actConv);
+    if (actTitle) actTitle.textContent = 'Activity — ' + ((c && (c.title || c.agent)) || 'this conversation');
+    closeDrawer();
+    actBody.textContent = '';
+    actBody.appendChild(el('div', 'sempty', 'Checking…'));
+    loadActivity();
+    clearInterval(actTimer);
+    actTimer = setInterval(function () { if (actOn && !document.hidden) loadActivity(); }, ACT_MS);
+    uiSync();
+  }
+
+  function hideActivity() {
+    if (!actView || !actOn) return;
+    actOn = false;
+    actView.hidden = true;
+    clearInterval(actTimer);
+    actTimer = null;
+    uiSync();
+  }
+
+  function initActivity() {
+    if (actOpenBtn) actOpenBtn.addEventListener('click', showActivity);
+    if (actCloseBtn) actCloseBtn.addEventListener('click', hideActivity);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideActivity(); });
+  }
+
+  /*
+   * ---------------------------------------------------------------- pictures
+   *
+   * Two views. The lightbox is one picture at full size; the gallery is every
+   * picture in the conversation. They are separate because the questions are
+   * separate — "is this crate any good" and "what did you make tonight" — and
+   * because the lightbox has to be openable from the thread, from the gallery,
+   * and from a picture written into a message, without any of them knowing
+   * about the others.
+   */
+  var lightbox = document.getElementById('lightbox');
+  var lbImg = document.getElementById('lbimg');
+  var lbCap = document.getElementById('lbcap');
+  var lbWrap = document.getElementById('lbwrap');
+  var lbRaw = document.getElementById('lbraw');
+  var lbZoom = document.getElementById('lbzoom');
+  var lbCloseBtn = document.getElementById('lbclose');
+  var lightOn = false;
+
+  function setActual(on) {
+    if (!lbWrap || !lbZoom) return;
+    if (on) lbWrap.classList.add('actual'); else lbWrap.classList.remove('actual');
+    lbZoom.textContent = on ? 'Fit' : 'Actual size';
+    lbZoom.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  /*
+   * `showLightbox` is called from imageNode, which is defined long before this
+   * — safe because these are function declarations, and deliberately so: a
+   * picture in the thread must not depend on the order the page happens to be
+   * assembled in.
+   */
+  function showLightbox(url, alt) {
+    if (!lightbox || !lbImg || !IMG_URL.test(String(url || ''))) return;
+    lightOn = true;
+    lightbox.hidden = false;
+    lbImg.src = url;
+    lbImg.alt = alt || 'image';
+    if (lbCap) lbCap.textContent = alt || '';
+    // The escape hatch. If anything about this view is wrong, the raw bytes are
+    // one tap away in a plain browser tab, where his own pinch-zoom works.
+    if (lbRaw) lbRaw.href = url;
+    setActual(false);
+    uiSync();
+  }
+
+  function hideLightbox() {
+    if (!lightbox || !lightOn) return;
+    lightOn = false;
+    lightbox.hidden = true;
+    // Dropped so a large contact sheet is not held in memory behind a closed
+    // screen; the browser cache makes reopening it free anyway.
+    if (lbImg) lbImg.removeAttribute('src');
+    uiSync();
+  }
+
+  function initLightbox() {
+    if (lbCloseBtn) lbCloseBtn.addEventListener('click', hideLightbox);
+    /*
+     * Tapping the picture toggles between fitted and ACTUAL PIXELS, unsmoothed.
+     * This is the whole reason the view exists: a 32-pixel sprite scaled up and
+     * interpolated by the browser is a blur, and "grey blob or good crate" is
+     * precisely the judgement he is trying to make.
+     */
+    if (lbImg) lbImg.addEventListener('click', function () {
+      setActual(!(lbWrap && lbWrap.classList.contains('actual')));
+    });
+    if (lbZoom) lbZoom.addEventListener('click', function () {
+      setActual(!(lbWrap && lbWrap.classList.contains('actual')));
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideLightbox(); });
+  }
+
+  var galView = document.getElementById('galview');
+  var galGrid = document.getElementById('galgrid');
+  var galTitle = document.getElementById('galtitle');
+  var galOpenBtn = document.getElementById('galopen');
+  var galCloseBtn = document.getElementById('galclose');
+  var galOn = false;
+  var galConv = null;
+
+  function renderGallery(data) {
+    if (!galGrid) return;
+    galGrid.textContent = '';
+    var list = (data && data.images) || [];
+    if (!list.length) {
+      galGrid.appendChild(el('div', 'galempty',
+        'No pictures in this conversation yet. An agent adds one by POSTing the bytes to /images.'));
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      var im = list[i] || {};
+      if (!im.url || !IMG_URL.test(im.url)) continue;
+      galGrid.appendChild(imageNode(im.url, im.alt, im.width, im.height));
+    }
+  }
+
+  function loadGallery() {
+    var id = galConv;
+    return fetch('/images?conversationId=' + encodeURIComponent(id) + '&limit=200', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function (data) {
+        if (!galOn || id !== galConv) return; // a switch mid-flight must not paint the wrong grid
+        renderGallery(data);
+      })
+      .catch(function (err) {
+        if (!galOn || id !== galConv) return;
+        if (!galGrid) return;
+        galGrid.textContent = '';
+        /*
+         * Said out loud, for the same reason the activity panel says it: an
+         * empty grid that failed to load is indistinguishable from a
+         * conversation with no pictures, and he would conclude the agents made
+         * nothing.
+         */
+        galGrid.appendChild(el('div', 'galempty',
+          'Could not read the gallery — ' + ((err && err.message) || 'network error') +
+          '. This is not the same as there being no pictures; it means this view does not know.'));
+      });
+  }
+
+  function showGallery() {
+    if (!galView) return;
+    galConv = activeConv;
+    galOn = true;
+    galView.hidden = false;
+    var c = convById(galConv);
+    if (galTitle) galTitle.textContent = 'Gallery — ' + ((c && (c.title || c.agent)) || 'this conversation');
+    closeDrawer();
+    if (galGrid) { galGrid.textContent = ''; galGrid.appendChild(el('div', 'galempty', 'Looking…')); }
+    loadGallery();
+    uiSync();
+  }
+
+  function hideGallery() {
+    if (!galView || !galOn) return;
+    galOn = false;
+    galView.hidden = true;
+    uiSync();
+  }
+
+  function initGallery() {
+    if (galOpenBtn) galOpenBtn.addEventListener('click', showGallery);
+    if (galCloseBtn) galCloseBtn.addEventListener('click', hideGallery);
+    document.addEventListener('keydown', function (e) {
+      // Only when the lightbox is not the thing on top; it owns Escape first.
+      if (e.key === 'Escape' && !lightOn) hideGallery();
+    });
+    initLightbox();
   }
 
   /*
@@ -4128,6 +5312,187 @@
     if (stopBtn) stopBtn.addEventListener('click', function () { stopConversation('user'); });
   }
 
+  /*
+   * ============================================================ the phone shell
+   *
+   * Everything below is about the one device this page is actually read on, and
+   * it is kept in a single block on purpose so it can be moved or reverted
+   * whole. Three complaints, and — this is the part that took a while to see —
+   * only about one and a half separate causes.
+   *
+   *   "the app lets me zoom and that gets me lost"
+   *   "I sometimes lose my side of the chat controls"
+   *   "don't ever hide my text controls, they hide when I scroll"
+   *
+   * WHAT IS ACTUALLY HAPPENING. There are two viewports. The LAYOUT viewport is
+   * what `innerHeight`, `vh`/`dvh` and this page's fixed-height flex column are
+   * measured against. The VISUAL viewport is the part of it you can currently
+   * see. Pinch to zoom, or raise the on-screen keyboard, and the visual viewport
+   * shrinks and can be panned around inside the layout viewport — which the
+   * layout knows nothing about. The composer is pinned to the bottom of the
+   * layout viewport, so it stays exactly where it was and simply stops being on
+   * screen. Panning a zoomed page is, to the person doing it, "scrolling".
+   *
+   * And it is unrecoverable rather than merely annoying because `body` is
+   * `overflow: hidden`, which CSS propagates to the viewport: the page has no
+   * root scroller at all (measured: documentElement.scrollHeight ===
+   * clientHeight, window.scrollTo() is a no-op). There is nothing to scroll to
+   * bring the controls back. You have to know to pinch out again.
+   *
+   * So the zoom lock is not a separate nicety from the vanishing composer; it
+   * removes the most likely way of triggering it. fitToKeyboard() is the safety
+   * net for every other way — the keyboard, or any browser that ignores the
+   * meta tag — and it works from the visual viewport directly, which is the one
+   * number that cannot lie about what is on screen.
+   */
+
+  /* ---- zoom, locked ------------------------------------------------------
+   * `user-scalable=no` in the meta tag is advisory: iOS Safari ignores it
+   * outright, and Chrome ignores it whenever "force enable zoom" is set in
+   * accessibility settings. `touch-action: manipulation` on the body kills
+   * double-tap zoom; these two listeners kill the pinch. One-finger touchmove
+   * is never touched, so scrolling still scrolls and selecting still selects.
+   */
+  function initNoZoom() {
+    var stop = function (e) { if (e.cancelable) e.preventDefault(); };
+    ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (t) {
+      document.addEventListener(t, stop, { passive: false });
+    });
+    document.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches.length > 1) stop(e);
+    }, { passive: false });
+  }
+
+  /* ---- the composer stays on screen, whatever the browser is doing -------
+   * `interactive-widget=resizes-content` in the meta tag asks Chrome 108+ to
+   * shrink the layout viewport when the keyboard opens, which makes the flex
+   * column re-lay-out above it and is the whole fix where it is honoured. iOS
+   * Safari does not honour it, older Chrome does not either, and neither will
+   * tell us. So: measure. If the visible area is meaningfully shorter than the
+   * layout viewport, size the body to what is visible; the flex column does the
+   * rest and the composer comes back above the keyboard.
+   *
+   * `offsetTop` is in there because the browser may already have panned the
+   * visual viewport down; the body's bottom edge has to land at the bottom of
+   * what is visible, in layout coordinates.
+   *
+   * Deliberately NOT applied while zoomed (`scale > 1`): shrinking the page in
+   * response to a zoom would be a fight the user cannot win. Zoom is blocked
+   * above; if some browser allows it anyway, leave the layout alone.
+   */
+  var vvFitted = false;
+  var vvQueued = false;
+
+  function fitToKeyboard() {
+    vvQueued = false;
+    var vv = window.visualViewport;
+    if (!vv) return;
+    /*
+     * How much of the layout viewport is hidden BELOW what can be seen. The
+     * `offsetTop` term is what makes this the occluded height rather than
+     * merely the shortfall: a visual viewport that has been panned down is
+     * already showing the bottom of the layout, and needs no help.
+     */
+    var occluded = window.innerHeight - (vv.height + vv.offsetTop);
+    // 24px, not 0: sub-pixel rounding is normal and must not start a fight.
+    if (occluded > 24 && !(vv.scale > 1.01)) {
+      var px = Math.max(180, Math.round(vv.height + vv.offsetTop)) + 'px';
+      if (document.body.style.height !== px) {
+        document.body.style.height = px;
+        // Only on the way in, or every pan while the keyboard is up would yank
+        // him back to the bottom of a thread he is trying to read.
+        if (!vvFitted) { vvFitted = true; scrollBottom(); }
+      }
+    } else if (vvFitted) {
+      document.body.style.height = '';
+      vvFitted = false;
+      scrollBottom();
+    }
+  }
+
+  function queueFit() {
+    if (vvQueued) return;
+    vvQueued = true;
+    requestAnimationFrame(fitToKeyboard);
+  }
+
+  function initKeyboardFit() {
+    var vv = window.visualViewport;
+    if (!vv) return; // no way to know; the meta tag is then the only defence
+    vv.addEventListener('resize', queueFit);
+    vv.addEventListener('scroll', queueFit);
+    queueFit();
+  }
+
+  /* ---- back closes what is open -----------------------------------------
+   * Android's back gesture on a one-screen app has nothing to go back to, so it
+   * leaves — even when what he meant was "shut this drawer". Conversation
+   * switches already earn a history entry (see setUrl), so back already walks
+   * the conversations he has visited. What was missing is the layer above:
+   * an open overlay has to be the first thing back consumes.
+   *
+   * At most one overlay is ever open — showStatus() shuts the drawer on its way
+   * in — so this is one marker, not a stack. One boolean is far easier to keep
+   * honest than an array that can drift out of step with the DOM.
+   *
+   * THE INVARIANT: `uiMarked` is true exactly when we have pushed one history
+   * entry standing for "something is open". Every way of closing an overlay —
+   * the X, the scrim, Escape, picking a conversation — runs through uiSync() or
+   * setUrl(), so the entry is always spent. Get that wrong and five taps on the
+   * X leave five dead entries behind, and then back does nothing five times,
+   * which is worse than the bug being fixed.
+   */
+  var uiMarked = false;  // we own one history entry meaning "an overlay is open"
+  var uiPending = 0;     // history.back() calls whose popstate has not arrived
+
+  function uiSync() {
+    /*
+     * The lightbox is the first thing here that can sit ON TOP of another
+     * overlay — it opens from the gallery as well as from the thread. The one
+     * marker still holds, and without a second line of code, because every
+     * hide* calls back into uiSync(): closing the top one re-pushes a marker
+     * while the one underneath is still open, so back keeps consuming layers
+     * one at a time and only leaves the app when the last is gone.
+     */
+    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!lightOn;
+    if (open === uiMarked) return; // includes drawer -> status, which re-uses it
+    if (open) {
+      // Same URL on purpose: a marker must not look like a conversation change,
+      // or onUrlChange would try to switch to the one we are already in.
+      try {
+        history.pushState({ relayOverlay: 1 }, '', location.href);
+        uiMarked = true;
+      } catch (e) { /* no History API: back leaves the app, exactly as before */ }
+      return;
+    }
+    // Closed by the UI rather than by back, so spend the entry ourselves.
+    uiMarked = false;
+    uiPending++;
+    try { history.back(); } catch (e) { uiPending--; return; }
+    // A popstate that never arrives must not swallow the next real back press.
+    setTimeout(function () { if (uiPending > 0) uiPending--; }, 2000);
+  }
+
+  function onUiPop() {
+    if (uiPending > 0) { uiPending--; return; }  // the echo of our own back()
+    if (!uiMarked) return;                       // not ours: let it be a conversation move
+    uiMarked = false;
+    // Topmost first, in the order they stack on screen. All of them call
+    // uiSync(), which sees the marker spent — and re-arms it if a lower layer
+    // is still open.
+    if (lightOn) hideLightbox();
+    else if (galOn) hideGallery();
+    else if (actOn) hideActivity();
+    else if (statusOn) hideStatus();
+    else if (drawerOpen) closeDrawer();
+  }
+
+  function initMobileShell() {
+    initNoZoom();
+    initKeyboardFit();
+    window.addEventListener('popstate', onUiPop);
+  }
+
   // First, before anything that could itself fail: report the previous session
   // if it never came back, and start listening for errors in this one.
   try { initCrashWatch(); } catch (e) { /* never let telemetry take the page down */ }
@@ -4136,6 +5501,26 @@
   setInterval(refreshTimes, 30000);
   initConvs();
   initStatus();
+  // Guarded like every other non-load-bearing feature here: reading and sending
+  // messages must not depend on the activity panel wiring itself up.
+  try {
+    initActivity();
+  } catch (err) {
+    logClient('activity-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Same guard, same reason: a picture is a bonus, and reading and sending
+  // messages must not depend on the gallery wiring itself up.
+  try {
+    initGallery();
+  } catch (err) {
+    logClient('gallery-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
+  // views exist, because it drives them; guarded, because none of it is
+  // load-bearing for reading and sending messages.
+  try { initMobileShell(); } catch (err) {
+    logClient('mobile-shell-init-failed', { message: (err && err.message) || String(err) });
+  }
   // Builds the panel and reads the current state. Requests no permission —
   // that happens only when he taps the button inside it.
   try {
