@@ -3003,6 +3003,50 @@ function sniffImage(buf) {
   return null;
 }
 
+/*
+ * Reading the upload, with a refusal the caller can actually READ.
+ *
+ * Deliberately not `readRawBody`, and the difference is the whole reason this
+ * exists: that one calls `req.destroy()` the instant the cap is passed, which
+ * resets the connection before the 413 can be written. The caller sees "fetch
+ * failed" — a message that says nothing about a limit and sends them looking
+ * for a network fault. For an agent pushing a contact sheet that is over the
+ * cap, "too large, here is the number" is the entire difference between one
+ * more try and an hour of confusion. `readRawBody` is left exactly as it is,
+ * because /stt depends on its behaviour.
+ */
+function readImageBody(req, max) {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > max) {
+      // Answered before a byte is read. Nothing has been consumed, so the
+      // response is certain to be deliverable.
+      reject(httpErr(413, `image too large: ${declared} bytes, max ${max}`));
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) {
+        // Stop keeping it, but let the request finish so the answer can be
+        // sent. Only a caller that ignores the limit outright gets cut off.
+        over = true;
+        chunks.length = 0;
+        if (size > max * 4) req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('error', () => reject(httpErr(400, 'request stream error')));
+    req.on('end', () => {
+      if (over) return reject(httpErr(413, `image too large: more than ${max} bytes`));
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
 /** The public shape. `url` is derived, never stored, so it cannot go stale. */
 const imageView = (im) => ({ ...im, url: `/images/${im.blob}` });
 
@@ -3023,7 +3067,7 @@ function imagePath(blob) {
 async function imageUploadRoute(req, res, q) {
   let buf;
   try {
-    buf = await readRawBody(req, MAX_IMAGE);
+    buf = await readImageBody(req, MAX_IMAGE);
   } catch (err) {
     return fail(res, err.code || 400, err.message || 'could not read the request body', {
       maxBytes: MAX_IMAGE,
