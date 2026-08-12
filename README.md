@@ -1213,6 +1213,7 @@ JSON
 | POST   | `/images`             | **new** — the raw bytes of a picture; `?conversationId=` `?alt=` `?agent=` (`415` if the bytes are not an image, `413` over 8 MiB) |
 | GET    | `/images`             | **new** — the gallery listing; `conversationId` `limit`           |
 | GET    | `/images/:sha256`     | **new** — the bytes back (`410` if the record outlived the file)  |
+| GET    | `/damaged`            | **new** — every record carrying a replacement character; a survey, never a repair |
 | GET    | `/events`             | **new** — Server-Sent Events; every change pushed as it happens  |
 | POST   | `/stt`                | raw PCM in, `{text}` out, via the local Whisper engine           |
 | POST   | `/tts`                | **new** — `{text}` in, a WAV out, via the local piper engine     |
@@ -1227,6 +1228,22 @@ JSON
 | POST   | `/push/subscribe`     | **new** — store a browser's push subscription (`400` if the keys will not encrypt) |
 | POST   | `/push/unsubscribe`   | **new** — forget one, by `deviceId` or `endpoint`                 |
 | POST   | `/push/test`          | **new** — send a test alert now, reporting per-device HTTP status |
+
+**Every JSON body must be valid UTF-8.** A body that is not is refused with `400` and *nothing is
+stored* — it used to be accepted with a `201` and the offending character silently replaced, which
+put unrecoverable mojibake into an append-only archive. The usual cause is a shell re-encoding text
+on its way into `curl` (an em-dash arriving as a lone CP1252 `0x97`). Send the body as bytes you
+control:
+
+```sh
+curl --data-binary @body.json ...                                  # write the JSON to a file
+# PowerShell: pass ([System.Text.Encoding]::UTF8.GetBytes($json)) as the body
+```
+
+The refusal names the character that broke and how to fix it. `POST /messages` and
+`POST /tasks/:id/result` additionally refuse text that *already* contains U+FFFD, since those
+characters are lost before they arrive. `POST /tasks` never refuses — it is the route the web UI's
+typed and dictated messages use — but it warns in the response and flags the thread entry.
 
 `POST /client-log` stores nothing and touches no queue state; it only writes a rate-limited,
 control-character-stripped line to stdout. It exists because the UI's real home is a phone, where
