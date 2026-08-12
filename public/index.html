@@ -1763,6 +1763,17 @@
       st.className = 'chip ' + (e.status || 'pending');
       st.textContent = (GLYPH[e.status] || '') + ' ' + (STATUS[e.status] || e.status || '');
       meta.appendChild(st);
+      /*
+       * Who is on it. Two agents starting the same job is the collision this
+       * whole feature exists to prevent, and the queue knew the answer all
+       * along without ever showing it to him.
+       */
+      if (e.claimedBy) {
+        var who = document.createElement('span');
+        who.className = 'chip';
+        who.textContent = '· ' + e.claimedBy;
+        meta.appendChild(who);
+      }
       wrap.className += ' st-' + (e.status || 'pending');
     }
 
