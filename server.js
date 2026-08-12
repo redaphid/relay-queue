@@ -407,8 +407,18 @@ function applyEvent(ev) {
     if (im && typeof im.id === 'string' && typeof im.blob === 'string') {
       images.set(im.id, im);
       const meta = blobs.get(im.blob);
-      if (meta) meta.posts++;
-      else blobs.set(im.blob, { type: im.type, bytes: im.bytes, width: im.width, height: im.height, posts: 1 });
+      if (meta) {
+        meta.posts++;
+        // The first description of a picture wins. Later postings of the same
+        // bytes are usually a re-send, and letting one silently retitle a
+        // picture already on his screen is a change he never asked for.
+        if (!meta.alt && im.alt) meta.alt = im.alt;
+      } else {
+        blobs.set(im.blob, {
+          type: im.type, bytes: im.bytes, width: im.width, height: im.height,
+          alt: im.alt || null, posts: 1,
+        });
+      }
     }
   } else if (ev.t === 'check') {
     // One tick. Last write wins, and the record keeps who and when, because
@@ -599,6 +609,28 @@ const counts = () => {
  * `since=` filters on, so a status change (pending -> claimed -> done) also
  * reaches an incrementally polling client.
  */
+/*
+ * An attached picture, as the thread hands it to a page.
+ *
+ * Expanded from the bare id the record stores, because the page needs the
+ * DIMENSIONS to reserve the right box before the bytes arrive — a thread full
+ * of images that resizes as each one lands is unreadable on a phone, and he
+ * reads this on a phone. Width and height are whatever the header said and may
+ * legitimately be null; a page that gets null lays out flexibly, where a page
+ * given a guess would lay out around a wrong number.
+ */
+const imageRef = (blob) => {
+  const meta = blobs.get(blob) || {};
+  return {
+    id: blob,
+    url: `/images/${blob}`,
+    type: meta.type || null,
+    width: meta.width === undefined ? null : meta.width,
+    height: meta.height === undefined ? null : meta.height,
+    alt: meta.alt || null,
+  };
+};
+
 const msOf = (v) => { const n = Date.parse(v || ''); return Number.isNaN(n) ? 0 : n; };
 const asText = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : JSON.stringify(v));
 
@@ -624,7 +656,7 @@ function entriesOf(t) {
    * message with none is byte-for-byte the shape every existing client was
    * written against — including the copy the service worker saved yesterday.
    */
-  if (Array.isArray(t.images) && t.images.length) first.images = t.images.slice();
+  if (Array.isArray(t.images) && t.images.length) first.images = t.images.map(imageRef);
   const out = [first];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
@@ -638,7 +670,7 @@ function entriesOf(t) {
       replyTo: t.id,
       conversationId,
     };
-    if (Array.isArray(t.resultImages) && t.resultImages.length) reply.images = t.resultImages.slice();
+    if (Array.isArray(t.resultImages) && t.resultImages.length) reply.images = t.resultImages.map(imageRef);
     out.push(reply);
   }
   /*

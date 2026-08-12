@@ -697,6 +697,92 @@
   }
   #input:focus { border-color: var(--accent); }
   #send:disabled { opacity: .5; }
+  /* ---- pictures ----
+   *
+   * He is judging pixel art on a phone. A thumbnail alone cannot answer the
+   * question he actually has — "grey blob or good crate" — so every picture is
+   * openable at full size, and the full-size view can be switched to ACTUAL
+   * pixels with smoothing off. A 32px sprite blown up and blurred by the
+   * browser's default interpolation is unjudgeable, which would make the whole
+   * feature decorative.
+   */
+  .shots { margin-top: 8px; display: grid; gap: 6px; }
+  .shots.one { grid-template-columns: 1fr; }
+  /* Two up from the second picture on: a contact sheet and eleven sprites are
+     both browsable, and neither becomes a column of full-width scrolling. */
+  .shots.many { grid-template-columns: repeat(2, 1fr); }
+  .shots img, img.relimg {
+    display: block; background: var(--line);
+    border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in;
+  }
+  .shots.one img, img.relimg { width: 100%; height: auto; max-height: 60vh; object-fit: contain; }
+  .shots.many img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; }
+  img.relimg { margin: 8px 0; }
+  /* The alt text, shown when the bytes do not arrive. Without this a failed
+     image is an empty box that looks identical to a bug in this page. */
+  .shots img, img.relimg { color: var(--muted); font-size: 12px; }
+
+  /* ---- the full-size view ---- */
+  #lightbox {
+    position: fixed; inset: 0; z-index: 60; background: #000;
+    display: flex; flex-direction: column;
+  }
+  #lightbox[hidden] { display: none; }
+  #lbbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: calc(6px + env(safe-area-inset-top)) 10px 6px;
+    color: #e6e8ec; font-size: 13px;
+  }
+  #lbcap { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #lbbar a, #lbbar button {
+    flex: 0 0 auto; min-height: 40px; padding: 0 10px;
+    font: inherit; color: #e6e8ec; background: transparent;
+    border: 1px solid #333a45; border-radius: 10px; cursor: pointer; text-decoration: none;
+    display: inline-flex; align-items: center;
+  }
+  #lbclose { width: 44px; justify-content: center; font-size: 24px; border-color: transparent; }
+  #lbwrap {
+    flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain;
+    display: flex; align-items: center; justify-content: center;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  #lbimg { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
+  /* Actual pixels, unsmoothed, and free to overflow into a scroll. This is the
+     mode in which a 32x32 sprite can actually be judged. */
+  #lbwrap.actual { display: block; }
+  #lbwrap.actual #lbimg {
+    max-width: none; max-height: none; width: auto; height: auto;
+    image-rendering: pixelated; image-rendering: crisp-edges; cursor: zoom-out;
+  }
+
+  /* ---- the gallery ---- */
+  #galview {
+    position: fixed; inset: 0; z-index: 32;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #galview[hidden] { display: none; }
+  #galclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #galtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #galopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #f59e0b, #ec4899, #8b5cf6) 1 / 0 0 0 4px;
+  }
+  #galgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 6px; }
+  #galgrid img {
+    width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block;
+    background: var(--line); border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in;
+  }
+  .galempty { padding: 16px 0; color: var(--muted); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -752,6 +838,7 @@
       <div id="convlist"></div>
       <button id="statusopen" type="button">Status &mdash; is anything listening?</button>
       <button id="actopen" type="button">Activity &mdash; what are its subagents doing?</button>
+      <button id="galopen" type="button">Gallery &mdash; every picture in this conversation</button>
     </nav>
   </div>
 
@@ -781,6 +868,36 @@
     </div>
     <div id="actbody" aria-live="polite"></div>
   </section>
+
+  <!--
+    Every picture in this conversation, newest first, whether it was attached to
+    a message or written into one as markdown. The thread shows pictures where
+    they were said; this answers "show me everything you made", which is the
+    question he actually asked and the one a thread cannot answer once the
+    conversation has moved on.
+  -->
+  <section id="galview" hidden aria-label="Gallery">
+    <div class="prow">
+      <b id="galtitle">Gallery</b>
+      <button id="galclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="galbody" aria-live="polite"><div id="galgrid"></div></div>
+  </section>
+
+  <!--
+    Full size. Deliberately not a modal over the thread but its own black
+    screen: the judgement being made here is about pixels, and anything else on
+    screen is a distraction and a source of accidental taps.
+  -->
+  <div id="lightbox" hidden role="dialog" aria-label="Full size image">
+    <div id="lbbar">
+      <span id="lbcap"></span>
+      <button id="lbzoom" type="button">Actual size</button>
+      <a id="lbraw" href="#" target="_blank" rel="noopener noreferrer">Open</a>
+      <button id="lbclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="lbwrap"><img id="lbimg" alt=""></div>
+  </div>
 
 <script>
 (function () {
@@ -924,6 +1041,36 @@
     return a;
   }
 
+  /*
+   * A picture in the thread.
+   *
+   * ONLY this server's own /images/<sha256> is ever turned into an <img>, and
+   * that is the same rule linkNode follows above rather than a new one. Two
+   * reasons, and the second is the one that matters: the page's CSP allows
+   * `img-src 'self'`, so any other source renders as a broken box — and a
+   * broken box is indistinguishable from a bug in this page, which is exactly
+   * the class of thing this codebase refuses to ship. Anything not matching
+   * falls through to the link rule and behaves precisely as it did before.
+   */
+  var IMG_URL = /^\/images\/[a-f0-9]{64}$/;
+
+  function imageNode(url, alt, w, h) {
+    var img = document.createElement('img');
+    img.className = 'relimg';
+    img.src = url;
+    /* The alt is what he sees if the bytes never arrive, so it must say what
+       the picture WAS, not merely that there was one. */
+    img.alt = alt || 'image';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    /* Given as attributes, the browser derives an aspect ratio and reserves the
+       box before the bytes land. Omitted when unknown: a flexible box is
+       correct, a guessed one lays the thread out around a wrong number. */
+    if (w > 0 && h > 0) { img.width = w; img.height = h; }
+    img.addEventListener('click', function () { showLightbox(url, alt); });
+    return img;
+  }
+
   /* Inline spans. Tried in order at each position; every branch consumes at
      least one character, so this cannot spin. */
   function inlineInto(parent, text) {
@@ -935,6 +1082,17 @@
         var code = document.createElement('code');
         code.textContent = m[1];
         parent.appendChild(code);
+        i += m[0].length; continue;
+      }
+      /*
+       * `![alt](/images/<id>)`. Tried BEFORE the link rule, which would
+       * otherwise match the `[alt](...)` part and leave a stray `!` in front of
+       * a link — which is exactly what this page did until now. Anything that
+       * is not one of our own image URLs is left to the link rule, so every
+       * `![...]()` that renders as text today still renders as text.
+       */
+      if ((m = /^!\[([^\]\n]*)\]\(\s*([^)\s]+)\s*\)/.exec(rest)) && IMG_URL.test(m[2])) {
+        parent.appendChild(imageNode(m[2], m[1], 0, 0));
         i += m[0].length; continue;
       }
       if ((m = /^\[([^\]\n]*)\]\(\s*([^)\s]+)[^)]*\)/.exec(rest))) {
@@ -965,8 +1123,12 @@
       }
       // A plain run, up to the next thing that could begin a span. The URL case
       // is matched in full rather than by its leading `h`, or every letter h in
-      // ordinary prose would end the run and cost a text node.
-      var next = rest.slice(1).search(/[`[*_~]|https?:\/\//);
+      // ordinary prose would end the run and cost a text node. `!` is matched
+      // only when an image could follow it, for exactly the same reason — and
+      // it MUST be here: without it a run swallows the `!` of a mid-sentence
+      // `![alt](/images/…)`, the next pass sees a bare `[alt](…)`, and the
+      // picture silently renders as a link instead.
+      var next = rest.slice(1).search(/[`[*_~]|!\[|https?:\/\//);
       var take = next === -1 ? rest.length : next + 1;
       parent.appendChild(document.createTextNode(rest.slice(0, take)));
       i += take;
@@ -1424,6 +1586,29 @@
     return li;
   }
 
+  /*
+   * The strip of pictures under a message.
+   *
+   * One picture gets the full width of the bubble, because a single render is
+   * the thing being judged. Two or more go into a two-up grid of squares, so
+   * eleven candidate crates stay browsable instead of becoming eleven
+   * full-width images to scroll past. Either way a tap opens the real thing.
+   */
+  function shotsNode(list) {
+    var box = document.createElement('div');
+    box.className = 'shots ' + (list.length === 1 ? 'one' : 'many');
+    for (var i = 0; i < list.length; i++) {
+      var im = list[i] || {};
+      // Tolerant of a bare id as well as the object the server sends: the saved
+      // offline copy may predate either shape, and a picture is never worth
+      // throwing a thread away for.
+      var url = typeof im === 'string' ? ('/images/' + im) : im.url;
+      if (!url || !IMG_URL.test(url)) continue;
+      box.appendChild(imageNode(url, im.alt, im.width, im.height));
+    }
+    return box;
+  }
+
   function nodeFor(e) {
     var wrap = document.createElement('div');
     wrap.className = 'msg ' + (e.role === 'agent' ? 'agent' : 'user');
@@ -1431,6 +1616,14 @@
     var body = document.createElement('div');
     body.className = 'body';
     body.appendChild(mdRender(e.text, e));   // nodes only: never innerHTML
+    /*
+     * Pictures attached to the message, as opposed to written into its text.
+     * Guarded rather than assumed: an entry from before this feature, or one
+     * restored from the service worker's saved copy, has no `images` at all,
+     * and a thread that threw here would take the whole page down over a
+     * decoration.
+     */
+    if (e && e.images && e.images.length) body.appendChild(shotsNode(e.images));
 
     var meta = document.createElement('div');
     meta.className = 'meta';
@@ -2949,6 +3142,157 @@
     if (actOpenBtn) actOpenBtn.addEventListener('click', showActivity);
     if (actCloseBtn) actCloseBtn.addEventListener('click', hideActivity);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideActivity(); });
+  }
+
+  /*
+   * ---------------------------------------------------------------- pictures
+   *
+   * Two views. The lightbox is one picture at full size; the gallery is every
+   * picture in the conversation. They are separate because the questions are
+   * separate — "is this crate any good" and "what did you make tonight" — and
+   * because the lightbox has to be openable from the thread, from the gallery,
+   * and from a picture written into a message, without any of them knowing
+   * about the others.
+   */
+  var lightbox = document.getElementById('lightbox');
+  var lbImg = document.getElementById('lbimg');
+  var lbCap = document.getElementById('lbcap');
+  var lbWrap = document.getElementById('lbwrap');
+  var lbRaw = document.getElementById('lbraw');
+  var lbZoom = document.getElementById('lbzoom');
+  var lbCloseBtn = document.getElementById('lbclose');
+  var lightOn = false;
+
+  function setActual(on) {
+    if (!lbWrap || !lbZoom) return;
+    if (on) lbWrap.classList.add('actual'); else lbWrap.classList.remove('actual');
+    lbZoom.textContent = on ? 'Fit' : 'Actual size';
+    lbZoom.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  /*
+   * `showLightbox` is called from imageNode, which is defined long before this
+   * — safe because these are function declarations, and deliberately so: a
+   * picture in the thread must not depend on the order the page happens to be
+   * assembled in.
+   */
+  function showLightbox(url, alt) {
+    if (!lightbox || !lbImg || !IMG_URL.test(String(url || ''))) return;
+    lightOn = true;
+    lightbox.hidden = false;
+    lbImg.src = url;
+    lbImg.alt = alt || 'image';
+    if (lbCap) lbCap.textContent = alt || '';
+    // The escape hatch. If anything about this view is wrong, the raw bytes are
+    // one tap away in a plain browser tab, where his own pinch-zoom works.
+    if (lbRaw) lbRaw.href = url;
+    setActual(false);
+    uiSync();
+  }
+
+  function hideLightbox() {
+    if (!lightbox || !lightOn) return;
+    lightOn = false;
+    lightbox.hidden = true;
+    // Dropped so a large contact sheet is not held in memory behind a closed
+    // screen; the browser cache makes reopening it free anyway.
+    if (lbImg) lbImg.removeAttribute('src');
+    uiSync();
+  }
+
+  function initLightbox() {
+    if (lbCloseBtn) lbCloseBtn.addEventListener('click', hideLightbox);
+    /*
+     * Tapping the picture toggles between fitted and ACTUAL PIXELS, unsmoothed.
+     * This is the whole reason the view exists: a 32-pixel sprite scaled up and
+     * interpolated by the browser is a blur, and "grey blob or good crate" is
+     * precisely the judgement he is trying to make.
+     */
+    if (lbImg) lbImg.addEventListener('click', function () {
+      setActual(!(lbWrap && lbWrap.classList.contains('actual')));
+    });
+    if (lbZoom) lbZoom.addEventListener('click', function () {
+      setActual(!(lbWrap && lbWrap.classList.contains('actual')));
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideLightbox(); });
+  }
+
+  var galView = document.getElementById('galview');
+  var galGrid = document.getElementById('galgrid');
+  var galTitle = document.getElementById('galtitle');
+  var galOpenBtn = document.getElementById('galopen');
+  var galCloseBtn = document.getElementById('galclose');
+  var galOn = false;
+  var galConv = null;
+
+  function renderGallery(data) {
+    if (!galGrid) return;
+    galGrid.textContent = '';
+    var list = (data && data.images) || [];
+    if (!list.length) {
+      galGrid.appendChild(el('div', 'galempty',
+        'No pictures in this conversation yet. An agent adds one by POSTing the bytes to /images.'));
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      var im = list[i] || {};
+      if (!im.url || !IMG_URL.test(im.url)) continue;
+      galGrid.appendChild(imageNode(im.url, im.alt, im.width, im.height));
+    }
+  }
+
+  function loadGallery() {
+    var id = galConv;
+    return fetch('/images?conversationId=' + encodeURIComponent(id) + '&limit=200', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function (data) {
+        if (!galOn || id !== galConv) return; // a switch mid-flight must not paint the wrong grid
+        renderGallery(data);
+      })
+      .catch(function (err) {
+        if (!galOn || id !== galConv) return;
+        if (!galGrid) return;
+        galGrid.textContent = '';
+        /*
+         * Said out loud, for the same reason the activity panel says it: an
+         * empty grid that failed to load is indistinguishable from a
+         * conversation with no pictures, and he would conclude the agents made
+         * nothing.
+         */
+        galGrid.appendChild(el('div', 'galempty',
+          'Could not read the gallery — ' + ((err && err.message) || 'network error') +
+          '. This is not the same as there being no pictures; it means this view does not know.'));
+      });
+  }
+
+  function showGallery() {
+    if (!galView) return;
+    galConv = activeConv;
+    galOn = true;
+    galView.hidden = false;
+    var c = convById(galConv);
+    if (galTitle) galTitle.textContent = 'Gallery — ' + ((c && (c.title || c.agent)) || 'this conversation');
+    closeDrawer();
+    if (galGrid) { galGrid.textContent = ''; galGrid.appendChild(el('div', 'galempty', 'Looking…')); }
+    loadGallery();
+    uiSync();
+  }
+
+  function hideGallery() {
+    if (!galView || !galOn) return;
+    galOn = false;
+    galView.hidden = true;
+    uiSync();
+  }
+
+  function initGallery() {
+    if (galOpenBtn) galOpenBtn.addEventListener('click', showGallery);
+    if (galCloseBtn) galCloseBtn.addEventListener('click', hideGallery);
+    document.addEventListener('keydown', function (e) {
+      // Only when the lightbox is not the thing on top; it owns Escape first.
+      if (e.key === 'Escape' && !lightOn) hideGallery();
+    });
+    initLightbox();
   }
 
   /*
@@ -5102,7 +5446,15 @@
   var uiPending = 0;     // history.back() calls whose popstate has not arrived
 
   function uiSync() {
-    var open = !!statusOn || !!actOn || !!drawerOpen;
+    /*
+     * The lightbox is the first thing here that can sit ON TOP of another
+     * overlay — it opens from the gallery as well as from the thread. The one
+     * marker still holds, and without a second line of code, because every
+     * hide* calls back into uiSync(): closing the top one re-pushes a marker
+     * while the one underneath is still open, so back keeps consuming layers
+     * one at a time and only leaves the app when the last is gone.
+     */
+    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!lightOn;
     if (open === uiMarked) return; // includes drawer -> status, which re-uses it
     if (open) {
       // Same URL on purpose: a marker must not look like a conversation change,
@@ -5125,8 +5477,12 @@
     if (uiPending > 0) { uiPending--; return; }  // the echo of our own back()
     if (!uiMarked) return;                       // not ours: let it be a conversation move
     uiMarked = false;
-    // Topmost first. All of them call uiSync(), which sees the marker spent.
-    if (actOn) hideActivity();
+    // Topmost first, in the order they stack on screen. All of them call
+    // uiSync(), which sees the marker spent — and re-arms it if a lower layer
+    // is still open.
+    if (lightOn) hideLightbox();
+    else if (galOn) hideGallery();
+    else if (actOn) hideActivity();
     else if (statusOn) hideStatus();
     else if (drawerOpen) closeDrawer();
   }
@@ -5151,6 +5507,13 @@
     initActivity();
   } catch (err) {
     logClient('activity-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Same guard, same reason: a picture is a bonus, and reading and sending
+  // messages must not depend on the gallery wiring itself up.
+  try {
+    initGallery();
+  } catch (err) {
+    logClient('gallery-init-failed', { message: (err && err.message) || String(err) });
   }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is

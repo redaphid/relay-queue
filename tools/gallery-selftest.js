@@ -260,7 +260,18 @@ async function main() {
       (byId(msg.body.id) || {}).images && byId(msg.body.id).images.length === 2);
     check('the ANSWER carries its own images, separately from the question',
       (byId(task.body.id + ':r') || {}).images &&
-      byId(task.body.id + ':r').images[0] === mislabelled.body.image.blob);
+      byId(task.body.id + ':r').images[0].id === mislabelled.body.image.blob);
+    /*
+     * The page has to reserve the right box before the bytes land, or a thread
+     * of images shudders as each one arrives. That means the dimensions must
+     * ride along with the entry rather than being discovered on load.
+     */
+    const shot = byId(msg.body.id).images[0];
+    check('...an attached image arrives with its url ready to use', shot.url === '/images/' + im.blob, shot.url);
+    check('*** ...and with the dimensions the page needs to reserve its box ***',
+      shot.width === 7 && shot.height === 3, `${shot.width}x${shot.height}`);
+    check('...and its alt text, so a picture that fails to load still says what it was',
+      shot.alt === 'seven by three', shot.alt);
     check('...and the question itself has none, so the two sets never merged',
       (byId(task.body.id) || {}).images === undefined);
 
@@ -300,8 +311,11 @@ async function main() {
     check('*** the image is still served after a restart ***', afterBytes.equals(png),
       `HTTP ${after.status}, ${afterBytes.length} bytes`);
     check('...the listing came back too', (await get('/images')).total === all.total);
-    check('...and the thread still has its attachments',
-      ((await get('/thread')).entries.find((e) => e.id === msg.body.id) || {}).images.length === 2);
+    const revived = (await get('/thread')).entries.find((e) => e.id === msg.body.id) || {};
+    check('...and the thread still has its attachments', revived.images && revived.images.length === 2);
+    check('...still with their dimensions, rebuilt from the log alone',
+      revived.images[0].width === 7 && revived.images[0].height === 3,
+      JSON.stringify(revived.images[0]));
     check('nothing was rewritten in the log, only appended',
       fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').startsWith(logBefore));
     check('the server booted clean on replay', /events replayed/.test(srv.out),
