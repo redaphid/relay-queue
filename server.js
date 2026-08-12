@@ -681,6 +681,14 @@ function entriesOf(t) {
    * written against — including the copy the service worker saved yesterday.
    */
   if (Array.isArray(t.images) && t.images.length) first.images = t.images.map(imageRef);
+  /*
+   * WHO HOLDS THIS. `claimedBy` has always been on the record and has never
+   * reached his page, so ownership was visible to the queue and to nobody else
+   * — which is half of how two agents ended up on one job. Added only when
+   * something actually holds it, so an unclaimed message is byte-for-byte the
+   * shape every existing client was written against.
+   */
+  if (t.claimedBy) first.claimedBy = t.claimedBy;
   const out = [first];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
