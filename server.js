@@ -4246,6 +4246,48 @@ function resultTask(res, id, body) {
    */
   const imgs = readImages(body.images);
   if (imgs instanceof Error) return fail(res, 400, imgs.message);
+
+  /*
+   * THE LOCK THAT EXISTED AND ENFORCED NOTHING.
+   *
+   * Four tasks in the live log are `done` with `claimedBy: null` — the claim
+   * was there to be taken and the answer arrived from outside it. Claiming has
+   * been an honour system, which is exactly the shape of "two agents worked on
+   * the same message".
+   *
+   * NARROWLY DRAWN ON PURPOSE, because tightening this could break agents that
+   * answer perfectly well without ever claiming, and breaking those is worse
+   * than the collision:
+   *
+   *   - No `by` at all -> ALLOWED, unchanged. A result may still be posted
+   *     straight to a pending task, and every existing caller keeps working.
+   *   - `by` matching the holder -> allowed, obviously.
+   *   - Nothing holds it -> allowed. There is no claim to violate.
+   *   - `by` naming someone OTHER than the holder -> refused.
+   *
+   * So the only request this newly rejects is one that says, in its own words,
+   * "I am B" about a task held by A. That is not a caller being sloppy, it is
+   * two agents on one job, and it is the only case where the server knows
+   * enough to be sure. The refusal names the holder and when the lease expires,
+   * so the loser can act on it rather than guess.
+   */
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : null;
+  if (by && task.claimedBy && by !== task.claimedBy) {
+    const lease = leaseOf(task);
+    return fail(res, 409, `"${task.claimedBy}" holds this task, not "${by}"`, {
+      id: task.id,
+      claimedBy: task.claimedBy,
+      claimedAt: task.claimedAt || null,
+      by,
+      leaseExpiresInSec: lease ? lease.leftSec : null,
+      // The way out, rather than a dead end: an abandoned task can still be
+      // taken over through the existing claim route once its lease is up.
+      hint: lease && lease.expired
+        ? 'the lease has expired — POST /tasks/:id/claim to take it over, then post the result'
+        : 'if you are both on this, one of you should stop. Nothing was written.',
+    });
+  }
+
   // A result may be posted straight to a pending task; no claim required.
   const patch = { status: 'done', result: body.result, resultTs: nowIso() };
   if (imgs) patch.resultImages = imgs;
