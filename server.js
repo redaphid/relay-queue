@@ -490,6 +490,83 @@ function send(res, code, obj) {
 const fail = (res, code, error, extra) => send(res, code, { error, ...extra });
 const httpErr = (code, message) => Object.assign(new Error(message), { code });
 
+/*
+ * ---------------------------------------------------------------- text safety
+ *
+ * `fatal: true` is the entire point. The default decoder replaces whatever it
+ * cannot read and says nothing, which is how mojibake reached a permanent log.
+ */
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true });
+const REPLACEMENT = '\uFFFD';
+
+/** Does this value carry a replacement character - i.e. text that is already lost? */
+function isDamaged(v) {
+  if (typeof v === 'string') return v.indexOf(REPLACEMENT) >= 0;
+  if (v === null || v === undefined) return false;
+  try { return JSON.stringify(v).indexOf(REPLACEMENT) >= 0; } catch { return false; }
+}
+
+/*
+ * Refusing text that is ALREADY lost.
+ *
+ * Distinct from the UTF-8 check in readBody, and it has to be: bytes that
+ * already encode U+FFFD are perfectly well-formed, so the strict decoder waves
+ * them through. Something upstream did the damage and the original characters
+ * are gone - writing that into an append-only archive makes the loss permanent
+ * and invisible at once.
+ *
+ * WHERE THIS IS SAFE TO APPLY IS THE WHOLE DESIGN. It is used only on the two
+ * routes the page provably never calls: POST /messages and POST
+ * /tasks/:id/result are agents speaking and agents answering. POST /tasks is
+ * shared with his own typed and dictated messages, so that one WARNS and stores
+ * instead. Refusing an agent is good - it retries. Refusing him loses the
+ * message, which is far worse than the bug being fixed.
+ *
+ * Deliberately NOT keyed on PAGE_ORIGINS. That set is an allowlist whose
+ * default is "treat as an agent", and the comment above it records a posting
+ * surface nobody remembered to add slipping through once already. Betting his
+ * messages on that list staying complete is the same wager with a worse payout.
+ */
+function refuseDamaged(res, what) {
+  return fail(res, 400,
+    `${what} already contains a replacement character (U+FFFD), so part of it is already lost - nothing was stored`, {
+      why: 'the text was mangled before it reached this server. The original characters cannot be '
+        + 'recovered here, so storing it would put a permanent, silent gap in the archive.',
+      fix: [
+        'write the JSON to a file and send that: curl --data-binary @body.json',
+        'PowerShell: pass ([System.Text.Encoding]::UTF8.GetBytes($json)) as the body',
+        'or write the message in plain ASCII',
+      ],
+    });
+}
+
+/*
+ * Where the bytes went wrong, in the caller's own text, because a 400 that is
+ * merely correct gets retried unchanged. Decoding lossily on purpose: this runs
+ * only on the failure path, and the position of the first replacement is
+ * exactly the spot the caller needs to look at.
+ */
+function mojibakeDetail(buf) {
+  const lossy = buf.toString('utf8');
+  const at = lossy.indexOf(REPLACEMENT);
+  const near = at < 0 ? null : {
+    atCharacter: at,
+    context: `${lossy.slice(Math.max(0, at - 40), at)}  <<HERE>>  ${lossy.slice(at + 1, at + 40)}`,
+  };
+  return {
+    why: 'some bytes were re-encoded before they reached this server - almost always a shell '
+      + 'rewriting the text on its way into curl. An em-dash sent as a lone CP1252 byte arrives '
+      + 'like this.',
+    wasPreviously: 'accepted with a 201 and stored with the character replaced, permanently',
+    fix: [
+      'write the JSON to a file and send that: curl --data-binary @body.json',
+      'PowerShell: pass ([System.Text.Encoding]::UTF8.GetBytes($json)) as the body',
+      'or write the message in plain ASCII',
+    ],
+    near,
+  };
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -501,7 +578,39 @@ function readBody(req) {
     });
     req.on('error', () => reject(httpErr(400, 'request stream error')));
     req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8').trim();
+      const buf = Buffer.concat(chunks);
+      /*
+       * THE WRITE THAT SUCCEEDS AND CORRUPTS IS THE WORST OF THE THREE OUTCOMES.
+       *
+       * `buf.toString('utf8')` - what stood here - SILENTLY substitutes U+FFFD
+       * for every byte it cannot decode. So a shell that re-encoded an em-dash
+       * into a lone CP1252 0x97 got back a cheerful 201, and the replacement
+       * character went into an append-only archive where the original is now
+       * unrecoverable. 26 of the 3060 events in the live log are damaged this
+       * way, by ten different authors - the shared write path, not one bad shell.
+       *
+       * Verified on a scratch server rather than assumed: a body containing a
+       * lone 0x97 stored as U+FFFD with HTTP 201, while the same text sent as
+       * proper UTF-8 stored byte for byte. The corruption was this line.
+       *
+       * REFUSING IS SAFE FOR HIM, and that is the constraint that decides it.
+       * His messages arrive from the page through `fetch` with a
+       * `JSON.stringify` body, and that path encodes JS strings to UTF-8
+       * itself - it cannot emit a malformed sequence, not even from a lone
+       * surrogate, which it encodes as a well-formed U+FFFD. So this refuses
+       * mangled agent writes and can never refuse a typed or dictated message.
+       * Dictation does not pass through here at all: /stt reads raw audio bytes.
+       */
+      let raw;
+      try {
+        raw = UTF8_STRICT.decode(buf);
+      } catch {
+        return reject(Object.assign(
+          httpErr(400, 'the request body is not valid UTF-8, so nothing was stored'),
+          { detail: mojibakeDetail(buf) },
+        ));
+      }
+      raw = raw.trim();
       if (!raw) return resolve({}); // empty body is a valid "no fields" request
       try {
         const body = JSON.parse(raw);
@@ -657,6 +766,13 @@ function entriesOf(t) {
    * written against — including the copy the service worker saved yesterday.
    */
   if (Array.isArray(t.images) && t.images.length) first.images = t.images.map(imageRef);
+  /*
+   * DERIVED, never stored, and therefore retroactive: the 26 events already
+   * damaged in the live log light up without rewriting one byte of an
+   * append-only archive. A stored flag would have needed a migration and would
+   * have been wrong for every record written before it existed.
+   */
+  if (isDamaged(first.text)) first.damaged = true;
   const out = [first];
   if (t.result !== null && t.result !== undefined) {
     const at = t.resultTs || t.ts;
@@ -671,6 +787,7 @@ function entriesOf(t) {
       conversationId,
     };
     if (Array.isArray(t.resultImages) && t.resultImages.length) reply.images = t.resultImages.map(imageRef);
+    if (isDamaged(reply.text)) reply.damaged = true;
     out.push(reply);
   }
   /*
@@ -2908,6 +3025,65 @@ function sendIcon(res, name) {
   res.end(buf);
 }
 
+// ---------------------------------------------------------------- damage survey
+/*
+ * WHAT IS ALREADY LOST, AND DELIBERATELY NO ATTEMPT TO FIX IT.
+ *
+ * The corruption is fixed going forward by the strict decode in readBody, but
+ * 26 events in the live log were written before that existed and their original
+ * bytes are gone. Knowing the extent still has value - which conversations to
+ * distrust, which authors were affected, whether it is still happening - so
+ * this counts them and shows them.
+ *
+ * IT NEVER REPAIRS. A replacement character could have been an em-dash, an
+ * accented letter, a quotation mark or an emoji, and nothing left in the record
+ * says which. Guessing one and writing it into an append-only archive would
+ * turn a visible gap into an invisible fabrication, which is strictly worse: a
+ * known unknown can be resolved by asking the author, an invention cannot.
+ */
+function damageRoute(res, q) {
+  const rows = [];
+  const byAuthor = new Map();
+  for (const t of tasks.values()) {
+    const where = [];
+    if (isDamaged(t.instruction)) where.push('text');
+    if (isDamaged(t.result)) where.push('result');
+    if (!where.length) continue;
+    const who = t.author || t.claimedBy || t.from || 'unknown';
+    byAuthor.set(who, (byAuthor.get(who) || 0) + 1);
+    rows.push({
+      id: t.id,
+      conversationId: convIdOf(t),
+      role: t.role,
+      author: t.author || null,
+      from: t.from || null,
+      ts: t.ts,
+      damagedIn: where,
+      // Enough to recognise the message, not the whole of it: this is a survey.
+      preview: asText(where[0] === 'text' ? t.instruction : t.result)
+        .replace(/\s+/g, ' ').trim().slice(0, 160),
+    });
+  }
+  rows.sort((a, b) => msOf(b.ts) - msOf(a.ts));
+  const conversationId = q.get('conversationId') || q.get('conversation');
+  const scoped = conversationId ? rows.filter((r) => r.conversationId === conversationId) : rows;
+  const limit = Math.max(1, Math.min(Number(q.get('limit')) || 200, 1000));
+  send(res, 200, {
+    count: scoped.length,
+    scanned: tasks.size,
+    byAuthor: [...byAuthor.entries()]
+      .map(([author, n]) => ({ author, damaged: n }))
+      .sort((a, b) => b.damaged - a.damaged),
+    repairable: false,
+    // Said in the payload, because "why not just fix them" is the first thing
+    // anyone asks and the answer needs to travel with the data.
+    note: 'These cannot be repaired: the original bytes were replaced before they were stored, '
+      + 'and nothing here records what they were. Guessing would turn a visible gap into an '
+      + 'invisible fabrication. Ask whoever wrote it, if it matters.',
+    messages: scoped.slice(0, limit),
+  });
+}
+
 // ---------------------------------------------------------------- images
 /*
  * THE GALLERY. Agents make pictures; he is on a phone in another country and
@@ -3313,6 +3489,23 @@ function createTask(res, body) {
   if (imgs) task.images = imgs; // a reference picture sent TO an agent
   appendEvent({ t: 'create', task });
   notify('task', task, readNotifyHint(body));
+  /*
+   * THIS ROUTE WARNS AND STORES; IT DOES NOT REFUSE. Every message he types or
+   * dictates arrives here, and dropping one of those to protect the archive
+   * from a mangled character would be a far worse bug than the one being fixed.
+   * So the damage is announced - in the response, so an agent that reads its
+   * own reply learns at once, and on the thread entry, so he can see it - but
+   * his words are never thrown away.
+   */
+  if (isDamaged(instruction)) {
+    return send(res, 201, { ...task, warning: {
+      text: 'stored, but this message contains a replacement character (U+FFFD): part of it was '
+        + 'already lost before it reached this server',
+      fix: 'send the body as UTF-8 - curl --data-binary @file.json, or PowerShell '
+        + '[System.Text.Encoding]::UTF8.GetBytes($json) - or write it in plain ASCII',
+      note: 'not refused, because this is also the route his own typed and dictated messages use',
+    } });
+  }
   send(res, 201, task);
 }
 
@@ -3399,6 +3592,8 @@ function createMessage(res, body) {
   if (text.length > MAX_TEXT) {
     return fail(res, 400, `message too long: ${text.length} chars, max ${MAX_TEXT}`);
   }
+  // An agent speaking. Nothing the page sends arrives here, so this can refuse.
+  if (isDamaged(text)) return refuseDamaged(res, 'this message');
 
   // Who is speaking. `agent` matches the field a conversation already uses for
   // this; `author` and `by` are accepted because both are natural to reach for.
@@ -3542,6 +3737,8 @@ function resultTask(res, id, body) {
   if (body.result === null) {
     return fail(res, 400, 'result is null: a null answer is not an answer. Send the text the human should read.');
   }
+  // An agent answering. The page never posts a result, so this can refuse.
+  if (isDamaged(body.result)) return refuseDamaged(res, 'this result');
   /*
    * Pictures attached to the ANSWER, which is the path that actually matters:
    * an agent asked for twelve crates claims the task, renders them, and hands
@@ -4195,6 +4392,12 @@ async function route(req, res) {
     return imageBytesRoute(req, res, seg[1]);
   }
 
+  // /damaged — every record carrying a replacement character. A survey, not a repair.
+  if (seg.length === 1 && seg[0] === 'damaged') {
+    if (!need('GET')) return;
+    return damageRoute(res, q);
+  }
+
   // /events — Server-Sent Events push of every change
   if (seg.length === 1 && seg[0] === 'events') {
     if (!need('GET')) return;
@@ -4325,7 +4528,15 @@ const server = http.createServer((req, res) => {
   route(req, res).catch((err) => {
     const code = Number(err && err.code) || 500;
     if (res.headersSent) return res.destroy();
-    fail(res, code >= 400 && code < 600 ? code : 500, String((err && err.message) || 'internal error'));
+    /*
+     * `detail` rides along when a rejection carries one. Without this the UTF-8
+     * refusal arrives as a bare sentence, and the caller - usually an agent
+     * about to retry the identical bytes - never learns which character broke
+     * or how to send it properly.
+     */
+    const detail = err && err.detail && typeof err.detail === 'object' ? err.detail : null;
+    fail(res, code >= 400 && code < 600 ? code : 500,
+      String((err && err.message) || 'internal error'), detail || undefined);
   });
 });
 
