@@ -396,6 +396,30 @@ function applyEvent(ev) {
     subscriptions.delete(ev.id);
   } else if (ev.t === 'pushcfg') {
     pushConfig = { ...pushConfig, ...ev.cfg };
+  } else if (ev.t === 'agent') {
+    // A self-chosen name claimed. Keyed by the FOLDED form, which is what makes
+    // two spellings that cannot be told apart the same agent rather than two.
+    if (ev.agent && typeof ev.agent.fold === 'string') agentsByFold.set(ev.agent.fold, ev.agent);
+  } else if (ev.t === 'agentpatch') {
+    const a = agentsByFold.get(ev.fold);
+    if (a) Object.assign(a, ev.patch);
+  } else if (ev.t === 'inbox') {
+    // The durable half of an addressed message. The file the agent tails is
+    // written separately, at the moment of delivery — see agentMessageRoute.
+    let box = INBOX.get(ev.fold);
+    if (!box) { box = []; INBOX.set(ev.fold, box); }
+    box.push(ev.msg);
+    while (box.length > INBOX_CAP) box.shift();
+    const a = agentsByFold.get(ev.fold);
+    if (a) { a.inboxCount = (a.inboxCount || 0) + 1; a.lastDeliveredAt = ev.msg.ts; }
+  } else if (ev.t === 'inboxack') {
+    const box = INBOX.get(ev.fold) || [];
+    const msg = box.find((m) => m.id === ev.id);
+    if (msg && !msg.ackedAt) {
+      msg.ackedAt = ev.at;
+      const a = agentsByFold.get(ev.fold);
+      if (a) { a.ackedCount = (a.ackedCount || 0) + 1; a.lastAckedAt = ev.at; }
+    }
   } else if (ev.t === 'image') {
     /*
      * One posting of one blob. The bytes live on disk under the content hash;
@@ -3084,6 +3108,669 @@ function damageRoute(res, q) {
   });
 }
 
+// ---------------------------------------------------------------- agents
+/*
+ * ADDRESSING AGENTS BY NAME, AND WAKING THEM.
+ *
+ * The diagnosis was his, and it was right: **his task queue was his front door,
+ * not a coordination layer.** Agents were discovering each other through his
+ * inbox, so every collision came from there — two agents rebasing one branch,
+ * two identical PRs, two agents on one sweep. And he could only reach the four
+ * or five coordinators holding a conversation; the workers doing the actual
+ * work were invisible and unreachable, so he talked to middlemen and got
+ * answers second-hand.
+ *
+ * Four things, in his order of priority.
+ *
+ * 1. EVERY AGENT ADDRESSABLE, AND IT PICKS ITS OWN NAME. Registration, not
+ *    assignment — which means a collision rule, because two agents will choose
+ *    the same name. See NAME_FOLD below: this is not hypothetical, "Sporefall 2"
+ *    and "Sporefall2" coexisted and were taken for one agent.
+ *
+ * 2. PUSH DELIVERY. His complaint was "some messages never picked up". A polled
+ *    endpoint cannot fix that, because AN AGENT ONLY PERCEIVES ANYTHING DURING A
+ *    TURN — a message sitting in a database is not delivered, it is merely
+ *    available. What demonstrably wakes an idle agent, verified rather than
+ *    assumed, is a blocking read that ENDS: `tail -f inbox | head -1` sits
+ *    quietly, exits the instant a line is appended, and that exit is an event
+ *    the harness delivers. So delivery here is an append to a per-agent file,
+ *    and the file is the mechanism rather than a convenience.
+ *
+ *    A detail found only by trying it: TAILING A FILE THAT DOES NOT EXIST EXITS
+ *    IMMEDIATELY, which looks exactly like a delivered message. So registering
+ *    creates the file, and boot recreates any that are missing.
+ *
+ * 3. A ROSTER HE CAN SEE, as a TREE — workers spawn workers, so depth is
+ *    arbitrary and a flat list cannot show who is under whom. Every node says
+ *    what that agent is working on, which is the whole point: it is what makes
+ *    two agents starting the same job visible BEFORE the work is wasted.
+ *
+ * 4. VISIBLE OWNERSHIP, so nobody unknowingly starts what is already held.
+ *
+ * NOTHING HERE INVENTS LIVENESS. `lastActedAt` moves only when an agent does
+ * something from inside a turn. There is no heartbeat in this section and there
+ * will not be one: a heartbeat proves a loop ticks, not that work is happening,
+ * and this file already says so twice.
+ */
+const INBOX_DIR = path.join(DATA_DIR, 'inbox');
+const MAX_AGENT_NAME = 60;
+const MAX_TASK_NOTE = 300;
+const MAX_LAST_WORDS = 600;
+const MAX_INBOX_TEXT = 4000;
+const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._'-]*$/;
+/*
+ * How long without a reported act before an agent is PRESUMED dead. Presumed,
+ * never confirmed — see deathOf(). Deliberately generous: a worker thinking
+ * hard, or waiting on a long build, reports nothing for a long time, and the
+ * cost of calling a working agent dead is higher than the cost of waiting.
+ */
+const PRESUMED_DEAD_MS = Number(process.env.PRESUMED_DEAD_MS || 30 * 60 * 1000);
+const MAX_AGENTS_REG = Number(process.env.MAX_AGENTS_REG || 500);
+
+/** @type {Map<string, object>} folded name -> agent record */
+const agentsByFold = new Map();
+/*
+ * @type {Map<string, object[]>} folded name -> messages addressed to it.
+ *
+ * The in-memory mirror of the per-agent inbox file. The FILE is the delivery
+ * mechanism and this is the queryable copy — both are written from the same
+ * event, so they cannot disagree about what was sent, only about what has been
+ * read, which is the one thing only the agent can tell us.
+ */
+const INBOX = new Map();
+const INBOX_CAP = Number(process.env.INBOX_CAP || 500); // per agent, in memory only
+
+/*
+ * THE COLLISION RULE, AND WHY IT FOLDS RATHER THAN COMPARES.
+ *
+ * Two agents picked "Sporefall 2" and "Sporefall2" and were taken for one. A
+ * rule that only rejects EXACT duplicates would have allowed both, which is how
+ * that happened. So identity is the folded form — lower-cased, with everything
+ * that is not a letter or digit removed — and the display name is whatever was
+ * typed.
+ *
+ * This buys two things at once. Registering a confusable variant of a taken
+ * name is refused, so the pair cannot exist. And ADDRESSING is forgiving: a
+ * message to "sporefall 2", "Sporefall2" or "SPOREFALL-2" all reach the same
+ * agent, which matters because he addresses these by voice from a phone.
+ */
+const NAME_FOLD = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+const inboxPath = (fold) => path.join(INBOX_DIR, `${fold}.jsonl`);
+
+function readAgentName(raw) {
+  const v = readString(raw, 'name', MAX_AGENT_NAME);
+  if (v instanceof Error) return v;
+  if (v === null) return new Error('name is required: an agent chooses its own');
+  if (!AGENT_NAME_RE.test(v)) {
+    return new Error(`invalid name "${v}": letters, digits, space, dot, dash, underscore and apostrophe only`);
+  }
+  if (!NAME_FOLD(v)) return new Error(`invalid name "${v}": it must contain at least one letter or digit`);
+  return v;
+}
+
+/** Whichever agent answers to this spelling, or null. */
+const agentByName = (name) => agentsByFold.get(NAME_FOLD(name)) || null;
+
+/*
+ * A free name near the one that was taken, so a refusal is actionable. An agent
+ * told only "taken" tends to try one more variant that folds to the same thing
+ * and be refused again.
+ */
+function suggestName(name) {
+  const base = String(name || 'agent').replace(/\s*\d+$/, '').trim() || 'agent';
+  for (let n = 2; n < 200; n++) {
+    const candidate = `${base} ${n}`;
+    if (!agentsByFold.has(NAME_FOLD(candidate))) return candidate;
+  }
+  return `${base} ${Date.now().toString(36)}`;
+}
+
+/*
+ * WHAT WE ACTUALLY KNOW ABOUT WHETHER THIS AGENT IS DEAD — in three states,
+ * because two would force an inference to wear the same badge as a fact.
+ *
+ *   confirmed — something REPORTED it finished: the agent itself, or the parent
+ *               that spawned it. First-hand, and the only kind that is a fact.
+ *   presumed  — nothing has been heard for PRESUMED_DEAD_MS and nothing ever
+ *               reported it finishing. THIS IS AN INFERENCE AND IT IS OFTEN
+ *               WRONG. A worker was declared dead on far stronger evidence than
+ *               this — no filesystem writes for 31 minutes, a reflog frozen
+ *               mid-operation, no report at all — and it resurrected an hour
+ *               later and committed useful work. Nobody reports their own
+ *               death, so this category cannot be removed; it can only be
+ *               labelled honestly.
+ *   null      — as far as anything here knows, it is alive.
+ *
+ * Note what `presumed` actually establishes: NOT WORKING RIGHT NOW. Never
+ * "gone". Every consumer gets `certain` so it cannot render the two the same,
+ * and `because` so the claim can be argued with.
+ *
+ * PRESUMED DEATH IS DERIVED, NEVER STORED, and that is what makes resurrection
+ * free: an agent that acts again is alive on its next read with nothing to undo.
+ * Only a CONFIRMED death is a record, and only that one needs exhuming.
+ */
+function deathOf(a) {
+  if (a.finished) {
+    return {
+      state: 'confirmed',
+      certain: true,
+      at: a.finished.at,
+      ok: a.finished.ok,
+      by: a.finished.by,
+      self: a.finished.by === a.name,
+      lastWords: a.finished.lastWords || null,
+      because: a.finished.by === a.name
+        ? 'it reported that it had finished'
+        : `${a.finished.by} reported that it had finished`,
+    };
+  }
+  const quietSec = secSince(a.lastActedAt);
+  if (quietSec !== null && quietSec * 1000 >= PRESUMED_DEAD_MS) {
+    return {
+      state: 'presumed',
+      /*
+       * The whole point of this field. A presumed death must never be rendered
+       * with the same marker as a confirmed one, because presuming is what got
+       * this wrong before.
+       */
+      certain: false,
+      at: null,
+      ok: null,
+      by: null,
+      self: false,
+      lastWords: a.lastActNote || null,
+      because: `nothing reported for ${Math.round(quietSec / 60)} min, and nothing ever said it finished`,
+      /*
+       * Said in the payload rather than left to each UI to remember. This
+       * establishes "not working right now" and nothing stronger; an agent that
+       * is thinking, or waiting on a long build, reports nothing either.
+       */
+      meaning: 'not working right now — not necessarily gone',
+      quietForSec: quietSec,
+    };
+  }
+  return { state: null, certain: false, at: null, ok: null, by: null, self: false, lastWords: null, because: null };
+}
+
+/*
+ * Never instrumented, or genuinely quiet? The same distinction `reporting:
+ * false` already makes for the activity feed, for the same reason: an agent
+ * that was never taught to report looks exactly like an idle one, and rendering
+ * them the same makes the roster a comfortable lie.
+ */
+function agentView(a) {
+  const death = deathOf(a);
+  const acted = secSince(a.lastActedAt);
+  return {
+    id: a.id,
+    name: a.name,
+    parent: a.parentName || null,
+    conversationId: a.conversationId || null,
+    // WHAT IT IS WORKING ON. The single most valuable field here: it is what
+    // makes two agents starting the same job visible before the work is wasted.
+    task: a.task || null,
+    registeredAt: a.registeredAt,
+    lastActedAt: a.lastActedAt || null,
+    lastActedAgoSec: acted,
+    lastActNote: a.lastActNote || null,
+    resumes: a.resumes || 0,
+    /*
+     * It registered and then never reported another thing. Distinct from quiet:
+     * an agent nobody taught to report its work is not evidence of anything,
+     * and must not be read as one that has gone silent.
+     */
+    everReported: !!a.acts,
+    acts: a.acts || 0,
+    death,
+    alive: death.state === null,
+    exhumed: a.exhumed || null,
+    inbox: {
+      waiting: (a.inboxCount || 0) - (a.ackedCount || 0),
+      delivered: a.inboxCount || 0,
+      acknowledged: a.ackedCount || 0,
+      lastDeliveredAt: a.lastDeliveredAt || null,
+      /*
+       * Delivered and never acknowledged is exactly his original complaint —
+       * "some messages never picked up" — made visible instead of inferred.
+       */
+      lastAckedAt: a.lastAckedAt || null,
+    },
+  };
+}
+
+/*
+ * The roster as a TREE, because workers spawn workers and a flat list cannot
+ * show who is under whom.
+ *
+ * Depth is arbitrary and the parent link comes from the agents themselves, so
+ * this must survive a cycle (a resumed agent naming its own descendant as
+ * parent) and a dangling parent (a parent that was never registered, or was
+ * dropped). A recursive walk without a guard would hang the whole server, and
+ * this server is his only line to every agent — so the guard is not a nicety.
+ */
+function agentTree() {
+  const all = [...agentsByFold.values()];
+  const kids = new Map();
+  const roots = [];
+  for (const a of all) {
+    const parentFold = a.parent && agentsByFold.has(a.parent) ? a.parent : null;
+    if (!parentFold) { roots.push(a); continue; }
+    if (!kids.has(parentFold)) kids.set(parentFold, []);
+    kids.get(parentFold).push(a);
+  }
+  const seen = new Set();
+  const build = (a, depth) => {
+    // A cycle, or the same agent reachable twice. Stop rather than recurse: the
+    // node is already in the tree somewhere above.
+    if (seen.has(a.fold) || depth > 32) return null;
+    seen.add(a.fold);
+    const children = (kids.get(a.fold) || [])
+      .sort((x, y) => msOf(y.lastActedAt) - msOf(x.lastActedAt))
+      .map((k) => build(k, depth + 1))
+      .filter(Boolean);
+    return { ...agentView(a), depth, children };
+  };
+  const tree = roots
+    .sort((x, y) => msOf(y.lastActedAt) - msOf(x.lastActedAt))
+    .map((r) => build(r, 0))
+    .filter(Boolean);
+  /*
+   * Anything a cycle kept out of the tree is added at the root rather than
+   * dropped. An agent that vanishes from the roster because of a bad parent
+   * link is unreachable, and unreachable is the failure this whole feature
+   * exists to end.
+   */
+  for (const a of all) {
+    if (!seen.has(a.fold)) {
+      seen.add(a.fold);
+      tree.push({ ...agentView(a), depth: 0, children: [], orphaned: true });
+    }
+  }
+  return tree;
+}
+
+/** Everything an agent does from inside a turn moves this, and nothing else does. */
+function markAct(a, note) {
+  const patch = {
+    lastActedAt: nowIso(),
+    acts: (a.acts || 0) + 1,
+  };
+  if (note) patch.lastActNote = String(note).slice(0, MAX_TASK_NOTE);
+  appendEvent({ t: 'agentpatch', fold: a.fold, patch });
+}
+
+function ensureInbox(fold) {
+  try {
+    fs.mkdirSync(INBOX_DIR, { recursive: true });
+    /*
+     * MUST EXIST BEFORE ANYONE TAILS IT. `tail -f` on a missing file exits at
+     * once, and an agent waiting on that exit reads it as "a message arrived"
+     * and wakes to an empty inbox — forever, in a tight loop. Verified the hard
+     * way. Never truncates: this is append-only and it is the delivery record.
+     */
+    if (!fs.existsSync(inboxPath(fold))) fs.writeFileSync(inboxPath(fold), '', { flag: 'a' });
+    return null;
+  } catch (err) {
+    return err;
+  }
+}
+
+/*
+ * POST /agents — an agent announcing itself, or coming back.
+ *
+ * The `key` is what makes a name STABLE ACROSS A RESUME without letting anyone
+ * else take it. Registering a free name mints one; registering a name that is
+ * already held requires it. Without that, "resume" and "impersonate" are the
+ * same request, and the roster's whole value is that a name means one agent.
+ */
+function registerAgent(res, body) {
+  const name = readAgentName(body.name);
+  if (name instanceof Error) return fail(res, 400, name.message);
+  const fold = NAME_FOLD(name);
+
+  const task = readString(body.task, 'task', MAX_TASK_NOTE);
+  if (task instanceof Error) return fail(res, 400, task.message);
+  const parentRaw = readString(body.parent, 'parent', MAX_AGENT_NAME);
+  if (parentRaw instanceof Error) return fail(res, 400, parentRaw.message);
+
+  const conversationId = readString(body.conversationId || body.conversation, 'conversationId', MAX_TITLE);
+  if (conversationId instanceof Error) return fail(res, 400, conversationId.message);
+  if (conversationId && !conversations.has(conversationId)) {
+    return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
+  }
+
+  const existing = agentsByFold.get(fold);
+  if (existing) {
+    const key = typeof body.key === 'string' ? body.key : null;
+    if (!key || key !== existing.key) {
+      /*
+       * Someone else already answers to this name, or to a spelling that cannot
+       * be told apart from it. Refused with a free name attached, because an
+       * agent told only "taken" tends to try one more variant that folds to the
+       * same thing and be refused again.
+       */
+      return fail(res, 409, `the name "${existing.name}" is already held by another agent`, {
+        name: existing.name,
+        // Named explicitly: this is the case that actually bit, and "but I
+        // typed something different" is the first thing anyone thinks.
+        note: NAME_FOLD(existing.name) === fold && existing.name !== name
+          ? `"${name}" and "${existing.name}" cannot be told apart, so they cannot both exist`
+          : 'send the key you were given at registration to resume this name',
+        suggestion: suggestName(name),
+        heldSince: existing.registeredAt,
+        holderLastActedAt: existing.lastActedAt || null,
+      });
+    }
+    // A genuine resume. Same identity, same inbox, same place in the tree.
+    const patch = { resumes: (existing.resumes || 0) + 1, lastActedAt: nowIso(), acts: (existing.acts || 0) + 1 };
+    if (task) patch.task = task;
+    if (conversationId) patch.conversationId = conversationId;
+    if (parentRaw !== null) { patch.parent = NAME_FOLD(parentRaw); patch.parentName = parentRaw; }
+    /*
+     * Coming back is proof of life, so a confirmed death is retracted here
+     * rather than left to be noticed. A row that says both "finished" and "just
+     * acted" is the contradiction this whole section exists to refuse.
+     */
+    if (existing.finished) {
+      patch.finished = null;
+      patch.exhumed = { at: nowIso(), note: 'it registered again, which is proof it is running' };
+    }
+    const err = ensureInbox(fold);
+    if (err) return fail(res, 500, `could not open the inbox: ${err.message}`);
+    appendEvent({ t: 'agentpatch', fold, patch });
+    return send(res, 200, {
+      ok: true, resumed: true, agent: agentView(agentsByFold.get(fold)),
+      key: existing.key, inboxFile: inboxPath(fold), wake: wakeRecipe(fold),
+    });
+  }
+
+  if (agentsByFold.size >= MAX_AGENTS_REG) {
+    return fail(res, 429, `too many registered agents (${agentsByFold.size}); nothing is removed automatically`);
+  }
+
+  const err = ensureInbox(fold);
+  if (err) return fail(res, 500, `could not create the inbox: ${err.message}`);
+
+  const agent = {
+    id: newId(),
+    name,
+    fold,
+    key: crypto.randomBytes(16).toString('hex'),
+    parent: parentRaw ? NAME_FOLD(parentRaw) : null,
+    parentName: parentRaw || null,
+    conversationId: conversationId || null,
+    task: task || null,
+    registeredAt: nowIso(),
+    // Registering IS an act, and the first one. It happens inside a turn.
+    lastActedAt: nowIso(),
+    lastActNote: null,
+    acts: 1,
+    resumes: 0,
+    finished: null,
+    exhumed: null,
+    inboxCount: 0,
+    ackedCount: 0,
+    lastDeliveredAt: null,
+    lastAckedAt: null,
+  };
+  appendEvent({ t: 'agent', agent });
+  send(res, 201, {
+    ok: true, resumed: false, agent: agentView(agent),
+    /*
+     * The key is returned HERE and never appears in any listing. It is the only
+     * thing standing between "resume" and "impersonate".
+     */
+    key: agent.key,
+    inboxFile: inboxPath(fold),
+    wake: wakeRecipe(fold),
+  });
+}
+
+/*
+ * How to actually be woken, handed over at registration rather than left in a
+ * document nobody reads at 3am. The command is the mechanism, not a suggestion:
+ * it blocks while there is nothing to do and EXITS on the first message, and it
+ * is that exit the harness turns into an event.
+ */
+function wakeRecipe(fold) {
+  return {
+    file: inboxPath(fold),
+    command: `tail -n 0 -f ${inboxPath(fold)} | head -1`,
+    how: 'run it as a BACKGROUND command. It blocks while the inbox is quiet and exits on the first message; that exit is what wakes you. Re-arm it each turn.',
+    why: 'a polled endpoint cannot wake an idle agent — an agent only perceives anything during a turn.',
+  };
+}
+
+/*
+ * POST /agents/:name/messages — the addressed message, and the wake.
+ *
+ * Two writes on purpose. The event log is the durable record and what
+ * GET reads back; the per-agent file is the DELIVERY, and it is the only half
+ * that can reach an agent that is not currently looking.
+ */
+function agentMessageRoute(res, name, body) {
+  const a = agentByName(name);
+  if (!a) {
+    return fail(res, 404, `no agent answers to "${name}"`, {
+      known: [...agentsByFold.values()].map((x) => x.name).slice(0, 50),
+    });
+  }
+  const text = readString(body.text !== undefined ? body.text : body.message, 'text', MAX_INBOX_TEXT);
+  if (text instanceof Error) return fail(res, 400, text.message);
+  if (!text) return fail(res, 400, 'text is required and must be a non-empty string');
+  const from = readString(body.from || body.agent || body.author, 'from', MAX_AGENT_NAME);
+  if (from instanceof Error) return fail(res, 400, from.message);
+
+  const msg = {
+    id: newId(),
+    to: a.name,
+    from: from || 'human',
+    text,
+    ts: nowIso(),
+    ackedAt: null,
+  };
+
+  /*
+   * The file first, because it is the half that wakes him — sorry, wakes IT.
+   * If this throws, nothing is recorded as delivered: a message that is in the
+   * log but never landed in the inbox is exactly the "never picked up" failure
+   * this route exists to end, and it would be invisible.
+   */
+  const err = ensureInbox(a.fold);
+  if (err) return fail(res, 500, `could not open the inbox for "${a.name}": ${err.message}`);
+  try {
+    fs.appendFileSync(inboxPath(a.fold), JSON.stringify(msg) + '\n');
+  } catch (e) {
+    return fail(res, 500, `could not deliver to "${a.name}": ${e.message}`, { file: inboxPath(a.fold) });
+  }
+
+  appendEvent({ t: 'inbox', fold: a.fold, msg });
+  send(res, 201, {
+    ok: true,
+    message: msg,
+    /*
+     * Deliberately not "delivered". The line is in the file; whether anything
+     * is tailing it is not something this server can see, and claiming
+     * otherwise would rebuild the lie the ack exists to expose.
+     */
+    written: inboxPath(a.fold),
+    acknowledged: false,
+    note: 'written to the inbox. It counts as picked up only when the agent acks it.',
+  });
+}
+
+/** The inbox read back — for a resumed agent catching up, and for the roster. */
+function agentInboxRoute(res, name, q) {
+  const a = agentByName(name);
+  if (!a) return fail(res, 404, `no agent answers to "${name}"`);
+  let list = (INBOX.get(a.fold) || []).slice();
+  const unread = q.get('unread');
+  if (unread !== null && unread !== 'false' && unread !== '0') list = list.filter((m) => !m.ackedAt);
+  const since = q.get('since');
+  if (since) {
+    const ms = parseSince(since);
+    if (ms !== null) list = list.filter((m) => msOf(m.ts) > ms);
+  }
+  const limit = Math.max(1, Math.min(Number(q.get('limit')) || 100, 500));
+  send(res, 200, {
+    agent: a.name,
+    count: Math.min(list.length, limit),
+    waiting: (INBOX.get(a.fold) || []).filter((m) => !m.ackedAt).length,
+    file: inboxPath(a.fold),
+    wake: wakeRecipe(a.fold),
+    messages: list.slice(-limit),
+  });
+}
+
+/*
+ * POST /agents/:name/messages/:id/ack — "I have this."
+ *
+ * The point of the whole exchange. Written, delivered and READ are three
+ * different states, and only the agent can report the third. Without it,
+ * "picked up" is an assumption, which is precisely what was wrong before.
+ */
+function agentAckRoute(res, name, msgId, body) {
+  const a = agentByName(name);
+  if (!a) return fail(res, 404, `no agent answers to "${name}"`);
+  const list = INBOX.get(a.fold) || [];
+  const msg = list.find((m) => m.id === msgId);
+  if (!msg) return fail(res, 404, `no message "${msgId}" in the inbox for "${a.name}"`);
+  if (msg.ackedAt) return send(res, 200, { ok: true, already: true, message: msg });
+  appendEvent({ t: 'inboxack', fold: a.fold, id: msgId, at: nowIso() });
+  // Acking happens inside a turn, so it is proof of life — the only kind trusted.
+  markAct(a, body && typeof body.note === 'string' ? body.note : `read a message from ${msg.from}`);
+  send(res, 200, { ok: true, message: list.find((m) => m.id === msgId) });
+}
+
+/*
+ * POST /agents/:name — the agent saying what it is doing now.
+ *
+ * This is the field the roster is FOR, so it is also the act that proves life.
+ * Requires the key: a roster where anyone can rewrite what another agent claims
+ * to be working on is worse than no roster, because it looks authoritative.
+ */
+function agentUpdateRoute(res, name, body) {
+  const a = agentByName(name);
+  if (!a) return fail(res, 404, `no agent answers to "${name}"`);
+  if (typeof body.key !== 'string' || body.key !== a.key) {
+    return fail(res, 403, `wrong key for "${a.name}"`, {
+      note: 'only the agent itself may say what it is working on; use the key returned when it registered',
+    });
+  }
+  const patch = { lastActedAt: nowIso(), acts: (a.acts || 0) + 1 };
+  if (body.task !== undefined) {
+    const task = readString(body.task, 'task', MAX_TASK_NOTE);
+    if (task instanceof Error) return fail(res, 400, task.message);
+    patch.task = task;
+  }
+  if (body.note !== undefined) {
+    const note = readString(body.note, 'note', MAX_TASK_NOTE);
+    if (note instanceof Error) return fail(res, 400, note.message);
+    patch.lastActNote = note;
+  }
+  if (body.conversationId !== undefined) {
+    const cid = readString(body.conversationId, 'conversationId', MAX_TITLE);
+    if (cid instanceof Error) return fail(res, 400, cid.message);
+    if (cid && !conversations.has(cid)) return fail(res, 400, `no conversation with id "${cid}"`);
+    patch.conversationId = cid;
+  }
+  // Acting again retracts a presumed death implicitly (it is derived), and a
+  // confirmed one explicitly, because both cannot be true at once.
+  if (a.finished) {
+    patch.finished = null;
+    patch.exhumed = { at: nowIso(), note: 'it reported work after being marked finished' };
+  }
+  appendEvent({ t: 'agentpatch', fold: a.fold, patch });
+  send(res, 200, { ok: true, agent: agentView(agentsByFold.get(a.fold)) });
+}
+
+/*
+ * POST /agents/:name/finished — a burial, and it must be first-hand.
+ *
+ * Either the agent itself or the PARENT that spawned it. A third party cannot
+ * know, and a tombstone for someone still alive is the exact lie the graveyard
+ * exists to cure — that has already happened here once, on evidence that felt
+ * overwhelming and was wrong.
+ *
+ * `lastWords` is usually the most useful sentence an agent ever produces, and
+ * at least one collision happened purely because nobody could tell whether an
+ * agent had stopped or was mid-task.
+ */
+function agentFinishedRoute(res, name, body) {
+  const a = agentByName(name);
+  if (!a) return fail(res, 404, `no agent answers to "${name}"`);
+  const key = typeof body.key === 'string' ? body.key : null;
+  const parent = a.parent ? agentsByFold.get(a.parent) : null;
+  const bySelf = key && key === a.key;
+  const byParent = key && parent && key === parent.key;
+  if (!bySelf && !byParent) {
+    return fail(res, 403, `only "${a.name}" or its parent may report that it finished`, {
+      parent: a.parentName || null,
+      note: 'a third party cannot know. Presumed death is derived from silence and is labelled as a guess.',
+    });
+  }
+  const lastWords = readString(body.lastWords || body.text || body.note, 'lastWords', MAX_LAST_WORDS);
+  if (lastWords instanceof Error) return fail(res, 400, lastWords.message);
+  const finished = {
+    at: nowIso(),
+    ok: typeof body.ok === 'boolean' ? body.ok : null,
+    by: bySelf ? a.name : (parent ? parent.name : a.name),
+    lastWords: lastWords || a.lastActNote || null,
+  };
+  appendEvent({ t: 'agentpatch', fold: a.fold, patch: { finished, exhumed: null } });
+  send(res, 200, { ok: true, agent: agentView(agentsByFold.get(a.fold)) });
+}
+
+/*
+ * POST /agents/:name/exhume — it came back.
+ *
+ * The dead do come back: one was declared dead here on strong evidence and
+ * resurrected an hour later with useful work. Without a way out, a headstone is
+ * permanent and a resurrected agent is in the graveyard AND working at the same
+ * time — a contradiction the UI would present as truth.
+ */
+function agentExhumeRoute(res, name, body) {
+  const a = agentByName(name);
+  if (!a) return fail(res, 404, `no agent answers to "${name}"`);
+  const note = readString(body.note, 'note', MAX_TASK_NOTE);
+  if (note instanceof Error) return fail(res, 400, note.message);
+  if (!a.finished) {
+    return send(res, 200, {
+      ok: true, already: true, agent: agentView(a),
+      note: 'it was not confirmed dead. A presumed death needs no exhuming — it lifts the moment the agent acts.',
+    });
+  }
+  appendEvent({ t: 'agentpatch', fold: a.fold, patch: {
+    finished: null,
+    exhumed: { at: nowIso(), note: note || 'exhumed' },
+    lastActedAt: nowIso(),
+    acts: (a.acts || 0) + 1,
+  } });
+  send(res, 200, { ok: true, agent: agentView(agentsByFold.get(a.fold)) });
+}
+
+/** GET /agents — the roster, flat and as a tree, plus the graveyard. */
+function agentRosterRoute(res, q) {
+  const all = [...agentsByFold.values()].map(agentView);
+  const conversationId = q.get('conversationId') || q.get('conversation');
+  const scoped = conversationId ? all.filter((a) => a.conversationId === conversationId) : all;
+  const living = scoped.filter((a) => a.alive);
+  const dead = scoped.filter((a) => !a.alive);
+  send(res, 200, {
+    count: scoped.length,
+    living: living.length,
+    // Kept apart in the payload so no client has to invent the split, and so
+    // "confirmed" and "presumed" cannot be summed into one number.
+    confirmedDead: dead.filter((a) => a.death.state === 'confirmed').length,
+    presumedDead: dead.filter((a) => a.death.state === 'presumed').length,
+    presumedAfterMin: Math.round(PRESUMED_DEAD_MS / 60000),
+    agents: scoped.sort((a, b) => msOf(b.lastActedAt) - msOf(a.lastActedAt)),
+    tree: agentTree(),
+    graveyard: dead.sort((a, b) => msOf(b.death.at || b.lastActedAt) - msOf(a.death.at || a.lastActedAt)),
+  });
+}
+
 // ---------------------------------------------------------------- images
 /*
  * THE GALLERY. Agents make pictures; he is on a phone in another country and
@@ -4376,6 +5063,49 @@ async function route(req, res) {
   }
 
   /*
+   * /agents — the roster, the tree, the graveyard, and the addressed inbox.
+   * A new top-level segment; nothing existing serves anything under it.
+   */
+  if (seg.length === 1 && seg[0] === 'agents') {
+    if (m === 'GET') return agentRosterRoute(res, q);
+    if (m === 'POST') return registerAgent(res, await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+  if (seg.length === 2 && seg[0] === 'agents') {
+    if (m === 'GET') {
+      const a = agentByName(seg[1]);
+      if (!a) return fail(res, 404, `no agent answers to "${seg[1]}"`);
+      return send(res, 200, agentView(a));
+    }
+    if (m === 'POST') return agentUpdateRoute(res, seg[1], await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+  if (seg.length === 3 && seg[0] === 'agents') {
+    if (seg[2] === 'messages') {
+      if (m === 'GET') return agentInboxRoute(res, seg[1], q);
+      if (m === 'POST') return agentMessageRoute(res, seg[1], await readBody(req));
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
+    if (seg[2] === 'finished') {
+      if (!need('POST')) return;
+      return agentFinishedRoute(res, seg[1], await readBody(req));
+    }
+    if (seg[2] === 'exhume') {
+      if (!need('POST')) return;
+      return agentExhumeRoute(res, seg[1], await readBody(req));
+    }
+    return fail(res, 404, `no such agent route "${seg[2]}"`, {
+      known: ['messages', 'finished', 'exhume'],
+    });
+  }
+  // /agents/:name/messages/:id/ack — "I have this", the only report of a read
+  // that anything can trust, because only the agent can make it.
+  if (seg.length === 5 && seg[0] === 'agents' && seg[2] === 'messages' && seg[4] === 'ack') {
+    if (!need('POST')) return;
+    return agentAckRoute(res, seg[1], seg[3], await readBody(req));
+  }
+
+  /*
    * /images — the gallery. A new top-level segment that shadows nothing: no
    * existing route, icon name or static path begins with it, so every request
    * that worked before this feature still reaches exactly the handler it did.
@@ -4556,6 +5286,18 @@ ensureDefaultConv(); // before replay, so a rename of it replays onto something
 const replayed = replay();
 ensureDefaultConv(); // ...and after, in case the log somehow removed it
 if (PUSH_ON) vapidKeys = loadVapidKeys(); // after mkdir: the key file lives in DATA_DIR
+/*
+ * Every registered agent must have an inbox file waiting, even one that has
+ * never been written to.
+ *
+ * `tail -f` on a file that does not exist EXITS IMMEDIATELY — which an agent
+ * waiting on that exit reads as "a message arrived", waking to an empty inbox
+ * and re-arming, forever, in a tight loop. This server restarts itself whenever
+ * server.js changes, i.e. constantly, so a DATA_DIR that lost its inbox
+ * directory between restarts would do that to every agent at once. Recreated,
+ * never truncated: an existing inbox is an append-only delivery record.
+ */
+for (const fold of agentsByFold.keys()) ensureInbox(fold);
 server.listen(PORT, HOST, () => {
   const c = counts();
   /*
