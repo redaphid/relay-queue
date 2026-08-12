@@ -783,6 +783,106 @@
     background: var(--line); border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in;
   }
   .galempty { padding: 16px 0; color: var(--muted); font-size: 14px; }
+
+  /* ---- the agent roster, the tree, and the graveyard ----
+   *
+   * Borrows the status view's vocabulary for the same reason the activity panel
+   * does: this is the same kind of screen answering a different question, and a
+   * separate look would imply the two disagree about what a row means.
+   */
+  #agview {
+    position: fixed; inset: 0; z-index: 33;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #agview[hidden] { display: none; }
+  #agclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #agopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #10b981, #14b8a6, #0ea5e9) 1 / 0 0 0 4px;
+  }
+  /* Talking to one agent directly, which is the thing he asked for by name. */
+  #agsend { display: flex; gap: 6px; align-items: center; margin: 8px 0 4px; }
+  #agsend[hidden] { display: none; }
+  #agto { flex: 0 0 auto; font-size: 13px; font-weight: 650; }
+  #agtext {
+    flex: 1 1 auto; min-width: 0; min-height: 44px; padding: 0 10px;
+    /* 16px is a floor, not a preference: below it iOS zooms the whole page on
+       focus and he then has to pinch back out to reach anything. */
+    font: inherit; font-size: 16px; color: var(--fg);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  }
+  #agsendbtn {
+    flex: 0 0 auto; min-height: 44px; padding: 0 14px; font: inherit;
+    color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+  }
+  #agmsg { margin: 4px 0; font-size: 13px; color: var(--muted); }
+
+  .agsec { margin-top: 14px; font-size: 13px; font-weight: 650; color: var(--muted); }
+  .agrow {
+    display: flex; gap: 8px; align-items: flex-start;
+    padding: 8px 0; border-top: 1px solid var(--line);
+  }
+  .agrow:first-of-type { border-top: 0; }
+  .agicon { flex: 0 0 auto; width: 22px; height: 22px; margin-top: 1px; }
+  .agicon svg { width: 22px; height: 22px; display: block; }
+  .agbody { flex: 1 1 auto; min-width: 0; }
+  .agname { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+  /* WHAT IT IS WORKING ON. The reason the roster is worth having: two agents on
+     one job are visible here before the work is wasted, not after. */
+  .agtask { font-size: 13px; color: var(--fg); opacity: .85; overflow-wrap: anywhere; }
+  .agwhen { margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .agbtn {
+    flex: 0 0 auto; min-height: 36px; padding: 0 10px; font: inherit; font-size: 13px;
+    color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+  }
+  .agwait { color: #b45309; font-weight: 650; }
+  .agrow.alive .agicon svg { fill: #1a7f4b; }
+  /*
+   * NEVER REPORTED ANYTHING. Not idle, not broken — unknown. Dashed, like the
+   * activity panel's unknown state, because every solid marker on these screens
+   * means a measurement was actually taken.
+   */
+  .agrow.mute .agicon svg { fill: var(--muted); }
+  .agrow.mute .agname { color: var(--muted); }
+
+  /* ---- the graveyard ---- */
+  #agyard { margin-top: 10px; }
+  .stone {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 10px; margin-top: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .stone .agicon svg { fill: var(--muted); }
+  .stone .agname { font-weight: 650; }
+  .stonehow { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  /* LAST WORDS. Usually the most useful sentence an agent ever produces, and at
+     least one collision happened because nobody could tell whether an agent had
+     stopped or was mid-task. */
+  .stonesaid {
+    margin-top: 6px; padding-left: 8px; font-size: 13px; font-style: italic;
+    border-left: 2px solid var(--line); overflow-wrap: anywhere;
+  }
+  /*
+   * A PRESUMED death must never look like a confirmed one. This is the exact
+   * mistake the graveyard exists to cure — a tombstone for someone still alive,
+   * which has already happened here on evidence that felt overwhelming. Dashed
+   * and faded: an inference, wearing an inference's clothes.
+   */
+  .stone.presumed { border-style: dashed; opacity: .78; }
+  .stone.presumed .agname::after { content: ' ?'; color: var(--muted); }
+  .yardempty { padding: 12px 0; color: var(--muted); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -839,6 +939,7 @@
       <button id="statusopen" type="button">Status &mdash; is anything listening?</button>
       <button id="actopen" type="button">Activity &mdash; what are its subagents doing?</button>
       <button id="galopen" type="button">Gallery &mdash; every picture in this conversation</button>
+      <button id="agopen" type="button">Agents &mdash; who is working, and on what</button>
     </nav>
   </div>
 
@@ -882,6 +983,28 @@
       <button id="galclose" type="button" aria-label="Close">&times;</button>
     </div>
     <div id="galbody" aria-live="polite"><div id="galgrid"></div></div>
+  </section>
+
+  <!--
+    Who is out there, what each one is working on, and who spawned whom. The
+    tree is the shape that matters: workers spawn workers, so a flat list cannot
+    show who is under whom, and "two agents on the same job" is only obvious
+    when they are side by side.
+  -->
+  <section id="agview" hidden aria-label="Agents">
+    <div class="prow">
+      <b id="agtitle">Agents</b>
+      <button id="agclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="agsend" hidden>
+      <span id="agto"></span>
+      <input id="agtext" type="text" placeholder="Say something to it&hellip;" maxlength="4000"
+        autocomplete="off" autocapitalize="sentences" enterkeyhint="send">
+      <button id="agsendbtn" type="button">Send</button>
+    </div>
+    <p id="agmsg"></p>
+    <div id="agbody" aria-live="polite"></div>
+    <div id="agyard"></div>
   </section>
 
   <!--
@@ -3296,6 +3419,298 @@
   }
 
   /*
+   * ---------------------------------------------------------------- agents
+   *
+   * Who is out there, what each is working on, who spawned whom, and who is
+   * dead. He could previously reach the four or five coordinators holding a
+   * conversation and nothing else, so he talked to middlemen about work he
+   * could not see.
+   *
+   * The artwork is DRAWN HERE, in code, for the same reason icons.js draws the
+   * home-screen icons rather than shipping PNGs: it keeps public/ text-only and
+   * the pictures reviewable as a diff. A feature that added an image route is
+   * not the one that should start committing binaries.
+   */
+  var AG_ART = {
+    /* Alive and reporting: a solid mark. Something measured it. */
+    live: { d: 'M12 5a7 7 0 1 1 0 14 7 7 0 0 1 0-14z', rule: 'nonzero' },
+    /* Registered and never reported again. A ring: an outline, not a reading. */
+    mute: { d: 'M12 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z', rule: 'evenodd' },
+    /*
+     * PRESUMED dead — so, a ghost. Not merely a joke: a ghost is exactly the
+     * right amount of certainty. It may be wandering about perfectly alive, and
+     * one of these did precisely that, coming back an hour later with useful
+     * work after being declared dead on far stronger evidence than silence.
+     */
+    ghost: {
+      d: 'M12 2a7 7 0 0 0-7 7v12l2.3-2 2.3 2 2.4-2 2.3 2 2.4-2 2.3 2V9a7 7 0 0 0-7-7z'
+        + 'M9.4 9.6a1.3 1.3 0 1 1 0 2.6 1.3 1.3 0 0 1 0-2.6z'
+        + 'M14.6 9.6a1.3 1.3 0 1 1 0 2.6 1.3 1.3 0 0 1 0-2.6z',
+      rule: 'evenodd',
+    },
+    /* CONFIRMED dead. Something first-hand reported it. A stone, and a grave. */
+    stone: {
+      d: 'M12 2a6 6 0 0 0-6 6v12h12V8a6 6 0 0 0-6-6z'
+        + 'M11 6h2v3h3v2h-3v5h-2v-5H8V9h3V6z'
+        + 'M4 21h16v2H4z',
+      rule: 'evenodd',
+    },
+  };
+
+  function agIcon(kind) {
+    var art = AG_ART[kind] || AG_ART.mute;
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    var p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', art.d);
+    p.setAttribute('fill-rule', art.rule);
+    svg.appendChild(p);
+    var box = el('span', 'agicon');
+    box.appendChild(svg);
+    return box;
+  }
+
+  var agView = document.getElementById('agview');
+  var agBody = document.getElementById('agbody');
+  var agYard = document.getElementById('agyard');
+  var agTitle = document.getElementById('agtitle');
+  var agOpenBtn = document.getElementById('agopen');
+  var agCloseBtn = document.getElementById('agclose');
+  var agSendBox = document.getElementById('agsend');
+  var agToLabel = document.getElementById('agto');
+  var agText = document.getElementById('agtext');
+  var agSendBtn = document.getElementById('agsendbtn');
+  var agMsg = document.getElementById('agmsg');
+  var agOn = false;
+  var agTo = null;
+  var AG_MS = 10000;
+  var agTimer = null;
+
+  function agSay(text, bad) {
+    if (!agMsg) return;
+    agMsg.textContent = text || '';
+    agMsg.style.color = bad ? '#b42318' : 'var(--muted)';
+  }
+
+  /** Point the composer at one agent. This is the direct line he asked for. */
+  function agAddress(name) {
+    agTo = name;
+    if (agToLabel) agToLabel.textContent = '→ ' + name;
+    if (agSendBox) agSendBox.hidden = false;
+    agSay('');
+    if (agText) { try { agText.focus(); } catch (e) { /* no matter */ } }
+  }
+
+  function agSendNow() {
+    if (!agTo || !agText) return;
+    var text = String(agText.value || '').trim();
+    if (!text) { agSay('Nothing to send.'); return; }
+    var to = agTo;
+    agSay('Sending…');
+    fetch('/agents/' + encodeURIComponent(to) + '/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: text, from: 'human' }),
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, b: b }; }); })
+      .then(function (r) {
+        if (!r.ok) { agSay((r.b && r.b.error) || 'Could not send.', true); return; }
+        agText.value = '';
+        /*
+         * Deliberately not "delivered". The line is in its inbox; whether
+         * anything is listening is not something this page can see, and saying
+         * otherwise would rebuild the very assumption the ack exists to expose.
+         */
+        agSay('In ' + to + '’s inbox. It counts as picked up when it acks.');
+        loadAgents();
+      })
+      .catch(function (err) { agSay('Could not send — ' + ((err && err.message) || 'network error'), true); });
+  }
+
+  function agRow(a) {
+    var kind = a.alive ? (a.everReported ? 'live' : 'mute') : (a.death.certain ? 'stone' : 'ghost');
+    var row = el('div', 'agrow ' + (a.alive ? (a.everReported ? 'alive' : 'mute') : 'dead'));
+    row.style.paddingLeft = ((a.depth || 0) * 14) + 'px';
+    row.appendChild(agIcon(kind));
+
+    var body = el('div', 'agbody');
+    body.appendChild(el('div', 'agname', a.name));
+    /*
+     * The field the whole roster is for. "Not saying" is written out rather
+     * than left blank, because a blank line reads as "nothing to do" and this
+     * one means "nobody taught it to say".
+     */
+    body.appendChild(el('div', 'agtask', a.task || 'not saying what it is working on'));
+
+    var bits = [];
+    if (a.lastActedAgoSec !== null && a.lastActedAgoSec !== undefined) {
+      bits.push((a.everReported ? 'acted ' : 'registered ') + rel(a.lastActedAt));
+    }
+    if (a.inbox && a.inbox.waiting > 0) bits.push(a.inbox.waiting + ' unread');
+    if (a.resumes) bits.push('resumed ' + a.resumes + '×');
+    var when = el('div', 'agwhen');
+    when.textContent = bits.join(' · ');
+    if (a.inbox && a.inbox.waiting > 0) when.className += ' agwait';
+    body.appendChild(when);
+    row.appendChild(body);
+
+    var btn = el('button', 'agbtn', 'Message');
+    btn.type = 'button';
+    btn.addEventListener('click', function () { agAddress(a.name); });
+    row.appendChild(btn);
+    return row;
+  }
+
+  function agWalk(nodes, into) {
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n || !n.alive) { if (n && n.children) agWalk(n.children, into); continue; }
+      into.appendChild(agRow(n));
+      if (n.children && n.children.length) agWalk(n.children, into);
+    }
+  }
+
+  function stoneFor(a) {
+    var presumed = !a.death.certain;
+    var box = el('div', 'stone' + (presumed ? ' presumed' : ''));
+    box.appendChild(agIcon(presumed ? 'ghost' : 'stone'));
+    var body = el('div', 'agbody');
+    body.appendChild(el('div', 'agname', a.name));
+    body.appendChild(el('div', 'agtask', a.task || 'nobody recorded what it was doing'));
+    /*
+     * Confirmed and presumed are worded as differently as they are rendered.
+     * The inference must read as an inference even to someone skimming.
+     */
+    body.appendChild(el('div', 'stonehow', presumed
+      ? 'presumed — ' + (a.death.because || 'it went quiet') + '. ' +
+        (a.death.meaning || 'not working right now — not necessarily gone')
+      : 'confirmed — ' + (a.death.because || 'it finished') +
+        (a.death.at ? ', ' + rel(a.death.at) : '')));
+    if (a.death.lastWords) {
+      var said = el('div', 'stonesaid');
+      said.textContent = '“' + a.death.lastWords + '”';
+      body.appendChild(said);
+    }
+    box.appendChild(body);
+    /*
+     * THE WAY BACK OUT. Without it a headstone is permanent, and a resurrected
+     * agent is in the graveyard and working at the same time — a contradiction
+     * this page would be presenting as fact. A presumed death needs no button:
+     * it is derived, so it lifts the moment the agent does anything.
+     */
+    if (!presumed) {
+      var up = el('button', 'agbtn', 'It’s alive');
+      up.type = 'button';
+      up.addEventListener('click', function () {
+        fetch('/agents/' + encodeURIComponent(a.name) + '/exhume', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ note: 'exhumed from the page' }),
+        }).then(loadAgents).catch(function () { agSay('Could not exhume it.', true); });
+      });
+      box.appendChild(up);
+    } else {
+      var poke = el('button', 'agbtn', 'Poke');
+      poke.type = 'button';
+      poke.addEventListener('click', function () { agAddress(a.name); });
+      box.appendChild(poke);
+    }
+    return box;
+  }
+
+  function renderAgents(data) {
+    if (!agBody || !agYard) return;
+    agBody.textContent = '';
+    agYard.textContent = '';
+    var tree = (data && data.tree) || [];
+    var living = (data && data.living) || 0;
+
+    if (!tree.length) {
+      agBody.appendChild(el('div', 'galempty',
+        'No agent has registered yet. An agent joins by POSTing its chosen name to /agents.'));
+    } else {
+      agBody.appendChild(el('div', 'agsec',
+        living === 1 ? '1 agent working' : living + ' agents working'));
+      agWalk(tree, agBody);
+      if (!agBody.querySelector('.agrow')) {
+        agBody.appendChild(el('div', 'galempty', 'Everyone who registered is in the graveyard.'));
+      }
+    }
+
+    var yard = (data && data.graveyard) || [];
+    agYard.appendChild(el('div', 'agsec', 'Graveyard'));
+    if (!yard.length) {
+      agYard.appendChild(el('div', 'yardempty', 'Nobody has died yet. Long may it continue.'));
+      return;
+    }
+    /*
+     * Said out loud, above the stones: the two kinds of death are counted
+     * apart and must never be added together. One is a report; the other is a
+     * guess this page has been wrong about before.
+     */
+    var conf = data.confirmedDead || 0;
+    var pres = data.presumedDead || 0;
+    agYard.appendChild(el('div', 'stonehow',
+      conf + ' confirmed · ' + pres + ' presumed after ' + (data.presumedAfterMin || 0) +
+      ' min of silence. A presumed stone is a guess, not a finding.'));
+    for (var i = 0; i < yard.length; i++) agYard.appendChild(stoneFor(yard[i]));
+  }
+
+  function loadAgents() {
+    return fetch('/agents', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function (data) { if (agOn) renderAgents(data); })
+      .catch(function (err) {
+        if (!agOn || !agBody) return;
+        agBody.textContent = '';
+        if (agYard) agYard.textContent = '';
+        /*
+         * An empty roster that failed to load is indistinguishable from having
+         * no agents, and he would conclude nobody is working. Say which it is.
+         */
+        agBody.appendChild(el('div', 'galempty',
+          'Could not read the roster — ' + ((err && err.message) || 'network error') +
+          '. That is not the same as there being nobody out there; it means this view does not know.'));
+      });
+  }
+
+  function showAgents() {
+    if (!agView) return;
+    agOn = true;
+    agView.hidden = false;
+    if (agTitle) agTitle.textContent = 'Agents';
+    closeDrawer();
+    if (agBody) { agBody.textContent = ''; agBody.appendChild(el('div', 'galempty', 'Looking…')); }
+    loadAgents();
+    clearInterval(agTimer);
+    agTimer = setInterval(function () { if (agOn && !document.hidden) loadAgents(); }, AG_MS);
+    uiSync();
+  }
+
+  function hideAgents() {
+    if (!agView || !agOn) return;
+    agOn = false;
+    agView.hidden = true;
+    clearInterval(agTimer);
+    agTimer = null;
+    uiSync();
+  }
+
+  function initAgents() {
+    if (agOpenBtn) agOpenBtn.addEventListener('click', showAgents);
+    if (agCloseBtn) agCloseBtn.addEventListener('click', hideAgents);
+    if (agSendBtn) agSendBtn.addEventListener('click', agSendNow);
+    if (agText) agText.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); agSendNow(); }
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !lightOn) hideAgents();
+    });
+  }
+
+  /*
    * ---------------------------------------------------------------- alerts
    *
    * Three ways to get his attention, each a fallback for the one above:
@@ -5454,7 +5869,7 @@
      * while the one underneath is still open, so back keeps consuming layers
      * one at a time and only leaves the app when the last is gone.
      */
-    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!lightOn;
+    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!agOn || !!lightOn;
     if (open === uiMarked) return; // includes drawer -> status, which re-uses it
     if (open) {
       // Same URL on purpose: a marker must not look like a conversation change,
@@ -5481,6 +5896,7 @@
     // uiSync(), which sees the marker spent — and re-arms it if a lower layer
     // is still open.
     if (lightOn) hideLightbox();
+    else if (agOn) hideAgents();
     else if (galOn) hideGallery();
     else if (actOn) hideActivity();
     else if (statusOn) hideStatus();
@@ -5514,6 +5930,13 @@
     initGallery();
   } catch (err) {
     logClient('gallery-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // The roster is how he reaches a worker at all, but it is still not the
+  // messaging app, so it gets the identical guard.
+  try {
+    initAgents();
+  } catch (err) {
+    logClient('agents-init-failed', { message: (err && err.message) || String(err) });
   }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is
