@@ -305,6 +305,36 @@ async function main() {
       !/"key"|"fold"/.test(JSON.stringify(thread)));
     check('an unknown agent route 404s with the known ones listed',
       /known/.test(JSON.stringify(await get('/agents/Zora/nonsense'))));
+
+    /*
+     * The lock that existed and enforced nothing. Four tasks in the live log
+     * are `done` with `claimedBy: null`. Tightening it is only safe if it stays
+     * narrow, so the cases that must KEEP working are asserted first and there
+     * are more of them than the case being closed.
+     */
+    console.log('\ntwo agents on one job — the claim finally means something');
+    const t1 = await post('/tasks', { text: 'unclaimed, answered directly' });
+    check('a result on an UNCLAIMED task is still accepted, exactly as before',
+      (await post(`/tasks/${t1.body.id}/result`, { result: 'done' })).status === 200);
+
+    const t2 = await post('/tasks', { text: 'claimed, answered with no name given' });
+    await post(`/tasks/${t2.body.id}/claim`, { by: 'Rune' });
+    check('*** a result with no `by` is still accepted, so nothing that worked breaks ***',
+      (await post(`/tasks/${t2.body.id}/result`, { result: 'done' })).status === 200);
+
+    const t3 = await post('/tasks', { text: 'claimed by one, answered by another' });
+    await post(`/tasks/${t3.body.id}/claim`, { by: 'Rune' });
+    const stolen = await post(`/tasks/${t3.body.id}/result`, { result: 'I did it', by: 'Fen' });
+    check('*** answering a task another agent holds is REFUSED ***', stolen.status === 409,
+      `HTTP ${stolen.status}`);
+    check('...naming who actually holds it', stolen.body.claimedBy === 'Rune', stolen.body.claimedBy);
+    check('...and saying what to do about it', /one of you should stop|take it over/.test(stolen.body.hint || ''),
+      stolen.body.hint);
+    check('...and nothing was written', (await get(`/tasks/${t3.body.id}`)).status === 'claimed');
+    check('the holder can still answer its own',
+      (await post(`/tasks/${t3.body.id}/result`, { result: 'mine', by: 'Rune' })).status === 200);
+    check('...and the ownership is visible in the thread, not only in the queue',
+      (await get('/thread')).entries.some((e) => e.claimedBy === 'Rune'));
   } finally {
     await srv.stop();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows may hold it */ }
