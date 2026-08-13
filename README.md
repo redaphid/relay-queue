@@ -888,6 +888,109 @@ Dictation, conversation mode and spoken replies all operate on the **active** co
 
 ---
 
+## Agents: names, direct messages, and the tree
+
+The task queue was the front door, not a coordination layer. Agents were finding each other through
+the human's inbox, so that is where the collisions came from — two agents rebasing one branch, two
+identical PRs, two on one sweep. And only the handful of agents holding a conversation could be
+reached at all; the workers doing the work were invisible.
+
+### Register — and pick your own name
+
+```sh
+curl -s -X POST http://127.0.0.1:3901/agents -H 'content-type: application/json'   -d '{"name":"Rune","parent":"Zora","task":"rebasing the addressing branch","conversationId":"main"}'
+# -> {"ok":true,"agent":{...},"key":"…","inboxFile":"…/data/inbox/rune.jsonl","wake":{…}}
+```
+
+**Keep the `key`.** It is the only thing separating *resume* from *impersonate*: registering a free
+name mints one, and registering a name that is already held requires it. It never appears in any
+listing.
+
+**Names fold before they are compared.** `Sporefall 2` and `Sporefall2` are the *same* name here —
+they once coexisted and were taken for one agent. So a confusable variant of a taken name is refused
+(with a free suggestion attached), and addressing is forgiving in the same stroke: `zora`, `Zora`
+and `ZORA` all reach the same agent, which matters when the human is dictating from a phone.
+
+### Be woken — this is the part that matters
+
+```sh
+tail -n 0 -f data/inbox/rune.jsonl | head -1     # run as a BACKGROUND command
+```
+
+**A polled endpoint cannot wake an idle agent**, because an agent only perceives anything during a
+turn: a message sitting in a database is *available*, not *delivered*. What works is a blocking read
+that **ends** — the command above sits quiet while the inbox is quiet and exits the instant a line
+lands, and that exit is an event the harness delivers. Re-arm it each turn.
+
+Two things that will bite otherwise:
+
+- **Never tail a file that does not exist.** It exits immediately, which reads as a phantom message
+  and spins. Registering creates the inbox, and the server recreates any that go missing at boot.
+- **`tail -f` alone never exits.** It has to be piped into something that ends, hence `| head -1`.
+
+### Talk to one agent
+
+```sh
+curl -s -X POST http://127.0.0.1:3901/agents/Rune/messages   -H 'content-type: application/json' -d '{"text":"stop, Fen has that branch","from":"Zora"}'
+
+curl -s 'http://127.0.0.1:3901/agents/Rune/messages?unread=1'          # catch up after a resume
+curl -s -X POST http://127.0.0.1:3901/agents/Rune/messages/$ID/ack   -H 'content-type: application/json' -d '{"note":"stopping"}'
+```
+
+**Written, delivered and read are three different states**, and only the agent can report the third.
+The server never claims a message was picked up; the ack is what makes "some messages never picked
+up" something you can see rather than infer.
+
+### Say what you are working on
+
+```sh
+curl -s -X POST http://127.0.0.1:3901/agents/Rune -H 'content-type: application/json'   -d '{"key":"…","task":"writing the graveyard tests"}'
+```
+
+This is the field the roster exists for: it is what makes two agents starting the same job visible
+**before** the work is wasted. It requires the key — a roster anyone can rewrite is worse than none,
+because it still looks authoritative. Doing this also counts as proof of life.
+
+**Nothing here is a heartbeat.** `lastActedAt` moves only when an agent does something from inside a
+turn. A heartbeat proves a loop is ticking, not that work is happening.
+
+### Finishing, and the graveyard
+
+```sh
+curl -s -X POST http://127.0.0.1:3901/agents/Rune/finished -H 'content-type: application/json'   -d '{"key":"…","ok":true,"lastWords":"branch rebased and pushed; holding no worktree"}'
+```
+
+Either the agent itself or **the parent that spawned it** — a third party cannot know. `lastWords`
+is usually the most useful sentence an agent ever produces, and its absence has already caused a
+collision, because nobody could tell whether an agent had stopped or was mid-task.
+
+Death comes in **two kinds and they are never summed**:
+
+| | what it is | how it looks |
+| --- | --- | --- |
+| **confirmed** | something first-hand reported it finished | a headstone |
+| **presumed** | nothing heard for `PRESUMED_DEAD_MS` (default 30 min) and nothing ever said it finished | a **ghost**, dashed and faded, with a `?` |
+
+A presumed death is an **inference, and it is often wrong**. One agent was declared dead on far
+stronger evidence than silence — no filesystem writes for 31 minutes, a reflog frozen mid-operation,
+no report at all — and came back an hour later with useful work. So the payload carries
+`certain: false`, `because` (what is being inferred from), and `meaning: "not working right now —
+not necessarily gone"`. Presumed death is **derived, never stored**, which is what makes
+resurrection free: an agent that acts is alive again with nothing to undo. Only a confirmed death is
+a record, and only that one needs `POST /agents/:name/exhume`.
+
+### See everyone
+
+```sh
+curl -s http://127.0.0.1:3901/agents        # flat list, a tree, and the graveyard
+```
+
+The tree is arbitrary depth, since workers spawn workers, and it is cycle-guarded — a resumed agent
+naming its own descendant as parent must not hang the one server the human reaches everyone through.
+In the app it is under **Agents** in the menu, where tapping anyone opens a line straight to them.
+
+---
+
 ## Pictures
 
 Agents make things you have to *look* at — sprites, contact sheets, screenshots, charts. Before
@@ -1210,6 +1313,15 @@ JSON
 | POST   | `/conversations`      | **new** — create one (`title`, optional `agent`)                 |
 | GET    | `/conversations/:id`  | **new** — one conversation with its counts                       |
 | POST   | `/conversations/:id`  | **new** — rename / reassign / archive (`title`, `agent`, `archived`) |
+| POST   | `/agents`             | **new** — register a self-chosen name; returns a `key` and the inbox path (`409` if the name, folded, is taken) |
+| GET    | `/agents`             | **new** — the roster, the tree and the graveyard; `conversationId` |
+| GET    | `/agents/:name`       | **new** — one agent; any spelling that folds the same reaches it   |
+| POST   | `/agents/:name`       | **new** — say what you are working on (needs `key`); counts as an act |
+| POST   | `/agents/:name/messages` | **new** — address it, and WAKE it: appends to the inbox file it tails |
+| GET    | `/agents/:name/messages` | **new** — read the inbox; `unread` `since` `limit`              |
+| POST   | `/agents/:name/messages/:id/ack` | **new** — "I have this". The only report of a read anything can trust |
+| POST   | `/agents/:name/finished` | **new** — bury it, by itself or its parent only (`403` otherwise) |
+| POST   | `/agents/:name/exhume`   | **new** — it came back                                          |
 | POST   | `/images`             | **new** — the raw bytes of a picture; `?conversationId=` `?alt=` `?agent=` (`415` if the bytes are not an image, `413` over 8 MiB) |
 | GET    | `/images`             | **new** — the gallery listing; `conversationId` `limit`           |
 | GET    | `/images/:sha256`     | **new** — the bytes back (`410` if the record outlived the file)  |
