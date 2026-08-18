@@ -1,0 +1,14 @@
+{
+  "name": "relay-share",
+  "compatibility_date": "2026-08-01",
+  "pages_build_output_dir": "public",
+  // Snapshots live here, keyed by their unguessable slug. KV rather than R2
+  // because a snapshot is one small immutable document, read far more often
+  // than written, and KV reads are served from the edge next to the reader.
+  "kv_namespaces": [
+    {
+      "binding": "SHARES",
+      "id": "2a32b492e4ef4288a4db1c35cdc6bf29"
+    }
+  ]
+}
