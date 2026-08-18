@@ -11,6 +11,12 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 // The home-screen icons, drawn and PNG-encoded rather than committed as blobs.
 const icons = require('./icons.js');
+/*
+ * Publishing a conversation as a public snapshot. It COPIES rather than
+ * proxies, because he asked for a link that works when this machine is off —
+ * see the header of share.js for why a tunnel cannot answer that.
+ */
+const share = require('./share.js');
 
 const NAME = 'relay-queue';
 const VERSION = '1.5.0';
@@ -207,6 +213,25 @@ const conversations = new Map();
  * is the one thing the append-only text can never be rewritten to express.
  */
 const checks = new Map();
+/*
+ * Where a conversation is currently published, if it is: conversationId ->
+ * { slug, url, sharedAt, ... }. Keyed by conversation so that re-sharing
+ * overwrites the snapshot in place and every link he has already sent keeps
+ * working. Absence means not shared; revoking deletes the row.
+ */
+const shares = new Map();
+/*
+ * Which attached pictures he has chosen, keyed by THREAD ENTRY id exactly as
+ * `checks` is, and for the same reason: a task carries two independent image
+ * sets — the references sent WITH it and the renders sent BACK — and they must
+ * be selectable separately. Value: { [index]: { on, by, at } }.
+ *
+ * The message is the source of truth for WHICH pictures are on offer; these
+ * events are the source of truth for WHICH ONE HE PICKED. Neither is a copy of
+ * the other, so they cannot drift, and a revised set of candidates is a new
+ * message that correctly starts with nothing chosen.
+ */
+const picks = new Map();
 let logFd = null;
 let mutations = 0; // bumped on every applied event; memoisation keys off it
 
@@ -426,6 +451,21 @@ function applyEvent(ev) {
     let row = checks.get(ev.entryId);
     if (!row) { row = {}; checks.set(ev.entryId, row); }
     row[String(ev.index)] = { on: !!ev.on, by: ev.by || null, at: ev.at };
+  } else if (ev.t === 'pick') {
+    /*
+     * One choice. `exclusive` is how single-select stays consistent no matter
+     * which client wrote it: the whole row is replaced rather than the caller
+     * being trusted to un-pick the others, so a replay and a live tap agree.
+     */
+    let row = picks.get(ev.entryId);
+    if (!row || (ev.exclusive && ev.on)) { row = {}; picks.set(ev.entryId, row); }
+    row[String(ev.index)] = { on: !!ev.on, by: ev.by || null, at: ev.at };
+  } else if (ev.t === 'share') {
+    // Publishing is durable state: after a restart the UI must still know the
+    // conversation is public and still be able to take it down.
+    if (ev.share && ev.share.conversationId) shares.set(ev.share.conversationId, ev.share);
+  } else if (ev.t === 'unshare') {
+    shares.delete(ev.conversationId);
   }
   // An unknown `t` is ignored, as it always has been: a log written by a newer
   // build replays on an older one without tripping it.
@@ -441,6 +481,7 @@ function appendEvent(ev) {
   // Push to live pages, post-durability.
   if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
   else if (ev.t === 'sub' || ev.t === 'unsub' || ev.t === 'pushcfg') { /* not thread state; nothing to stream */ }
+  else if (ev.t === 'share' || ev.t === 'unshare') { /* publication state, not thread content; the panel reads it on open */ }
   else if (ev.t === 'check') broadcast(taskIdOfEntry(ev.entryId));
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
   // An agent acting is what clears the deadman banner, and it must clear at once
@@ -624,6 +665,13 @@ const imageRef = (blob) => {
   return {
     id: blob,
     url: `/images/${blob}`,
+    /*
+     * Where to open the bytes, spelled for the host — agents read pictures off
+     * the disk, and a URL alone leaves them describing "an attachment" they
+     * never opened. Computed at read time, never logged, so it stays true if
+     * the data directory moves.
+     */
+    path: hostImagePath(blob),
     type: meta.type || null,
     width: meta.width === undefined ? null : meta.width,
     height: meta.height === undefined ? null : meta.height,
@@ -678,6 +726,22 @@ function entriesOf(t) {
    * `since=<rev>` would otherwise never be told, and his second device would sit
    * showing a stale list until something unrelated happened in the thread.
    */
+  /*
+   * Selectable pictures ride along with the entry so the page can draw the
+   * picker without a second request, and a pick moves `rev` for the same reason
+   * a tick does: a client polling since=<rev> would otherwise never be told,
+   * and his other device would sit showing a stale choice.
+   */
+  for (const e of out) {
+    const pl = pickListOf(e.id);
+    if (!pl) continue;
+    e.selection = { mode: pl.mode, total: pl.total, picked: pl.picked, decided: pl.decided, items: pl.items };
+    const prow = picks.get(e.id);
+    if (!prow) continue;
+    let latest = msOf(e.rev);
+    for (const k of Object.keys(prow)) latest = Math.max(latest, msOf(prow[k].at));
+    e.rev = new Date(latest).toISOString();
+  }
   for (const e of out) {
     const row = checks.get(e.id);
     if (!row) continue;
@@ -795,6 +859,121 @@ function checklistOf(entryId) {
     remaining: out.length - done,
     items: out,
   };
+}
+
+// ---------------------------------------------------------------- picking
+/*
+ * SELECTABLE IMAGES.
+ *
+ * The problem this solves, in his words: agents generate candidates and then
+ * ask him to pick in prose, so choosing a chair seed means typing "p2-1005" on
+ * a phone. A picture already carries a label — the `alt` it was uploaded with —
+ * so selection reports THAT, never an array index. An agent reading
+ * `selected: 2` has learned nothing; `selected: ["p2-1005"]` is the answer.
+ *
+ * Modes, declared by whoever posts the pictures:
+ *   "one"  — radio. Picking one clears the rest. For "choose a seed".
+ *   "many" — checkboxes. For "which of these are any good".
+ *   "none" — not selectable at all.
+ * Unset, a message with TWO OR MORE pictures is "many" and a lone picture is
+ * "none". A single screenshot should not sprout a checkbox, and a set of
+ * candidates should be tappable even when the agent forgot to say so — which is
+ * the failure that would put him back to typing seeds by hand.
+ */
+const PICK_MODES = ['one', 'many', 'none'];
+
+function readPickMode(raw) {
+  if (raw === undefined || raw === null) return null;
+  const v = String(raw).toLowerCase().trim();
+  if (PICK_MODES.indexOf(v) < 0) return new Error(`select must be one of ${PICK_MODES.join(', ')}`);
+  return v;
+}
+
+/** The pictures an entry id names, with the mode and defaults declared for them. */
+function imagesOfEntry(entryId) {
+  const id = String(entryId || '');
+  const isReply = /:r$/.test(id);
+  const task = tasks.get(taskIdOfEntry(id));
+  if (!task) return null;
+  const ids = isReply ? task.resultImages : task.images;
+  if (!Array.isArray(ids) || !ids.length) return null;
+  const declared = (isReply ? task.resultImageSelected : task.imageSelected) || [];
+  let mode = isReply ? task.resultImageSelect : task.imageSelect;
+  if (!mode) mode = ids.length >= 2 ? 'many' : 'none';
+  return {
+    task,
+    ids,
+    mode,
+    declared,
+    role: isReply ? 'agent' : (task.role === 'agent' ? 'agent' : 'user'),
+  };
+}
+
+/**
+ * The live state of one entry's selectable pictures, or null when there are
+ * none or they are not selectable. Shaped like checklistOf on purpose.
+ */
+function pickListOf(entryId) {
+  const found = imagesOfEntry(entryId);
+  if (!found || found.mode === 'none') return null;
+  const row = picks.get(String(entryId)) || {};
+  let picked = 0;
+  const items = found.ids.map((blob, index) => {
+    const ref = imageRef(blob);
+    const rec = row[String(index)];
+    const selected = rec ? !!rec.on : found.declared.indexOf(blob) >= 0;
+    if (selected) picked++;
+    return {
+      index,
+      id: blob,
+      // What an agent should quote back at him. The alt is the label the
+      // uploader chose; without one there is nothing better than the position.
+      label: ref.alt || `picture ${index + 1}`,
+      url: ref.url,
+      path: ref.path,
+      width: ref.width,
+      height: ref.height,
+      selected,
+      /*
+       * Exactly the distinction `source` draws on a checklist item: "declared"
+       * means the message was posted that way, "picked" means HE tapped it.
+       * Without this an agent cannot tell its own suggested default from his
+       * decision, and would act on a choice he never made.
+       */
+      source: rec ? 'picked' : 'declared',
+      by: rec ? rec.by || null : null,
+      at: rec ? rec.at || null : null,
+    };
+  });
+  return {
+    entryId: String(entryId),
+    taskId: found.task.id,
+    conversationId: convIdOf(found.task),
+    role: found.role,
+    mode: found.mode,
+    total: items.length,
+    picked,
+    // The answer to "what did he choose", in the form worth reading.
+    selected: items.filter((i) => i.selected).map((i) => ({ index: i.index, id: i.id, label: i.label })),
+    // True only once he has actually touched it: "nothing chosen yet" and "he
+    // chose none of them" are different answers and must not be confused.
+    decided: items.some((i) => i.source === 'picked'),
+    items,
+  };
+}
+
+/** Every selectable image set in the queue. Optionally one conversation. */
+function allPickLists(conversationId) {
+  const out = [];
+  for (const t of tasks.values()) {
+    if (isInternal(t)) continue;
+    if (conversationId && convIdOf(t) !== conversationId) continue;
+    for (const entryId of [t.id, `${t.id}:r`]) {
+      const pl = pickListOf(entryId);
+      if (pl) out.push(pl);
+    }
+  }
+  return out;
 }
 
 /** Every checklist in the queue, newest task last. Optionally one conversation. */
@@ -937,6 +1116,94 @@ function queueCheckNotice(conversationId, entryId, index, label, on) {
   if (rec.timer) clearTimeout(rec.timer);
   rec.timer = setTimeout(() => flushCheckNotice(conversationId), CHECK_SETTLE_MS);
   if (rec.timer.unref) rec.timer.unref(); // never hold the process open for this
+}
+
+/*
+ * The same settle-then-tell machinery checklists use, for the same reasons: a
+ * burst of taps while he compares eight seeds must land as ONE message, and the
+ * half that actually wakes the coordinator is a PENDING task in the
+ * conversation. Nothing here pushes or speaks — he did this himself, with his
+ * thumb, seconds ago.
+ */
+const PICK_CHANNEL = 'picks';
+/** conversationId -> { timer, changes: Map<string, {entryId, index, label, on}> } */
+const pickNotices = new Map();
+
+function pickNoticeText(changes) {
+  const lines = [];
+  const on = changes.filter((c) => c.on);
+  const off = changes.filter((c) => !c.on);
+  if (on.length) lines.push(`Picked: ${on.map((c) => safeLabel(c.label)).join('; ')}`);
+  if (off.length) lines.push(`Un-picked: ${off.map((c) => safeLabel(c.label)).join('; ')}`);
+  for (const entryId of new Set(changes.map((c) => c.entryId))) {
+    const pl = pickListOf(entryId);
+    if (!pl) continue;
+    const chosen = pl.selected.map((s) => safeLabel(s.label));
+    lines.push(`Images ${entryId} (${pl.mode}): ${pl.picked}/${pl.total} chosen` +
+      (chosen.length ? ` — ${chosen.join('; ')}` : ' — none'));
+  }
+  return lines.join('\n').slice(0, MAX_TEXT);
+}
+
+function flushPickNotice(conversationId) {
+  const rec = pickNotices.get(conversationId);
+  if (!rec) return;
+  pickNotices.delete(conversationId);
+  if (rec.timer) clearTimeout(rec.timer);
+  const changes = [...rec.changes.values()];
+  if (!changes.length) return;
+  const body = pickNoticeText(changes);
+  const ts = nowIso();
+
+  // 1. The durable, thread-free record: GET /messages?channel=picks&since=…
+  appendEvent({
+    t: 'create',
+    task: {
+      id: newId(),
+      role: 'agent',
+      instruction: body,
+      from: 'picks',
+      author: 'picks',
+      ts,
+      status: 'done',
+      claimedBy: null, claimedAt: null, result: null, resultTs: null,
+      relayed: true, relayedAt: ts,
+      visibility: 'internal',
+      channel: PICK_CHANNEL,
+      conversationId: `#${PICK_CHANNEL}`,
+      about: conversationId,
+    },
+  });
+
+  // 2. The wake-up. Only a pending task in the conversation rouses its
+  //    coordinator, so this is the half that makes "Claude can see it" true.
+  if (conversations.has(conversationId)) {
+    const ts2 = nowIso();
+    appendEvent({
+      t: 'create',
+      task: {
+        id: newId(),
+        role: DEFAULT_ROLE, // his action, not an agent's
+        conversationId,
+        instruction: body,
+        from: 'picks',
+        ts: ts2,
+        status: 'pending',
+        claimedBy: null, claimedAt: null, result: null, resultTs: null,
+        relayed: false, relayedAt: null,
+      },
+    });
+  }
+}
+
+function queuePickNotice(conversationId, entryId, index, label, on) {
+  let rec = pickNotices.get(conversationId);
+  if (!rec) { rec = { timer: null, changes: new Map() }; pickNotices.set(conversationId, rec); }
+  // Keyed by item, so picking and un-picking before it settles is one net change.
+  rec.changes.set(`${entryId}#${index}`, { entryId, index, label, on });
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => flushPickNotice(conversationId), CHECK_SETTLE_MS);
+  if (rec.timer.unref) rec.timer.unref();
 }
 
 function threadEntries(conversationId) {
@@ -3080,10 +3347,45 @@ function readImageBody(req, max) {
 }
 
 /** The public shape. `url` is derived, never stored, so it cannot go stale. */
-const imageView = (im) => ({ ...im, url: `/images/${im.blob}` });
+const imageView = (im) => ({ ...im, url: `/images/${im.blob}`, path: hostImagePath(im.blob) });
 
 function imagePath(blob) {
   return path.join(IMAGE_DIR, blob);
+}
+
+/*
+ * The same file, named the way the REST of this machine can open it.
+ *
+ * Agents do not run in here. They run on the host, and the host knows this
+ * directory by a different name — the container sees /app/data because
+ * D:/projects/relay-queue is bind-mounted at /app. Handing an agent the
+ * container's spelling sends it to a file that does not exist, and it will
+ * report the picture as broken rather than the path as wrong.
+ *
+ * HOST_DATA_DIR is that other name, from the environment or — because data/ is
+ * the one writable mount and editing the environment means recreating a
+ * container that has live coordinators attached — from data/host.json.
+ * Unconfigured, on bare node where there is only one spelling, this is the
+ * identity function and nothing changes.
+ */
+const HOST_DATA_DIR = (() => {
+  if (process.env.HOST_DATA_DIR) return process.env.HOST_DATA_DIR;
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'host.json'), 'utf8'));
+    if (j && typeof j.dataDir === 'string' && j.dataDir) return j.dataDir;
+  } catch { /* absent or unreadable: the two spellings are simply the same */ }
+  return null;
+})();
+function hostImagePath(blob) {
+  if (!HOST_DATA_DIR) return imagePath(blob);
+  // Joined by hand rather than with path.join: the host separator is not
+  // necessarily this process's separator, and a POSIX container has to be able
+  // to spell a Windows path. Separators are normalised so the result is not the
+  // half-and-half "D:/a/b\images\x" that Windows accepts but nobody wants to
+  // paste anywhere.
+  const sep = /^[A-Za-z]:[\\/]/.test(HOST_DATA_DIR) ? '\\' : '/';
+  const base = HOST_DATA_DIR.replace(/[\\/]+$/, '').replace(/[\\/]/g, sep);
+  return base + sep + 'images' + sep + blob;
 }
 
 /*
@@ -3278,9 +3580,28 @@ function readImages(raw) {
 // ---------------------------------------------------------------- handlers
 function createTask(res, body) {
   // `text` is the UI's field name and an alias for `instruction`; both are accepted.
-  const instruction = typeof body.text === 'string' ? body.text : body.instruction;
-  if (typeof instruction !== 'string' || !instruction.trim()) {
-    return fail(res, 400, 'instruction (alias: text) is required and must be a non-empty string');
+  const instruction = typeof body.text === 'string'
+    ? body.text
+    : (typeof body.instruction === 'string' ? body.instruction : '');
+  /*
+   * Read first, because whether an empty caption is allowed depends on it: on a
+   * phone the ordinary gesture is to send the photo and say nothing, and
+   * refusing that reads as "the upload failed" when the upload worked.
+   */
+  const imgs = readImages(body.images);
+  if (imgs instanceof Error) return fail(res, 400, imgs.message);
+  /*
+   * How a poster declares selectability: `select` is "one" | "many" | "none",
+   * and `selected` pre-marks its own suggestion — which reads back as
+   * source:"declared" so an agent can never mistake its own default for his
+   * decision.
+   */
+  const mode = readPickMode(body.select);
+  if (mode instanceof Error) return fail(res, 400, mode.message);
+  const preset = readImages(body.selected);
+  if (preset instanceof Error) return fail(res, 400, preset.message);
+  if (!instruction.trim() && !(imgs && imgs.length)) {
+    return fail(res, 400, 'instruction (alias: text) is required and must be a non-empty string, unless the message carries images');
   }
   if (instruction.length > MAX_TEXT) {
     return fail(res, 400, `message too long: ${instruction.length} chars, max ${MAX_TEXT}`);
@@ -3293,8 +3614,6 @@ function createTask(res, body) {
   if (!conversations.has(conversationId)) {
     return fail(res, 400, `no conversation with id "${conversationId}"`, { conversationId });
   }
-  const imgs = readImages(body.images);
-  if (imgs instanceof Error) return fail(res, 400, imgs.message);
   const task = {
     id: newId(),
     role: DEFAULT_ROLE, // server-set, never taken from the client
@@ -3311,6 +3630,8 @@ function createTask(res, body) {
     relayedAt: null,
   };
   if (imgs) task.images = imgs; // a reference picture sent TO an agent
+  if (imgs && mode) task.imageSelect = mode;
+  if (imgs && preset) task.imageSelected = preset.filter((b) => imgs.indexOf(b) >= 0);
   appendEvent({ t: 'create', task });
   notify('task', task, readNotifyHint(body));
   send(res, 201, task);
@@ -3356,6 +3677,49 @@ function setCheckRoute(res, entryId, body) {
   });
   queueCheckNotice(cl.conversationId, String(entryId), index, before.label, body.on);
   return send(res, 200, { changed: true, checklist: checklistOf(entryId) });
+}
+
+/*
+ * POST /tasks/:entryId/picks — one picture chosen or unchosen.
+ *
+ * Idempotent by value, exactly as the checkbox route is: the page retries this
+ * after being offline, and a retry must never toggle a choice he made once.
+ */
+function setPickRoute(res, entryId, body) {
+  const pl = pickListOf(entryId);
+  if (!pl) {
+    return fail(res, 404, `no selectable images on entry "${entryId}"`, {
+      hint: 'the entry must carry attached images and must not be select:"none". '
+        + 'Remember the id is the THREAD ENTRY: "<taskId>" for a message, "<taskId>:r" for a result.',
+    });
+  }
+  const index = Number(body.index);
+  if (!Number.isInteger(index) || index < 0 || index >= pl.total) {
+    return fail(res, 400, `index must be an integer 0..${pl.total - 1}`, { total: pl.total });
+  }
+  if (typeof body.on !== 'boolean') return fail(res, 400, 'on is required and must be true or false');
+  const by = readString(body.by !== undefined ? body.by : body.who, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  const before = pl.items[index];
+  if (before.selected === body.on && before.source === 'picked') {
+    return send(res, 200, { changed: false, selection: pickListOf(entryId) });
+  }
+
+  // Single-select is enforced HERE rather than in the page, so every client —
+  // his phone, his laptop, an agent — ends up with the same one chosen.
+  const exclusive = pl.mode === 'one' && body.on === true;
+  appendEvent({
+    t: 'pick',
+    entryId: String(entryId),
+    index,
+    on: body.on,
+    exclusive,
+    by: by || 'web',
+    at: nowIso(),
+  });
+  queuePickNotice(pl.conversationId, String(entryId), index, before.label, body.on);
+  return send(res, 200, { changed: true, selection: pickListOf(entryId) });
 }
 
 /** Is this claim old enough that another agent may take it? See CLAIM_LEASE_MS. */
@@ -3409,6 +3773,10 @@ function createMessage(res, body) {
   const to = readString(body.to, 'to', MAX_AUTHOR);
   if (to instanceof Error) return fail(res, 400, to.message);
   const imgs = readImages(body.images);
+  const pickMode = readPickMode(body.select);
+  if (pickMode instanceof Error) return fail(res, 400, pickMode.message);
+  const pickPreset = readImages(body.selected);
+  if (pickPreset instanceof Error) return fail(res, 400, pickPreset.message);
   if (imgs instanceof Error) return fail(res, 400, imgs.message);
 
   const channelRaw = readString(body.channel, 'channel', MAX_CHANNEL);
@@ -3433,6 +3801,13 @@ function createMessage(res, body) {
   };
   if (to) task.to = to;
   if (imgs) task.images = imgs;
+  /*
+   * Selectability, declared by the agent offering the pictures. This is the
+   * busiest of the three write paths for it: "here are five seeds, pick one"
+   * is an agent speaking, not answering a task.
+   */
+  if (imgs && pickMode) task.imageSelect = pickMode;
+  if (imgs && pickPreset) task.imageSelected = pickPreset.filter((b) => imgs.indexOf(b) >= 0);
 
   if (internal) {
     const channel = channelRaw === null ? DEFAULT_CHANNEL : channelRaw;
@@ -3552,8 +3927,14 @@ function resultTask(res, id, body) {
   const imgs = readImages(body.images);
   if (imgs instanceof Error) return fail(res, 400, imgs.message);
   // A result may be posted straight to a pending task; no claim required.
+  const mode = readPickMode(body.select);
+  if (mode instanceof Error) return fail(res, 400, mode.message);
+  const preset = readImages(body.selected);
+  if (preset instanceof Error) return fail(res, 400, preset.message);
   const patch = { status: 'done', result: body.result, resultTs: nowIso() };
   if (imgs) patch.resultImages = imgs;
+  if (imgs && mode) patch.resultImageSelect = mode;
+  if (imgs && preset) patch.resultImageSelected = preset.filter((b) => imgs.indexOf(b) >= 0);
   appendEvent({ t: 'patch', id, patch });
   notify('result', task, readNotifyHint(body));
   send(res, 200, task);
@@ -4112,7 +4493,25 @@ async function route(req, res) {
       }
       return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
     }
-    return fail(res, 404, `no such conversation route "${seg[2]}"`, { known: ['stop-ack', 'activity'] });
+    /*
+     * /conversations/:id/share — GET the current state and the preflight of
+     * what would become public, POST to publish or refresh, DELETE to revoke.
+     * The heavy lifting is in share.js; everything it may touch is handed to
+     * it here rather than reached for, the same boundary push.js has.
+     */
+    if (seg[2] === 'share') {
+      const conv = conversations.get(seg[1]);
+      if (!conv) return fail(res, 404, `no conversation with id "${seg[1]}"`);
+      const ctx = {
+        conv, entries: threadEntries(seg[1]), shares, blobs, imagePath,
+        DATA_DIR, appendEvent, send, fail, nowIso,
+      };
+      if (m === 'GET') return share.stateRoute(res, ctx);
+      if (m === 'POST') return share.publishRoute(res, ctx, await readBody(req));
+      if (m === 'DELETE') return share.revokeRoute(res, ctx);
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST, DELETE' });
+    }
+    return fail(res, 404, `no such conversation route "${seg[2]}"`, { known: ['stop-ack', 'activity', 'share'] });
   }
 
   // /status — is anything actually listening?
@@ -4289,7 +4688,18 @@ async function route(req, res) {
     return send(res, 200, { count: list.length, checklists: list });
   }
 
-  // /tasks/:id/(claim|result|relayed|checks)
+  // /picks — every selectable image set, or those in one conversation. The
+  // "what has he chosen" question, answerable in one call without the thread.
+  if (seg.length === 1 && seg[0] === 'picks') {
+    if (!need('GET')) return;
+    const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+    let list = allPickLists(conv || null);
+    const undecided = q.get('undecided');
+    if (undecided !== null && undecided !== 'false' && undecided !== '0') list = list.filter((p) => !p.decided);
+    return send(res, 200, { count: list.length, picks: list });
+  }
+
+  // /tasks/:id/(claim|result|relayed|checks|picks)
   if (seg.length === 3 && seg[0] === 'tasks') {
     const [, id, action] = seg;
     if (action === 'checks') {
@@ -4299,6 +4709,15 @@ async function route(req, res) {
         return send(res, 200, cl);
       }
       if (m === 'POST') return setCheckRoute(res, id, await readBody(req));
+      return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+    }
+    if (action === 'picks') {
+      if (m === 'GET') {
+        const pl = pickListOf(id);
+        if (!pl) return fail(res, 404, `no selectable images on entry "${id}"`);
+        return send(res, 200, pl);
+      }
+      if (m === 'POST') return setPickRoute(res, id, await readBody(req));
       return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
     }
     if (action === 'claim' || action === 'result' || action === 'relayed') {

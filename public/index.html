@@ -407,6 +407,28 @@
     -webkit-appearance: none; appearance: none;
   }
   #conn.show + #spk { margin-left: 8px; }
+  /*
+     Share lives in the header because the drawer was not a home for it: below
+     the conversation list, it sat 625px past the bottom of the screen and he
+     reported the feature as simply missing. Same 40px shape as its neighbours.
+  */
+  #hshare {
+    position: relative; flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px; margin-left: 8px; padding: 0;
+    color: var(--muted); background: transparent;
+    border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #hshare svg { width: 20px; height: 20px; fill: currentColor; pointer-events: none; }
+  /* Lit when this conversation is currently published, so "is this public?" is
+     answerable at a glance rather than by opening the panel. */
+  #hshare.on { color: var(--accent); border-color: var(--accent); }
+  #hshare.on::after {
+    content: ''; position: absolute; top: -3px; right: -3px;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--accent); border: 2px solid var(--panel);
+  }
   #spk svg { width: 20px; height: 20px; fill: currentColor; pointer-events: none; }
   #spk.on { color: var(--accent); border-color: var(--accent); }
   /* Muted is drawn struck through, the same language the blocked mic uses. */
@@ -646,11 +668,20 @@
   }
   #voice.live #vstop { display: inline-flex; align-items: center; }
 
+  /*
+     Two rows, not one: the tools on top, the box he types in below at full
+     width. Inline, the three 48px buttons and Send left the textarea 114px
+     wide on a 390px screen — 29% of it — and a narrow box wraps early, so it
+     also grew TALLER than the two-row layout it replaced. Widening the input
+     buys back vertical space rather than spending it.
+  */
   #composer {
-    flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end;
+    flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px;
     padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom));
     background: var(--panel); border-top: 1px solid var(--line);
   }
+  #tools { display: flex; gap: 8px; align-items: center; }
+  #entry { display: flex; gap: 8px; align-items: flex-end; }
   #mic, #convo {
     position: relative;
     flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
@@ -676,11 +707,82 @@
   #convo.on { color: #fff; background: var(--rec); border-color: var(--rec); }
   /* Muted while the agent is talking — steady blue, not the recording red. */
   #convo.gated { color: #fff; background: var(--accent); border-color: var(--accent); animation: none; }
+  /* ---- attaching pictures ----
+     #attach is a sibling of the mic and wears the same 48px shape, because it
+     is the same KIND of thing: another way to put something into a message. */
+  #attach {
+    position: relative;
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 48px; height: 48px; padding: 0;
+    color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 15px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #attach svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
+  /* iOS zooms the whole page when a form control under 16px takes focus, and
+     the zoom does not come back. This one is hidden and cannot be focused, so
+     it is safe today — but a file input defaults to 13.3px, and leaving that
+     in place would arm the trap for whoever un-hides it. mobile-selftest
+     checks every field for exactly this. */
+  #filepick { font-size: 16px; }
+  #attach:disabled { opacity: .5; }
+  #attach.busy { color: #fff; background: var(--accent); border-color: var(--accent); }
+  /*
+     The tray of what is about to be sent. It sits ABOVE the composer and inside
+     the same fixed bottom block, so it rides up with the keyboard instead of
+     hiding behind it — the mistake that made a search box unusable elsewhere.
+  */
+  #tray {
+    flex: 0 0 auto; display: flex; gap: 8px; align-items: center;
+    padding: 8px 10px 0; background: var(--panel);
+    overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch;
+  }
+  #tray[hidden] { display: none; }
+  .thumb {
+    position: relative; flex: 0 0 auto; width: 80px; height: 80px;
+    border-radius: 12px; overflow: hidden; border: 1px solid var(--line); background: var(--bg);
+  }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* 44px of tap area, drawn as a 26px dot. The target is what the thumb needs;
+     the dot is what the picture needs. */
+  .thumb .x {
+    position: absolute; top: 0; right: 0; width: 44px; height: 44px; padding: 0;
+    display: flex; align-items: flex-start; justify-content: flex-end;
+    background: transparent; border: 0; cursor: pointer; -webkit-appearance: none; appearance: none;
+  }
+  .thumb .x i {
+    display: flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; margin: 3px 3px 0 0;
+    font-style: normal; font-size: 17px; line-height: 1; color: #fff;
+    background: rgba(0,0,0,.62); border-radius: 50%;
+  }
+  .thumb.bad { border-color: var(--bad, #dc2626); }
+  .thumb .err {
+    position: absolute; inset: auto 0 0 0; padding: 2px 4px;
+    font-size: 10px; line-height: 1.2; color: #fff; background: rgba(220,38,38,.92);
+  }
+  .thumb .spin { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45); color: #fff; font-size: 11px; }
+  /* Dropping a file anywhere on the thread. No hover states anywhere here —
+     there is no hover on the device this is for; this only shows mid-drag. */
+  body.dropping #thread { outline: 3px dashed var(--accent); outline-offset: -6px; }
   #input {
     flex: 1 1 auto; min-width: 0;
     font-family: inherit; font-size: 16px; line-height: 1.4;
     resize: none; overflow-y: auto;
-    min-height: 48px; max-height: 40vh; padding: 12px;
+    /*
+       Two lines at rest. The keyboard covers half the screen, so the few lines
+       above it are the whole of what he can see of what he is saying; one line
+       meant a sentence scrolled out of view as he typed it.
+       16px x 1.4 = 22.4 per line, plus 24 of padding.
+    */
+    /*
+       40vh MINUS the tools row above it. The budget belongs to the composer as
+       a whole, not to the textarea: leaving this at a flat 40vh after moving
+       the icons onto their own line pushed Send below the bottom of the
+       screen once a long dictated draft grew the box, with the keyboard up.
+    */
+    min-height: 70px; max-height: calc(40vh - 56px); padding: 12px;
     color: var(--fg); background: var(--bg);
     border: 1px solid var(--line); border-radius: 15px;
   }
@@ -783,6 +885,151 @@
     background: var(--line); border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in;
   }
   .galempty { padding: 16px 0; color: var(--muted); font-size: 14px; }
+
+  /* ---- choosing between pictures ----
+     Sized for judging artwork one-handed in the dark: one big image, a label
+     that stays put, one unmistakable commit button, and a filmstrip for the
+     rest. Selection is never carried by colour alone — every chosen state also
+     has a tick glyph and a solid ring. */
+  .picker { margin-top: 8px; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--panel); }
+  .pk-stage {
+    position: relative; display: flex; align-items: center; justify-content: center;
+    /* A neutral bed so a 2000x560 comparison sheet letterboxes instead of being
+       cropped. Aspect ratios here are wild and must all survive. */
+    background: var(--code); min-height: 180px;
+  }
+  .pk-big {
+    display: block; max-width: 100%; max-height: 46vh; width: auto; height: auto;
+    /* contain, never cover: cropping a sprite lineup to a square defeats the
+       entire point of showing it large. */
+    object-fit: contain; cursor: zoom-in;
+  }
+  .pk-nav {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    width: 44px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 22px; line-height: 1; color: #fff; background: rgba(0,0,0,.5);
+    border: 0; border-radius: 50%; cursor: pointer; -webkit-appearance: none; appearance: none;
+  }
+  .pk-prev { left: 6px; } .pk-next { right: 6px; }
+  .pk-nav[disabled] { opacity: .3; }
+  .pk-count {
+    position: absolute; top: 8px; right: 8px; padding: 3px 9px;
+    font-size: 12px; font-variant-numeric: tabular-nums; color: #fff;
+    background: rgba(0,0,0,.6); border-radius: 999px;
+  }
+  /* The "this one is chosen" mark on the big image. Glyph AND ring AND fill. */
+  .pk-mark {
+    position: absolute; top: 8px; left: 8px; display: none;
+    align-items: center; gap: 5px; padding: 4px 10px 4px 8px;
+    font-size: 13px; font-weight: 650; color: #fff; background: #16a34a;
+    border-radius: 999px;
+  }
+  .picker.on .pk-mark { display: inline-flex; }
+  .picker.on .pk-stage { box-shadow: inset 0 0 0 4px #16a34a; }
+  .pk-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+  .pk-label {
+    flex: 1 1 auto; min-width: 0; font-size: 15px; font-weight: 650;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .pk-choose {
+    flex: 0 0 auto; min-height: 48px; padding: 0 16px;
+    font: inherit; font-size: 15px; font-weight: 650;
+    color: #fff; background: var(--accent); border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .pk-choose.on { background: #16a34a; }
+  .pk-choose[disabled] { opacity: .6; }
+  .pk-strip {
+    display: flex; gap: 6px; padding: 0 10px 8px; overflow-x: auto;
+    overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch;
+  }
+  .pk-thumb {
+    position: relative; flex: 0 0 auto; width: 64px; height: 64px; padding: 0;
+    background: var(--code); border: 2px solid transparent; border-radius: 10px;
+    overflow: hidden; cursor: pointer; -webkit-appearance: none; appearance: none;
+  }
+  .pk-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* Where you ARE (dashed) is deliberately a different language from what you
+     CHOSE (solid + tick), so the two can never be read for one another. */
+  .pk-thumb.here { border-color: var(--fg); border-style: dashed; }
+  .pk-thumb.on { border-color: #16a34a; border-style: solid; }
+  .pk-thumb.on::after {
+    content: '\2713'; position: absolute; right: 2px; bottom: 1px;
+    width: 18px; height: 18px; display: flex; align-items: center; justify-content: center;
+    font-size: 12px; color: #fff; background: #16a34a; border-radius: 50%;
+  }
+  .pk-sum { padding: 0 10px 10px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .pk-sum b { color: var(--fg); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  /* ---- sharing ----
+     Sized for a thumb on a 390px screen: every control is full width and at
+     least 48px tall, and nothing here is revealed by hover, because there is
+     no hover on the device this is for. */
+  #shareview {
+    position: fixed; inset: 0; z-index: 33;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #shareview[hidden] { display: none; }
+  #shareclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #sharetitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #shareopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #06b6d4, #3b82f6, #8b5cf6) 1 / 0 0 0 4px;
+  }
+  #sharebody { padding-bottom: 8px; }
+  .shsec { margin: 14px 0 0; }
+  .shwarn {
+    margin: 12px 0 0; padding: 12px; border-radius: 12px; font-size: 14px; line-height: 1.5;
+    background: #fff7ed; color: #7c2d12; border: 1px solid #fed7aa;
+  }
+  .shwarn b { display: block; margin-bottom: 4px; }
+  .shfound {
+    margin: 10px 0 0; padding: 12px; border-radius: 12px; font-size: 13px; line-height: 1.5;
+    background: #fef2f2; color: #991b1b; border: 1px solid #fecaca;
+  }
+  .shfound ul { margin: 6px 0 0; padding-left: 18px; }
+  .shnote { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .shfacts { margin: 10px 0 0; font-size: 14px; }
+  .shfacts div { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .shfacts span:last-child { color: var(--muted); text-align: right; }
+  .shbtn {
+    margin-top: 10px; width: 100%; min-height: 48px; padding: 0 14px;
+    font: inherit; font-size: 15px; font-weight: 600; color: #fff;
+    background: var(--accent); border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .shbtn[disabled] { opacity: .55; }
+  .shbtn.ghost { color: var(--fg); background: var(--panel); border: 1px solid var(--line); }
+  .shbtn.danger { color: #fff; background: #dc2626; }
+  /* Deliberately NOT the conversation accent. The accent is whatever hue this
+     conversation hashes to, and landing on green would read as the safe,
+     default action for the one button here that cannot be fully undone. */
+  .shbtn.publish { color: #fff; background: #b45309; }
+  .shurl {
+    margin-top: 10px; width: 100%; min-height: 48px; padding: 10px 12px;
+    font: inherit; font-size: 13px; color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px; word-break: break-all;
+    -webkit-appearance: none; appearance: none;
+  }
+  .shlive {
+    margin: 10px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+    background: var(--accent-soft); color: var(--fg); border: 1px solid var(--line);
+  }
+  @media (prefers-color-scheme: dark) {
+    .shwarn { background: #2a1a0d; color: #fdba74; border-color: #7c2d12; }
+    .shfound { background: #2a1113; color: #fca5a5; border-color: #7f1d1d; }
+  }
 </style>
 </head>
 <body>
@@ -794,6 +1041,9 @@
     <b id="title">relay</b><span id="conn">offline &mdash; retrying</span>
     <button id="spk" type="button" aria-label="Spoken replies are off" title="Spoken replies are off" aria-pressed="false">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4 4 0 0 0-2.5-3.7v7.4a4 4 0 0 0 2.5-3.7zM13 3.2v2.1a6.8 6.8 0 0 1 0 13.4v2.1a8.8 8.8 0 0 0 0-17.6z"/></svg>
+    </button>
+    <button id="hshare" type="button" aria-label="Share this conversation" title="Share this conversation">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 16.08a2.9 2.9 0 0 0-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11A2.99 2.99 0 1 0 15 5c0 .24.04.47.09.7L8.04 9.81a3 3 0 1 0 0 4.38l7.12 4.16c-.05.21-.08.43-.08.65a2.92 2.92 0 1 0 2.92-2.92z"/></svg>
     </button>
   </header>
 
@@ -810,16 +1060,36 @@
     <button id="vstop" type="button">Stop</button>
   </div>
 
+  <!--
+    What is attached but not yet sent. Emptied only after the message lands.
+  -->
+  <div id="tray" hidden aria-label="Attached pictures"></div>
+
   <div id="composer">
-    <button id="mic" type="button" aria-label="Dictate a message" title="Dictate a message">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
-    </button>
-    <button id="convo" type="button" aria-label="Start a hands-free conversation" title="Hands-free conversation" aria-pressed="false">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3c-4.97 0-9 3.13-9 7 0 1.9.97 3.62 2.55 4.88-.16 1.2-.66 2.3-1.4 3.15-.24.28-.05.72.31.7 1.86-.1 3.5-.75 4.71-1.6 .9.23 1.85.36 2.83.36 4.97 0 9-3.13 9-7s-4.03-7-9-7zm-3.6 8.4a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8zm3.6 0a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8zm3.6 0a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8z"/></svg>
-    </button>
-    <textarea id="input" rows="1" placeholder="Message&hellip;" maxlength="8000"
-      autocapitalize="sentences" autocomplete="off" spellcheck="true" enterkeyhint="send"></textarea>
-    <button id="send" type="button">Send</button>
+    <!--
+      No `capture` attribute, deliberately. `capture="environment"` forces the
+      camera open and REMOVES the gallery from the sheet; plain accept="image/*"
+      is what makes the system offer camera *and* photo library, which is what
+      he asked for. `multiple` because picking three photos at once is normal.
+    -->
+    <input id="filepick" type="file" accept="image/*" multiple hidden>
+    <!-- The tools, on their own line above the box. -->
+    <div id="tools">
+      <button id="attach" type="button" aria-label="Attach a picture" title="Attach a picture">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 5h-3.2l-1.8-2H9L7.2 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm-8 12a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
+      </button>
+      <button id="mic" type="button" aria-label="Dictate a message" title="Dictate a message">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
+      </button>
+      <button id="convo" type="button" aria-label="Start a hands-free conversation" title="Hands-free conversation" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3c-4.97 0-9 3.13-9 7 0 1.9.97 3.62 2.55 4.88-.16 1.2-.66 2.3-1.4 3.15-.24.28-.05.72.31.7 1.86-.1 3.5-.75 4.71-1.6 .9.23 1.85.36 2.83.36 4.97 0 9-3.13 9-7s-4.03-7-9-7zm-3.6 8.4a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8zm3.6 0a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8zm3.6 0a1.4 1.4 0 1 1 0-2.8 1.4 1.4 0 0 1 0 2.8z"/></svg>
+      </button>
+    </div>
+    <div id="entry">
+      <textarea id="input" rows="2" placeholder="Message&hellip;" maxlength="8000"
+        autocapitalize="sentences" autocomplete="off" spellcheck="true" enterkeyhint="send"></textarea>
+      <button id="send" type="button">Send</button>
+    </div>
   </div>
 
   <div id="drawer" hidden>
@@ -839,6 +1109,7 @@
       <button id="statusopen" type="button">Status &mdash; is anything listening?</button>
       <button id="actopen" type="button">Activity &mdash; what are its subagents doing?</button>
       <button id="galopen" type="button">Gallery &mdash; every picture in this conversation</button>
+      <button id="shareopen" type="button">Share &mdash; publish a public snapshot</button>
     </nav>
   </div>
 
@@ -882,6 +1153,24 @@
       <button id="galclose" type="button" aria-label="Close">&times;</button>
     </div>
     <div id="galbody" aria-live="polite"><div id="galgrid"></div></div>
+  </section>
+
+  <!--
+    Publishing this conversation to a public URL.
+
+    The thing this panel exists to make unmissable is that it is a COPY. The
+    relay runs on his desktop, so a link that pointed here would be a 502 the
+    moment the machine sleeps — which is exactly when someone he sent it to
+    would open it. So sharing exports a snapshot to Cloudflare and this machine
+    leaves the path entirely, at the cost of the page being frozen at the
+    moment he tapped it. Every string here says so.
+  -->
+  <section id="shareview" hidden aria-label="Share this conversation">
+    <div class="prow">
+      <b id="sharetitle">Share</b>
+      <button id="shareclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="sharebody" aria-live="polite"></div>
   </section>
 
   <!--
@@ -1609,6 +1898,210 @@
     return box;
   }
 
+  /*
+   * ------------------------------------------------- choosing between pictures
+   *
+   * State lives on the server (see pickListOf in server.js); this only draws it
+   * and posts taps. Which image is currently BEING VIEWED is the one piece of
+   * genuinely local state, so it is kept out here — the thread re-renders on
+   * every poll and a pick changes the entry's rev, so a cursor stored on the
+   * node would jump back to the first image the moment he chose something.
+   */
+  var pickCursor = {};   // entryId -> index currently on the stage
+  var pickBusy = {};     // entryId -> true while a POST is in flight
+
+  function postPick(entryId, index, on) {
+    return fetch('/tasks/' + encodeURIComponent(entryId) + '/picks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ index: index, on: on, by: 'web' })
+    }).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+        return j;
+      });
+    });
+  }
+
+  function pickerNode(e) {
+    var sel = e.selection;
+    var items = sel.items || [];
+    var entryId = e.id;
+    var many = sel.mode === 'many';
+    var at = pickCursor[entryId];
+    if (typeof at !== 'number' || at < 0 || at >= items.length) {
+      // Open on what he already chose, not on the first candidate: coming back
+      // to a decided set should show the decision.
+      var firstOn = -1;
+      for (var q = 0; q < items.length; q++) { if (items[q].selected) { firstOn = q; break; } }
+      at = firstOn >= 0 ? firstOn : 0;
+      pickCursor[entryId] = at;
+    }
+
+    var box = el('div', 'picker');
+    // Which entry this belongs to, so a second picker in the same thread is
+    // addressable — by a test, and by anyone reading the DOM to debug one.
+    box.setAttribute('data-entry', entryId);
+    var stage = el('div', 'pk-stage');
+    var big = document.createElement('img');
+    big.className = 'pk-big';
+    big.loading = 'lazy';
+    big.decoding = 'async';
+    stage.appendChild(big);
+
+    var mark = el('div', 'pk-mark');
+    mark.appendChild(el('span', null, '\u2713'));
+    mark.appendChild(el('span', null, many ? 'Selected' : 'Chosen'));
+    stage.appendChild(mark);
+
+    var count = el('div', 'pk-count');
+    stage.appendChild(count);
+
+    var prev = el('button', 'pk-nav pk-prev', '\u2039');
+    var next = el('button', 'pk-nav pk-next', '\u203a');
+    prev.type = 'button'; next.type = 'button';
+    prev.setAttribute('aria-label', 'Previous picture');
+    next.setAttribute('aria-label', 'Next picture');
+    stage.appendChild(prev); stage.appendChild(next);
+    box.appendChild(stage);
+
+    var bar = el('div', 'pk-bar');
+    var label = el('div', 'pk-label');
+    var choose = el('button', 'pk-choose');
+    choose.type = 'button';
+    bar.appendChild(label); bar.appendChild(choose);
+    box.appendChild(bar);
+
+    var strip = el('div', 'pk-strip');
+    box.appendChild(strip);
+    var sum = el('div', 'pk-sum');
+    box.appendChild(sum);
+
+    var thumbs = [];
+    for (var i = 0; i < items.length; i++) {
+      (function (idx) {
+        var t = el('button', 'pk-thumb');
+        t.type = 'button';
+        t.setAttribute('aria-label', 'View ' + items[idx].label);
+        var ti = document.createElement('img');
+        ti.src = items[idx].url; ti.alt = items[idx].label;
+        ti.loading = 'lazy';
+        t.appendChild(ti);
+        // Browsing only. Never selects — see the header comment.
+        t.addEventListener('click', function () { show(idx); });
+        strip.appendChild(t);
+        thumbs.push(t);
+      })(i);
+    }
+
+    function draw() {
+      var it = items[at];
+      if (!it) return;
+      big.src = it.url;
+      big.alt = it.label;
+      if (it.width > 0 && it.height > 0) { big.width = it.width; big.height = it.height; }
+      label.textContent = it.label;
+      count.textContent = (at + 1) + ' / ' + items.length;
+      box.className = 'picker' + (it.selected ? ' on' : '');
+      choose.className = 'pk-choose' + (it.selected ? ' on' : '');
+      choose.textContent = it.selected
+        ? (many ? '\u2713 Selected' : '\u2713 Chosen')
+        : (many ? 'Select' : 'Choose this');
+      choose.setAttribute('aria-pressed', it.selected ? 'true' : 'false');
+      choose.setAttribute('aria-label',
+        (it.selected ? 'Deselect ' : 'Select ') + it.label);
+      prev.disabled = at <= 0;
+      next.disabled = at >= items.length - 1;
+      for (var k = 0; k < thumbs.length; k++) {
+        thumbs[k].className = 'pk-thumb' + (k === at ? ' here' : '') + (items[k].selected ? ' on' : '');
+      }
+      var chosen = [];
+      for (var m2 = 0; m2 < items.length; m2++) if (items[m2].selected) chosen.push(items[m2].label);
+      sum.textContent = '';
+      if (!chosen.length) {
+        // "Nothing chosen yet" and "he chose none" are different, and the copy
+        // says which this is.
+        sum.appendChild(el('span', null, many
+          ? 'Nothing selected yet — browse, then tap Select.'
+          : 'Nothing chosen yet — browse, then tap Choose this.'));
+      } else {
+        sum.appendChild(el('span', null, (many ? 'Selected: ' : 'Chosen: ')));
+        for (var c = 0; c < chosen.length; c++) {
+          if (c) sum.appendChild(el('span', null, ', '));
+          sum.appendChild(el('b', null, chosen[c]));
+        }
+      }
+    }
+
+    function show(idx) {
+      if (idx < 0 || idx >= items.length) return;
+      at = idx;
+      pickCursor[entryId] = idx;
+      draw();
+      if (thumbs[idx] && thumbs[idx].scrollIntoView) {
+        try { thumbs[idx].scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (err) { /* old browser */ }
+      }
+    }
+
+    prev.addEventListener('click', function () { show(at - 1); });
+    next.addEventListener('click', function () { show(at + 1); });
+
+    /*
+     * Swipe browses. The threshold, and the check that the gesture was more
+     * horizontal than vertical, are what keep it from stealing his scroll — and
+     * a swipe never selects, so a misread gesture costs him nothing but a step.
+     */
+    var sx = 0, sy = 0, moved = false;
+    stage.addEventListener('touchstart', function (ev) {
+      var t = ev.touches[0]; sx = t.clientX; sy = t.clientY; moved = false;
+    }, { passive: true });
+    stage.addEventListener('touchend', function (ev) {
+      var t = ev.changedTouches[0];
+      var dx = t.clientX - sx, dy = t.clientY - sy;
+      if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy)) {
+        moved = true;
+        show(at + (dx < 0 ? 1 : -1));
+      }
+    }, { passive: true });
+
+    // Tapping the picture itself is "show me this properly", the same as
+    // everywhere else in the thread. Suppressed right after a swipe.
+    big.addEventListener('click', function () {
+      if (moved) { moved = false; return; }
+      var it = items[at];
+      if (it) showLightbox(it.url, it.label);
+    });
+
+    choose.addEventListener('click', function () {
+      if (pickBusy[entryId]) return;
+      var it = items[at];
+      if (!it) return;
+      var wantOn = !it.selected;
+      pickBusy[entryId] = true;
+      choose.disabled = true;
+      postPick(entryId, at, wantOn).then(function (j) {
+        var fresh = (j && j.selection && j.selection.items) || null;
+        if (fresh) {
+          // Trust the server's answer rather than assuming: single-select
+          // clears the others there, and this is how the strip learns.
+          items = fresh;
+          e.selection = j.selection;
+        } else {
+          it.selected = wantOn;
+        }
+        draw();
+      }).catch(function (err) {
+        showErr('That did not save — ' + ((err && err.message) || 'network error') + '. Nothing was changed.');
+      }).then(function () {
+        pickBusy[entryId] = false;
+        choose.disabled = false;
+      });
+    });
+
+    draw();
+    return box;
+  }
+
   function nodeFor(e) {
     var wrap = document.createElement('div');
     wrap.className = 'msg ' + (e.role === 'agent' ? 'agent' : 'user');
@@ -1623,7 +2116,15 @@
      * and a thread that threw here would take the whole page down over a
      * decoration.
      */
-    if (e && e.images && e.images.length) body.appendChild(shotsNode(e.images));
+    /*
+     * A set offered for choosing is drawn as the picker; anything else stays the
+     * plain grid it has always been, so a lone screenshot never sprouts controls.
+     */
+    if (e && e.selection && e.selection.mode !== 'none' && e.selection.total) {
+      body.appendChild(pickerNode(e));
+    } else if (e && e.images && e.images.length) {
+      body.appendChild(shotsNode(e.images));
+    }
 
     var meta = document.createElement('div');
     meta.className = 'meta';
@@ -2438,6 +2939,7 @@
     render();
     setTitle();
     renderConvs();
+    try { refreshShareBadge(); } catch (e) { /* hoisting order; the panel still works */ }
     closeDrawer();
     clearTimeout(timer);
     return poll(true).then(function () { booted = true; }).then(function () {
@@ -3296,6 +3798,258 @@
   }
 
   /*
+   * ---------------------------------------------------------------- sharing
+   *
+   * "A public URL that shows this conversation, including links, even when my
+   * computer is offline." The last clause is the whole design: this server is
+   * that computer, so the share cannot point here. Tapping Publish renders the
+   * thread to one self-contained HTML file and uploads it to Cloudflare; the
+   * link serves from the edge whether or not this machine is awake.
+   *
+   * The cost is that it is a SNAPSHOT. Nothing in this panel is allowed to
+   * imply otherwise — the button says Publish, the shared state says when it
+   * was taken, and Refresh is offered next to it rather than hidden, because
+   * "it silently went stale" is the failure mode that would embarrass him in
+   * front of whoever he sent it to.
+   */
+  var shareView = document.getElementById('shareview');
+  var shareBody = document.getElementById('sharebody');
+  var shareTitle = document.getElementById('sharetitle');
+  var shareOpenBtn = document.getElementById('shareopen');
+  var shareCloseBtn = document.getElementById('shareclose');
+  var shareOn = false;
+  var shareConv = null;
+  var shareBusy = false;
+
+  function shareWhen(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso || '');
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+
+  function shareBtn(label, cls, onTap) {
+    var b = el('button', 'shbtn' + (cls ? ' ' + cls : ''), label);
+    b.type = 'button';
+    b.addEventListener('click', onTap);
+    return b;
+  }
+
+  function shareSay(msg, cls) {
+    var n = el('div', cls || 'shnote', msg);
+    shareBody.appendChild(n);
+    return n;
+  }
+
+  /* What is about to become public, named rather than gestured at. */
+  function shareFacts(p) {
+    var box = el('div', 'shfacts');
+    var row = function (k, v) {
+      var r = el('div');
+      r.appendChild(el('span', null, k));
+      r.appendChild(el('span', null, v));
+      box.appendChild(r);
+    };
+    row('Messages', String(p.messages));
+    row('Pictures', String(p.images));
+    if (p.first) row('From', shareWhen(p.first));
+    if (p.last) row('To', shareWhen(p.last));
+    if (p.authors && p.authors.length) row('Voices', p.authors.join(', '));
+    shareBody.appendChild(box);
+  }
+
+  /*
+   * The scanner is ADVISORY and says so. He was asked and answered that the
+   * warning was enough, so this never blocks and never edits — it only makes
+   * the warning specific enough to act on.
+   */
+  function shareFindings(findings) {
+    if (!findings || !findings.length) return;
+    var box = el('div', 'shfound');
+    box.appendChild(el('b', null, 'Possible secrets in this conversation'));
+    var ul = document.createElement('ul');
+    for (var i = 0; i < findings.length; i++) {
+      var f = findings[i];
+      ul.appendChild(el('li', null, f.kind + ' \u00d7' + f.count + (f.example ? ' (' + f.example + ')' : '')));
+    }
+    box.appendChild(ul);
+    box.appendChild(el('div', null,
+      'Nothing is removed or hidden. If any of these are real, edit or delete those messages before publishing.'));
+    shareBody.appendChild(box);
+  }
+
+  function renderShare(data) {
+    if (!shareBody) return;
+    shareBody.textContent = '';
+    var p = (data && data.preflight) || { messages: 0, images: 0, authors: [] };
+
+    if (!data.configured) {
+      shareSay('Sharing is not configured on this relay yet: ' + (data.reason || 'unknown reason') +
+        '. Add data/share-config.json with the publish endpoint and its token.');
+      return;
+    }
+
+    if (data.shared && data.share) {
+      var s = data.share;
+      shareSay('Published \u2014 anyone with this link can read it.', 'shlive');
+      var url = el('div', 'shurl', s.url);
+      shareBody.appendChild(url);
+
+      shareBody.appendChild(shareBtn('Copy link', 'ghost', function () {
+        var done = function () { url.textContent = 'Copied \u2014 ' + s.url; setTimeout(function () { url.textContent = s.url; }, 1500); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(s.url).then(done, function () { done(); });
+        } else { done(); }
+      }));
+
+      var open = el('a', 'shbtn ghost', 'Open it');
+      open.href = s.url;
+      open.target = '_blank';
+      open.rel = 'noopener noreferrer';
+      open.style.display = 'block';
+      open.style.lineHeight = '48px';
+      open.style.textAlign = 'center';
+      open.style.textDecoration = 'none';
+      shareBody.appendChild(open);
+
+      shareSay('This is a snapshot taken ' + shareWhen(s.sharedAt) + ' \u2014 ' + s.messages +
+        ' message' + (s.messages === 1 ? '' : 's') + ', ' + s.images + ' picture' + (s.images === 1 ? '' : 's') +
+        ' embedded in the page. It does NOT update as you keep talking. Tap Refresh to replace it with what the ' +
+        'conversation says now; the link stays the same.');
+
+      shareBody.appendChild(shareBtn('Refresh snapshot', null, function () { doShare('POST'); }));
+      shareBody.appendChild(shareBtn('Unshare \u2014 take it down', 'danger', function () {
+        doShare('DELETE');
+      }));
+      shareSay('Unsharing deletes the published copy. The link then says it was taken down. ' +
+        'Anything already saved or screenshotted by someone else is, of course, out of reach.');
+      shareFindings(p.findings);
+      return;
+    }
+
+    var warn = el('div', 'shwarn');
+    warn.appendChild(el('b', null, 'Publishing makes this conversation public.'));
+    warn.appendChild(el('div', null,
+      'Anyone with the link can read every message, picture and link in it \u2014 no login and no Access check. ' +
+      'These threads carry file paths, hostnames and sometimes credentials, and nothing is removed or redacted. ' +
+      'The link is unguessable, and you can take it down again at any time.'));
+    shareBody.appendChild(warn);
+
+    shareFindings(p.findings);
+    shareFacts(p);
+
+    shareSay('It publishes a COPY, frozen at the moment you tap. It will not follow the conversation \u2014 ' +
+      'share again later to refresh it. Pictures are embedded in the page, so it still works with this computer off.');
+
+    shareBody.appendChild(shareBtn('Publish publicly', 'publish', function () { doShare('POST'); }));
+  }
+
+  function doShare(method) {
+    if (shareBusy || !shareConv) return;
+    shareBusy = true;
+    var id = shareConv;
+    var btns = shareBody ? shareBody.querySelectorAll('button') : [];
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
+    var opts = { method: method, headers: { accept: 'application/json' } };
+    if (method === 'POST') {
+      opts.headers['content-type'] = 'application/json';
+      opts.body = JSON.stringify({ by: 'phone' });
+    }
+    fetch('/conversations/' + encodeURIComponent(id) + '/share', opts)
+      .then(function (r) {
+        return r.json().then(function (j) {
+          if (!r.ok) throw new Error((j && j.error) || 'HTTP ' + r.status);
+          return j;
+        });
+      })
+      .then(function () {
+        shareBusy = false;
+        refreshShareBadge();
+        if (shareOn && id === shareConv) loadShare();
+      })
+      .catch(function (err) {
+        shareBusy = false;
+        if (!shareOn || id !== shareConv) return;
+        shareBody.textContent = '';
+        shareSay('That did not work \u2014 ' + ((err && err.message) || 'network error') +
+          '. Nothing was published. Try again, or check the relay log.', 'shfound');
+        shareBody.appendChild(shareBtn('Back', 'ghost', loadShare));
+      });
+  }
+
+  function loadShare() {
+    var id = shareConv;
+    return fetch('/conversations/' + encodeURIComponent(id) + '/share', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function (data) {
+        if (!shareOn || id !== shareConv) return; // a switch mid-flight must not paint the wrong panel
+        renderShare(data);
+      })
+      .catch(function (err) {
+        if (!shareOn || id !== shareConv) return;
+        if (!shareBody) return;
+        shareBody.textContent = '';
+        // Said out loud for the same reason the gallery says it: a blank panel
+        // that failed to load looks exactly like "not shared", and acting on
+        // that would mean publishing a second copy of something already public.
+        shareSay('Could not read the share state \u2014 ' + ((err && err.message) || 'network error') +
+          '. This is not the same as "not shared"; it means this view does not know.', 'shfound');
+      });
+  }
+
+  function showShare() {
+    if (!shareView) return;
+    shareConv = activeConv;
+    shareOn = true;
+    shareView.hidden = false;
+    var c = convById(shareConv);
+    if (shareTitle) shareTitle.textContent = 'Share \u2014 ' + ((c && (c.title || c.agent)) || 'this conversation');
+    closeDrawer();
+    if (shareBody) { shareBody.textContent = ''; shareSay('Looking\u2026'); }
+    loadShare();
+    uiSync();
+  }
+
+  function hideShare() {
+    if (!shareView || !shareOn) return;
+    shareOn = false;
+    shareView.hidden = true;
+    uiSync();
+  }
+
+  /*
+   * Whether the conversation on screen is currently public, shown on the header
+   * button itself. Cheap (one request per conversation switch) and it answers
+   * the question he would otherwise have to open the panel to ask — including
+   * the one that matters, "did that unshare actually take?".
+   */
+  function refreshShareBadge() {
+    var btn = document.getElementById('hshare');
+    if (!btn) return Promise.resolve();
+    var id = activeConv;
+    return fetch('/conversations/' + encodeURIComponent(id) + '/share', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d || id !== activeConv) return;
+        btn.className = d.shared ? 'on' : '';
+        btn.setAttribute('aria-label', d.shared
+          ? 'Shared publicly — open sharing'
+          : 'Share this conversation');
+      })
+      .catch(function () { /* the badge is a hint, never a blocker */ });
+  }
+
+  function initShare() {
+    if (shareOpenBtn) shareOpenBtn.addEventListener('click', showShare);
+    if (shareCloseBtn) shareCloseBtn.addEventListener('click', hideShare);
+    var hs = document.getElementById('hshare');
+    if (hs) hs.addEventListener('click', showShare);
+    refreshShareBadge();
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !lightOn) hideShare();
+    });
+  }
+
+  /*
    * ---------------------------------------------------------------- alerts
    *
    * Three ways to get his attention, each a fallback for the one above:
@@ -3842,8 +4596,294 @@
 
   function autosize() {
     input.style.height = 'auto';
-    var cap = Math.round(window.innerHeight * 0.4);
+    /*
+     * The same budget the CSS max-height uses, and for the same reason: the
+     * 40% belongs to the composer, so the tools row above the box comes out of
+     * it. Measured rather than assumed, since that row can wrap.
+     */
+    var tools = document.getElementById('tools');
+    var above = tools ? tools.offsetHeight + 8 : 0;
+    var cap = Math.max(70, Math.round(window.innerHeight * 0.4) - above);
     input.style.height = Math.min(input.scrollHeight + 2, cap) + 'px';
+  }
+
+  /*
+   * ------------------------------------------------- attaching pictures
+   *
+   * The server side of this already existed: POST /images stores the bytes
+   * under their sha256 and `images: [<sha>]` on a task attaches them. Agents
+   * have been posting pictures for days. What was missing was any way for HIM
+   * to send one, because the page had no file input at all.
+   *
+   * Three ways in, because on a phone they are three different gestures:
+   * the button (camera or library, via the system sheet), paste, and drop.
+   *
+   * Everything is re-encoded through a canvas before upload, and that one step
+   * quietly solves three separate phone problems:
+   *
+   *   HEIC. iPhone photos are frequently HEIC, which sniffImage does not accept
+   *   — it knows PNG, JPEG, GIF and WebP. A HEIC upload would 415 and read to
+   *   him as "the camera is broken". Safari can DECODE HEIC even though the
+   *   server cannot store it, so decoding here and re-encoding to JPEG means
+   *   the format never reaches the server. Where the browser cannot decode it
+   *   either, the error says so in those words rather than showing a 415.
+   *
+   *   SIZE. A 12MP photo is several megabytes and MAX_IMAGE is 8 MiB. Sending
+   *   the original over mobile data to be refused is the worst of both; the
+   *   longest edge is capped at 1600px first, which is far more than the thread
+   *   or the lightbox can show.
+   *
+   *   ROTATION. Phone photos carry EXIF orientation, and a canvas drawn from a
+   *   raw bitmap ignores it — the classic sideways photo. `imageOrientation:
+   *   'from-image'` bakes the rotation into the pixels, so what he saw in the
+   *   camera roll is what lands in the thread.
+   *
+   * Small PNGs pass through untouched: they are usually screenshots, and
+   * re-encoding crisp text as JPEG is a visible downgrade for no gain.
+   */
+  var fileInput = document.getElementById('filepick');
+  var attachBtn = document.getElementById('attach');
+  var tray = document.getElementById('tray');
+  var pending = [];        // { key, file, node, blob, failed }
+  var pendingSeq = 0;
+
+  var MAX_DIM = 1600;              // longest edge after downscale
+  var JPEG_Q = 0.85;
+  var PASS_THROUGH = 400 * 1024;   // a PNG under this is left exactly as it is
+
+  var isImage = function (f) {
+    // A HEIC picked on some Androids arrives with an empty type, so the name is
+    // the fallback rather than the primary test.
+    return !!f && (/^image\//.test(f.type || '') || /\.(png|jpe?g|gif|webp|heic|heif|avif|bmp)$/i.test(f.name || ''));
+  };
+
+  var THUMB_DIM = 200;
+
+  function scaledCanvas(bm, maxDim) {
+    var longest = Math.max(bm.width, bm.height);
+    var scale = longest > maxDim ? maxDim / longest : 1;
+    var c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bm.width * scale));
+    c.height = Math.max(1, Math.round(bm.height * scale));
+    c.getContext('2d').drawImage(bm, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  function asDataUrl(file) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(new Error('could not read that file')); };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  /*
+   * One decode, two outputs: the bytes to upload and a small data: URI for the
+   * tray. A data: URI rather than URL.createObjectURL because this page is
+   * served under `img-src 'self' data:` and a blob: URL is silently blocked —
+   * which showed up as a tray full of broken-image icons.
+   */
+  function prepare(file) {
+    if (!window.createImageBitmap) {
+      // No decoder to resize with: send it as-is and preview the raw file.
+      return asDataUrl(file).then(function (u) {
+        return { body: file, type: file.type || 'image/jpeg', thumb: u };
+      });
+    }
+    return createImageBitmap(file, { imageOrientation: 'from-image' }).then(function (bm) {
+      var thumb = scaledCanvas(bm, THUMB_DIM).toDataURL('image/jpeg', 0.7);
+      var longest = Math.max(bm.width, bm.height);
+      // A small PNG that is already a sane size goes up byte-for-byte: these are
+      // usually screenshots, and re-encoding crisp text as JPEG is a visible
+      // downgrade for nothing.
+      if (/^image\/png$/.test(file.type || '') && file.size <= PASS_THROUGH && longest <= MAX_DIM) {
+        if (bm.close) bm.close();
+        return { body: file, type: file.type, thumb: thumb };
+      }
+      var c = scaledCanvas(bm, MAX_DIM);
+      if (bm.close) bm.close();
+      return new Promise(function (resolve, reject) {
+        c.toBlob(function (b) {
+          if (b) resolve({ body: b, type: 'image/jpeg', thumb: thumb });
+          else reject(new Error('this browser could not re-encode the picture'));
+        }, 'image/jpeg', JPEG_Q);
+      });
+    }, function () {
+      throw new Error('this browser cannot read that picture format (HEIC?) — try Settings > Camera > Most Compatible');
+    });
+  }
+
+  function drawTray() {
+    if (!tray) return;
+    tray.hidden = pending.length === 0;
+    if (attachBtn) {
+      attachBtn.setAttribute('aria-label',
+        pending.length ? 'Attach a picture (' + pending.length + ' waiting)' : 'Attach a picture');
+    }
+  }
+
+  function dropAttachment(key) {
+    for (var i = 0; i < pending.length; i++) {
+      if (pending[i].key !== key) continue;
+      if (pending[i].node && pending[i].node.parentNode) pending[i].node.parentNode.removeChild(pending[i].node);
+      // A rejected `ready` with no other handler would surface as an unhandled
+      // rejection in the console when its item is removed before sending.
+      if (pending[i].ready) pending[i].ready.catch(function () { /* already reported in the tray */ });
+      pending.splice(i, 1);
+      break;
+    }
+    drawTray();
+  }
+
+  /*
+   * One picture. A function per file rather than a loop body, and that is a bug
+   * fix rather than a style preference: `var` is function-scoped, so as a loop
+   * every asynchronous `prepare` callback closed over the SAME `img` and
+   * `node` — the last pair created. Picking two pictures left the first tile
+   * permanently blank and painted the second one twice, a failure only
+   * reachable with `multiple`, i.e. exactly the case this feature is for.
+   */
+  function addOne(f) {
+    var key = 'a' + (++pendingSeq);
+    var node = el('div', 'thumb');
+    var img = document.createElement('img');
+    img.alt = f.name || 'attached picture';
+    node.appendChild(img);
+    var x = el('button', 'x');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Remove ' + (f.name || 'this picture'));
+    x.appendChild(el('i', null, '\u00d7'));
+    x.addEventListener('click', function () { dropAttachment(key); });
+    node.appendChild(x);
+    tray.appendChild(node);
+    var item = { key: key, file: f, node: node, blob: null, failed: false, ready: null };
+    /*
+     * Decoding starts the moment it is picked rather than at send time, so the
+     * wait for a big photo happens while he is still typing the caption.
+     */
+    item.ready = prepare(f).then(function (p) {
+      img.src = p.thumb;
+      return p;
+    }, function (err) {
+      item.failed = true;
+      node.className = 'thumb bad';
+      node.appendChild(el('div', 'err', 'unreadable'));
+      showErr('That picture could not be read — ' + ((err && err.message) || 'unknown format') + '.');
+      throw err;
+    });
+    pending.push(item);
+  }
+
+  function addFiles(list) {
+    if (!list || !tray) return;
+    var added = 0;
+    for (var i = 0; i < list.length; i++) {
+      if (!isImage(list[i])) continue;
+      addOne(list[i]);
+      added++;
+    }
+    if (added) { drawTray(); clearErr(); }
+  }
+
+  /* Upload everything still waiting; resolves to the list of sha ids. */
+  function uploadPending() {
+    if (!pending.length) return Promise.resolve([]);
+    if (attachBtn) attachBtn.className = 'busy';
+    var jobs = pending.map(function (it) {
+      if (it.blob) return Promise.resolve(it.blob); // already up: a retried send
+      var spin = el('div', 'spin', 'sending');
+      if (it.node) it.node.appendChild(spin);
+      // Already decoded and downscaled at pick time; this just waits for it.
+      return it.ready.then(function (p) {
+        return fetch('/images?conversationId=' + encodeURIComponent(activeConv) +
+          '&alt=' + encodeURIComponent((it.file.name || 'picture').slice(0, 120)), {
+          method: 'POST',
+          headers: { 'content-type': p.type || 'application/octet-stream' },
+          body: p.body
+        });
+      }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+          if (!r.ok) throw new Error((j && j.error) || ('upload failed (HTTP ' + r.status + ')'));
+          return j.image.blob;
+        });
+      }).then(function (sha) {
+        it.blob = sha;
+        if (spin.parentNode) spin.parentNode.removeChild(spin);
+        return sha;
+      }).catch(function (err) {
+        if (spin.parentNode) spin.parentNode.removeChild(spin);
+        it.failed = true;
+        if (it.node) {
+          it.node.className = 'thumb bad';
+          it.node.appendChild(el('div', 'err', 'failed'));
+        }
+        throw err;
+      });
+    });
+    return Promise.all(jobs).then(function (ids) {
+      if (attachBtn) attachBtn.className = '';
+      return ids;
+    }, function (err) {
+      if (attachBtn) attachBtn.className = '';
+      throw err;
+    });
+  }
+
+  function clearAttachments() {
+    while (pending.length) dropAttachment(pending[0].key);
+  }
+
+  function initAttach() {
+    if (attachBtn && fileInput) {
+      attachBtn.addEventListener('click', function () { fileInput.click(); });
+      fileInput.addEventListener('change', function () {
+        addFiles(fileInput.files);
+        // Cleared so picking the SAME file twice in a row still fires change.
+        fileInput.value = '';
+      });
+    }
+    // Paste. Reads .files rather than .items so a screenshot pasted from the
+    // system clipboard and a file copied from a folder both arrive.
+    var onPaste = function (e) {
+      var dt = e.clipboardData;
+      if (!dt) return;
+      var files = dt.files && dt.files.length ? dt.files : null;
+      if (!files && dt.items) {
+        var got = [];
+        for (var i = 0; i < dt.items.length; i++) {
+          if (dt.items[i].kind === 'file') { var f = dt.items[i].getAsFile(); if (f) got.push(f); }
+        }
+        files = got.length ? got : null;
+      }
+      if (!files) return;
+      var before = pending.length;
+      addFiles(files);
+      // Only swallow the paste if we actually took something, or pasting text
+      // into the box would stop working.
+      if (pending.length > before) e.preventDefault();
+    };
+    if (input) input.addEventListener('paste', onPaste);
+    document.addEventListener('paste', function (e) {
+      if (e.target === input) return; // already handled above
+      onPaste(e);
+    });
+    // Drag and drop, for the desktop case. Guarded the same as everything else.
+    var depth = 0;
+    document.addEventListener('dragenter', function (e) {
+      if (!e.dataTransfer) return;
+      depth++; document.body.classList.add('dropping');
+    });
+    document.addEventListener('dragleave', function () {
+      depth = Math.max(0, depth - 1);
+      if (!depth) document.body.classList.remove('dropping');
+    });
+    document.addEventListener('dragover', function (e) { e.preventDefault(); });
+    document.addEventListener('drop', function (e) {
+      e.preventDefault();
+      depth = 0; document.body.classList.remove('dropping');
+      if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+    });
   }
 
   /*
@@ -3852,11 +4892,13 @@
    * land in the conversation that was open when it was *spoken* — not wherever
    * the user has switched to while it was being transcribed.
    */
-  function postTask(text, from, conversationId) {
+  function postTask(text, from, conversationId, images) {
+    var payload = { text: text, from: from, conversationId: conversationId || activeConv };
+    if (images && images.length) payload.images = images;
     return fetch('/tasks', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: text, from: from, conversationId: conversationId || activeConv })
+      body: JSON.stringify(payload)
     }).then(function (r) {
       return r.json().catch(function () { return null; }).then(function (j) {
         if (!r.ok) throw new Error((j && j.error) || ('send failed (HTTP ' + r.status + ')'));
@@ -3872,7 +4914,9 @@
     // letting the timer fire too would post them twice.
     if (pendingInBox) { from = 'voice-conversation'; clearStitch(true); }
     var text = input.value;
-    if (!text.trim()) { input.focus(); return Promise.resolve(false); }
+    // A picture with no caption is a whole message on a phone, so an empty box
+    // is only refused when there is nothing attached either.
+    if (!text.trim() && !pending.length) { input.focus(); return Promise.resolve(false); }
     /*
      * Refuse before trying, when we already know there is nothing to try. The
      * button is disabled in this state, but Enter reaches here too, and so does
@@ -3891,16 +4935,27 @@
     var ok = true;
     sending = true; sendBtn.disabled = true; clearErr();
     var origin = from === 'voice' || from === 'voice-conversation' ? from : 'web';
-    return postTask(text, origin).then(function () {
+    /*
+     * Pictures go up FIRST and the message only follows once every one of them
+     * has a sha. The other order would post his words attached to an upload
+     * that then failed, leaving a message in the thread pointing at nothing.
+     * A blob that did upload is remembered on its tray item, so a retry after a
+     * partial failure re-sends only what is still missing.
+     */
+    return uploadPending().then(function (ids) {
+      return postTask(text, origin, activeConv, ids);
+    }).then(function () {
       input.value = '';            // cleared only after the POST succeeded
+      clearAttachments();          // ...and so is the tray
       autosize();
       return poll(false);
     }).then(function () {
       scrollBottom();
     }).catch(function (err) {
-      // Draft is left untouched so nothing typed is ever lost.
+      // Draft and attachments are left untouched so nothing is ever lost.
       ok = false;
-      showErr('Not sent — ' + ((err && err.message) || 'network error') + '. Your text is still here.');
+      showErr('Not sent — ' + ((err && err.message) || 'network error') +
+        '. Your text and pictures are still here.');
     }).then(function () {
       sending = false; sendBtn.disabled = false;
       return ok;
@@ -5454,7 +6509,7 @@
      * while the one underneath is still open, so back keeps consuming layers
      * one at a time and only leaves the app when the last is gone.
      */
-    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!lightOn;
+    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!lightOn || !!shareOn;
     if (open === uiMarked) return; // includes drawer -> status, which re-uses it
     if (open) {
       // Same URL on purpose: a marker must not look like a conversation change,
@@ -5481,6 +6536,7 @@
     // uiSync(), which sees the marker spent — and re-arms it if a lower layer
     // is still open.
     if (lightOn) hideLightbox();
+    else if (shareOn) hideShare();
     else if (galOn) hideGallery();
     else if (actOn) hideActivity();
     else if (statusOn) hideStatus();
@@ -5514,6 +6570,19 @@
     initGallery();
   } catch (err) {
     logClient('gallery-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Same guard again: publishing a snapshot is a bonus, and reading and sending
+  // messages must not depend on the share panel wiring itself up.
+  try {
+    initShare();
+  } catch (err) {
+    logClient('share-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // ...and typing must not depend on the attach button wiring itself up either.
+  try {
+    initAttach();
+  } catch (err) {
+    logClient('attach-init-failed', { message: (err && err.message) || String(err) });
   }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is

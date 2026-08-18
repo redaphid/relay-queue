@@ -17,6 +17,12 @@ services:
       # same client code in server.js, different port.
       TTS_HOST: "host.docker.internal"
       TTS_PORT: "10200"
+      # Where DATA_DIR lives as far as the REST of the machine is concerned.
+      # In here it is /app/data; agents run on the host, where it is this. The
+      # image routes report the host spelling so an agent handed a picture can
+      # actually open the file instead of being sent to a path that exists only
+      # inside this container. Must match the data/ bind mount below.
+      HOST_DATA_DIR: "D:/projects/relay-queue/data"
     ports:
       # Loopback only. The page has no auth of its own, so the sole way in is
       # relay.hypnodroid.com through the tunnel, where Cloudflare Access checks

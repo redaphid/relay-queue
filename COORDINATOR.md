@@ -830,3 +830,161 @@ the flaky, re-authenticating network this gap covers.
 deliberately expired Access session, tap a box, and observe whether the row
 reports honestly or claims a tick that never landed. Until someone does that and
 writes down what they saw, this stays an open question.
+
+## Pictures — how to actually look at one
+
+He can now send pictures from his phone (camera or camera roll, paste, or drop).
+Added 2026-08-16; before that only agents could post images, which is why the
+thread has plenty of pictures *to* him and almost none *from* him.
+
+**The bytes are on disk and you should open them directly.** Every image is a
+sha256 blob under `DATA_DIR/images/<sha>`, with no file extension. The image
+routes hand you the path already spelled for the host:
+
+```sh
+curl -s 'http://127.0.0.1:3901/thread?conversation=<id>' | jq '.entries[].images[]?'
+```
+
+```json
+{
+  "id":   "c939fcdd…",
+  "url":  "/images/c939fcdd…",
+  "path": "D:\projects\relay-queue\data\images\c939fcdd…",
+  "type": "image/jpeg", "width": 1600, "height": 1067, "alt": "IMG_4821.HEIC"
+}
+```
+
+**Read `path` with your file-reading tool.** It is a real JPEG/PNG despite having
+no extension, and it opens fine. Do not fetch `url` — that is the browser's route
+and it goes through the server for no reason.
+
+**Why `path` is not simply `DATA_DIR/images/<sha>`.** The relay runs in a
+container where `DATA_DIR` is `/app/data`; you run on the *host*, where the same
+directory is `D:\projects\relay-queue\data`. Handing you the container's spelling
+would send you to a file that does not exist, and the natural conclusion would be
+that the picture is broken rather than that the path is wrong. The mapping lives
+in `data/host.json` (or `HOST_DATA_DIR`) and is applied on read. **If you ever
+see a `path` starting `/app/`, that file is missing that mapping — the file you
+want is `data/images/<sha>` under the repo.**
+
+**Never describe a picture you have not opened.** "He attached a screenshot" is
+not an answer; open it and say what is in it. That is the entire point of the
+feature.
+
+**What the page does to a photo before it arrives.** Phone photos are re-encoded
+in the browser first, so what you get is not byte-identical to what left his
+camera:
+
+- **HEIC becomes JPEG.** `sniffImage` only accepts PNG, JPEG, GIF and WebP, and
+  iPhone photos are frequently HEIC. Safari can decode HEIC even though this
+  server cannot store it, so the page decodes and re-encodes before uploading.
+- **The longest edge is capped at 1600px**, because a 12MP photo is several
+  megabytes and `MAX_IMAGE` is 8 MiB. A 17 MiB test image arrives as ~1 MB.
+- **EXIF rotation is baked into the pixels**, so it is upright, not sideways.
+- **Small PNGs pass through untouched**, because they are usually screenshots and
+  re-encoding crisp text as JPEG is a visible downgrade.
+
+## Sharing a conversation publicly
+
+`POST /conversations/<id>/share` publishes the thread to an unguessable public
+URL. Added 2026-08-16.
+
+**It is a snapshot, not a live view, and that is the whole design.** The relay
+runs on his desktop, so any link pointing *here* is a 502 the moment the machine
+sleeps — which is exactly when whoever he sent it to will open it. So sharing
+does not proxy, it copies: the thread is rendered to one self-contained HTML file
+(pictures inlined as `data:` URIs, no scripts, no external requests) and PUT to a
+Cloudflare Pages Function that serves it from the edge. See `share.js`.
+
+- `GET` returns the current state plus a preflight of what would become public.
+- `POST` publishes, or **re-publishes to refresh — the slug never changes**, so a
+  link he already sent keeps working and simply shows newer content.
+- `DELETE` revokes; the URL then answers **410**, distinguishable from a typo's 404.
+
+**Never share a conversation on your own initiative.** It makes every message,
+path and hostname in it world-readable to anyone with the link. It is his call,
+made from the panel in the UI where the warning is; there is nothing an agent
+needs it for.
+
+## Choosing between pictures — the contract
+
+He can tap to choose among attached images, and you can read the choice back.
+Added 2026-08-18, deliberately modelled on checklists above — same event log,
+same entry ids, same settle-and-wake behaviour. If you know that section you
+already know this one.
+
+**Why it exists:** agents generate candidates and then ask him to pick in prose,
+so choosing a chair seed meant typing `p2-1005` on a phone. That is the friction
+this removes.
+
+**Offer a choice by posting pictures with `select`.** Works on `POST /messages`
+(an agent offering candidates — the common case), `POST /tasks`, and
+`POST /tasks/:id/result`.
+
+```bash
+# 1. upload each candidate WITH ITS LABEL as the alt — this is what you read back
+curl -s -X POST 'http://127.0.0.1:3901/images?conversationId=<c>&alt=p2-1005' \
+  -H 'content-type: image/png' --data-binary @p2-1005.png
+
+# 2. offer them
+curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/json' -d '{
+  "conversationId":"<c>", "agent":"propart",
+  "text":"Five chair seeds. Pick one and I will render the set.",
+  "images":["<sha1>","<sha2>","..."], "select":"one" }'
+```
+
+`select` is `"one"` (radio — picking one clears the rest), `"many"`
+(checkboxes), or `"none"`. **Unset, two or more pictures default to `"many"`
+and a lone picture to `"none"`** — a single screenshot should not sprout
+controls, and a set of candidates should be tappable even when you forgot to
+say so. `selected: ["<sha>"]` pre-marks your own suggestion.
+
+**THE ALT IS THE LABEL.** It is what the picker shows under the big image and
+what the API reports. Upload candidates with no `alt` and he sees "picture 3"
+and you read back "picture 3", which is worth nothing. Name them.
+
+**The id you address is the THREAD ENTRY, not the task** — exactly as with
+checklists, and with the same hazard. `<taskId>` for pictures sent WITH a
+message, `<taskId>:r` for pictures sent back in a RESULT. One task can carry
+both sets, independently selectable, so guessing wrong is not reliably a 404.
+
+```bash
+curl -s http://127.0.0.1:3901/tasks/<entryId>/picks        # one set
+curl -s 'http://127.0.0.1:3901/picks?conversation=<c>'     # all of them
+curl -s 'http://127.0.0.1:3901/picks?undecided=1'          # still waiting on him
+curl -s -X POST http://127.0.0.1:3901/tasks/<entryId>/picks \
+  -H 'content-type: application/json' -d '{"index":4,"on":true,"by":"me"}'
+```
+
+**Read `selected`, not `items`:**
+
+```json
+{ "mode":"one", "total":5, "picked":1, "decided":true,
+  "selected":[{"index":4,"id":"700b905c…","label":"p2-1005"}] }
+```
+
+Each item also carries `source` — **`"picked"` means he tapped it, `"declared"`
+means the message was posted that way.** That is the same distinction a
+checklist draws between `"checked"` and `"text"`, and it exists for the same
+reason: without it you cannot tell your own suggested default from his decision.
+`decided` is the blunt version — **false means he has not touched it yet, which
+is NOT the same as him rejecting everything.** Do not act on an undecided set.
+
+**How you find out he chose.** Identical to checklists: a burst of taps settles
+into **one** notification after `CHECK_SETTLE_MS` (20 s of quiet), never one per
+tap, and two things are written — a **pending task in the conversation**
+(`from: "picks"`, `role: "user"`), which is the half that actually wakes you, and
+a `picks` channel message (`GET /messages?channel=picks&since=<iso>`). Nothing
+pushes or speaks: he did it himself, with his thumb, seconds ago.
+
+**Never rewrite the message to record a choice.** The message is the source of
+truth for *which pictures are on offer*; the `pick` events are the source of
+truth for *which one he chose*. Neither is a copy of the other, so they cannot
+drift — and a revised set of candidates is a **new message**, which correctly
+starts with nothing chosen instead of inheriting a stale pick.
+
+**What the picker looks like, so your copy matches it.** One image shown large
+(`object-fit: contain`, up to 46vh, so a 1800×520 sheet and a 400×1100 lineup
+both render whole), a filmstrip below, arrows and swipe to browse, and exactly
+one button that commits. **Browsing never selects** — say "tap Choose this",
+not "swipe to the one you want".
