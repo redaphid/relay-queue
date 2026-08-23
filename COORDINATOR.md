@@ -378,6 +378,15 @@ A background poll that echoes pending ids wakes you the same way a tool result
 does — that is the whole difference between responsive and dead-looking.
 Filter it by your `conversationId`, and never heartbeat from it.
 
+**The server backs this up itself, now.** If a conversation has an assigned
+agent (you) and a task sits `pending` — unclaimed — for more than 2 minutes,
+`nudgeStalePending()` (server.js, on the same `WATCH_TICK_MS` tick as the
+deadman banner) queues one short push, e.g. `"1 unclaimed 3 min in <title>"`,
+through the same pipeline as everything else in `notifyWatchLevel`'s family.
+It re-nudges at most every few minutes for a task that stays unclaimed, never
+every tick — this is not a substitute for arming your own watcher, it is the
+backstop for when that watcher died or was never armed.
+
 **Own one conversation.** Never claim, answer, or mark relayed a task outside
 it. The queue accepts one result per task, so a cross-conversation claim does
 not double-answer — it silently steals another agent's message.

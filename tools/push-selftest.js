@@ -20,7 +20,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const wp = require('../push.js');
-const { classify, browserLabel } = require('../server.js');
+const { classify, browserLabel, nudgeText } = require('../server.js');
 const { startServer } = require('./harness-lib');
 
 let failures = 0;
@@ -359,6 +359,22 @@ console.log('\nbrowsers are named, so he can tell which one is armed');
   check('nothing at all', browserLabel(null) === 'this browser');
 }
 
+console.log('\nthe stale-pending nudge is one short line, not a sentence');
+{
+  /*
+   * relay-watchdog's phrasing for the same situation is a full sentence:
+   * "X has not picked up a message in Y for N minutes. Opening the thread
+   * will deliver it." He explicitly asked for less token waste, so this one
+   * is deliberately terser — a single line, no trailing period, no verb.
+   */
+  const one = nudgeText({ count: 1, oldestAgeSec: 190, title: 'Sporefall' });
+  check('one unclaimed task reads naturally', one === '1 unclaimed 3 min in Sporefall', one);
+  check('it is a single line', !one.includes('\n'));
+  check('it is short — well under a sentence', one.length < 60, String(one.length));
+  const many = nudgeText({ count: 3, oldestAgeSec: 610, title: 'relay-queue' });
+  check('several unclaimed tasks still read as one line', many === '3 unclaimed 10 min in relay-queue', many);
+}
+
 // ------------------------------------------------- the same rule, over HTTP
 
 /*
@@ -549,7 +565,123 @@ async function overHttp() {
   }
 }
 
-overHttp().then(() => {
+// --------------------------------------------------- the 2-minute nudge, live
+
+/*
+ * A second, isolated server instance, on purpose: it drives NUDGE_PENDING_MS
+ * and NUDGE_RENUDGE_MS down to human-visible-but-fast scale (same trick
+ * WAITING_GRACE_MS etc. use elsewhere — "the selftest also leans on these to
+ * exercise the transitions in seconds") so this proves the real 15s tick and
+ * 2-minute threshold logic without the test taking two minutes to run.
+ * Sharing the first server's counters would also make the exact-count
+ * assertions above fragile against timing.
+ *
+ * stalePending()'s age check rounds to the nearest SECOND before comparing
+ * (same style as stuckClaims()'s forSec, elsewhere in server.js) — utterly
+ * negligible at the real 2-minute threshold, but it means the moment of
+ * crossing STALE_MS is only known to within ~500ms either side. So
+ * NUDGE_RENUDGE_MS here is set much larger than that band plus the window
+ * used to check "exactly one nudge happened" — otherwise a second, entirely
+ * legitimate nudge can land inside that window and the assertion is really
+ * testing timing noise, not the dedup logic. (First draft of this test used
+ * a 1s cooldown against a ~2.7s check window and saw exactly that: 2 nudges
+ * where 1 was expected, both real.)
+ */
+async function overHttpNudge() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-nudge-'));
+  const TICK_MS = 200;
+  const STALE_MS = 2000;
+  const RENUDGE_MS = 4000;
+  srv = await startServer({
+    dir,
+    port: TEST_PORT,
+    label: 'nudge',
+    env: {
+      WATCH_TICK_MS: String(TICK_MS),
+      NUDGE_PENDING_MS: String(STALE_MS),
+      NUDGE_RENUDGE_MS: String(RENUDGE_MS),
+      PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
+    },
+    unsetEnv: ['PUSH', 'PUSH_PER_HOUR', 'PUSH_PER_HOUR_ALERTS'],
+    timeoutMs: 20000,
+  });
+
+  try {
+    console.log(`\nover HTTP: a stale pending task in an ASSIGNED conversation nudges once`);
+    const conv = (await post('/conversations', { title: 'Sporefall art batch', agent: 'coord-props' })).body;
+    const before = (await getJson('/push/config')).stats.queued;
+    // from:'web' deliberately — a page origin, so task CREATION itself queues
+    // nothing (classify()'s PAGE_ORIGINS rule, proven above). That isolates
+    // every queued count below to the nudge mechanism, not the ordinary
+    // "a task needs you" notify this route already sends for agent-posted work.
+    const task = (await post('/tasks', { text: 'ready to render — go?', from: 'web', conversationId: conv.id })).body;
+    check('task creation itself queued nothing (from:"web")', (await getJson('/push/config')).stats.queued === before,
+      String((await getJson('/push/config')).stats.queued));
+
+    // Well under the 2s threshold (rounds to at most 1s) — proves the check
+    // can say "not yet", not just "yes" (COORDINATOR.md: prove it can fail).
+    await sleep(800);
+    const early = await getJson('/watch');
+    check('not stale yet — under the threshold', early.stalePendingCount === 0, JSON.stringify(early.stalePending));
+    const stillZero = (await getJson('/push/config')).stats.queued;
+    check('...so nothing queued yet', stillZero === before, String(stillZero));
+
+    // T0+3000: past STALE_MS even accounting for the ~500ms rounding band
+    // (worst case it crossed as early as T0+1500), and nowhere near
+    // RENUDGE_MS's earliest possible expiry (1500+4000=5500) — so exactly one
+    // nudge, never zero, never two.
+    await sleep(2200);
+    const w1 = await getJson('/watch');
+    check('the watch snapshot names the stale conversation', w1.stalePendingCount === 1, JSON.stringify(w1.stalePending));
+    check('...with the right title and count', w1.stalePending[0] && w1.stalePending[0].title === conv.title && w1.stalePending[0].count === 1,
+      JSON.stringify(w1.stalePending));
+    const afterFirst = (await getJson('/push/config')).stats.queued;
+    check('exactly one nudge queued for the one stale task', afterFirst - before === 1, String(afterFirst - before));
+
+    console.log('\nover HTTP: it does NOT repeat every tick — that would be the spam this replaces');
+    // T0+4500: several more ticks, still well inside even the earliest
+    // possible re-nudge cooldown expiry (5500).
+    await sleep(1500);
+    const stillOne = (await getJson('/push/config')).stats.queued;
+    check('no repeat nudge before the re-nudge cooldown elapses', stillOne === afterFirst, String(stillOne));
+
+    console.log('\nover HTTP: still unclaimed after the re-nudge cooldown DOES nudge again');
+    // T0+7000: past even the LATEST possible cooldown expiry (worst-case
+    // first nudge at T0+2500, +4000 = 6500), so the second nudge has
+    // definitely happened, and definitely not a third (7000 < 6500+4000).
+    await sleep(2500);
+    const afterSecond = (await getJson('/push/config')).stats.queued;
+    check('a second nudge fires once the cooldown has passed', afterSecond - afterFirst === 1, String(afterSecond - afterFirst));
+
+    console.log('\nover HTTP: claiming it stops the nudges');
+    await post(`/tasks/${task.id}/claim`, { by: 'coord-props' });
+    await sleep(TICK_MS * 3);
+    const w2 = await getJson('/watch');
+    check('claimed — no longer reported as stale-pending', w2.stalePendingCount === 0, JSON.stringify(w2.stalePending));
+    const afterClaim = (await getJson('/push/config')).stats.queued;
+    check('...and no further nudge queued for it', afterClaim === afterSecond, String(afterClaim));
+
+    console.log('\nover HTTP: a conversation with NO assigned coordinator is never nudged');
+    const orphan = (await post('/conversations', { title: 'nobody home' })).body;
+    check('created with no agent', orphan.agent === null || orphan.agent === undefined, JSON.stringify(orphan.agent));
+    await post('/tasks', { text: 'anyone?', from: 'web', conversationId: orphan.id });
+    await sleep(2700); // safely past STALE_MS even with the rounding band
+    const w3 = await getJson('/watch');
+    const orphanListed = (w3.stalePending || []).some((g) => g.conversationId === orphan.id);
+    check('unassigned conversation is excluded from stalePending', !orphanListed, JSON.stringify(w3.stalePending));
+    const afterOrphan = (await getJson('/push/config')).stats.queued;
+    check('...and it queued no nudge', afterOrphan === afterClaim, String(afterOrphan));
+  } catch (e) {
+    failures++;
+    console.log(`  FAIL the nudge HTTP section did not run — ${e && e.message}`);
+    if (srv.out) console.log(srv.out.split('\n').slice(-8).map((l) => `       | ${l}`).join('\n'));
+  } finally {
+    await srv.stop();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows can hold it briefly */ }
+  }
+}
+
+overHttp().then(overHttpNudge).then(() => {
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
 }).catch((err) => {

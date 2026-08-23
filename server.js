@@ -2176,6 +2176,24 @@ const WAITING_ALARM_MS = Number(process.env.WAITING_ALARM_MS || 5 * 60 * 1000); 
 const STUCK_CLAIM_MS = Number(process.env.STUCK_CLAIM_MS || 15 * 60 * 1000);
 const STUCK_ALARM_MS = Number(process.env.STUCK_ALARM_MS || 60 * 60 * 1000);
 /*
+ * NOBODY HAS EVEN LOOKED YET. Different failure from STUCK_CLAIM_MS above:
+ * that one is an agent that took a task and went quiet; this one is a task
+ * nobody has claimed at all, sitting in front of a coordinator who is
+ * assigned but has not acted. relay-watchdog already covers this from
+ * outside the process, polling every few minutes and posting a nag task into
+ * the queue — but a queue message costs the coordinator tokens to read. A
+ * push notification does not, so this is the terser, server-native version
+ * of the same idea, built on the watch tick this file already runs. Two
+ * minutes: fine enough to matter, coarse enough that a normal claim latency
+ * never trips it (see WAITING_GRACE_MS above, one minute for the same
+ * reason).
+ */
+const NUDGE_PENDING_MS = Number(process.env.NUDGE_PENDING_MS || 2 * 60 * 1000);
+// Once a stale task has been nudged, don't repeat it every 15s tick forever —
+// that is exactly the "token wasteful" spam this was built to avoid. Re-nudge
+// only if it is STILL the oldest unclaimed task after this long.
+const NUDGE_RENUDGE_MS = Number(process.env.NUDGE_RENUDGE_MS || 5 * 60 * 1000);
+/*
  * THE CLAIM LEASE. A claim used to last forever, so an agent that died still
  * held its message: one sat 3h14m and another 32m, and nothing but luck found
  * either. The lease is deliberately PERMISSIVE rather than pre-emptive:
@@ -2416,6 +2434,59 @@ function stuckClaims() {
   return out.sort((a, b) => b.stuckForSec - a.stuckForSec);
 }
 
+/*
+ * PENDING, not claimed at all — the other half of "nobody is home", and a
+ * different signal from stuckClaims() above. That one fires once an agent
+ * demonstrably took something and went quiet; this one fires when nothing has
+ * even been picked up. Grouped by conversation, one row per conversation, so
+ * a burst of five messages nudges once, not five times.
+ *
+ * Deliberately narrow to conversations with an assigned agent
+ * (`conv.agent`): an empty chair is not this mechanism's problem to solve —
+ * relay-watchdog already reports that case (its "unassigned" state) — and
+ * nudging nobody would just be a push into the void.
+ *
+ * Not memoised, for the same reason stuckClaims() is not: a task goes stale
+ * purely by the clock ticking, with nothing else mutating, so a cache keyed
+ * on `mutations` would never notice.
+ */
+function stalePending() {
+  const now = Date.now();
+  const byConv = new Map();
+  for (const t of tasks.values()) {
+    if (isInternal(t)) continue;
+    if (t.status !== 'pending') continue;
+    const id = convIdOf(t);
+    const conv = conversations.get(id);
+    if (!conv || !conv.agent) continue; // no coordinator assigned; not this mechanism's job
+    let hit = byConv.get(id);
+    if (!hit) {
+      hit = { conversationId: id, title: conv.title, agent: conv.agent, count: 0, oldestId: null, oldestTsMs: Infinity };
+      byConv.set(id, hit);
+    }
+    hit.count++;
+    const tsMs = msOf(t.ts);
+    if (tsMs < hit.oldestTsMs) { hit.oldestTsMs = tsMs; hit.oldestId = t.id; }
+  }
+  const out = [];
+  for (const hit of byConv.values()) {
+    const oldestAgeSec = Math.round((now - hit.oldestTsMs) / 1000);
+    if (oldestAgeSec * 1000 < NUDGE_PENDING_MS) continue;
+    out.push({
+      conversationId: hit.conversationId,
+      title: hit.title,
+      agent: hit.agent,
+      count: hit.count,
+      oldestId: hit.oldestId,
+      oldestAgeSec,
+    });
+  }
+  return out.sort((a, b) => b.oldestAgeSec - a.oldestAgeSec);
+}
+
+/** The nudge text — deliberately one short line, not a sentence. */
+const nudgeText = (g) => `${g.count} unclaimed ${humanFor(g.oldestAgeSec)} in ${g.title}`;
+
 function headline(c, watch, derived, stuck) {
   const waiting = c.pending + c.claimed;
   const oldestSec = derived.oldestWaiting ? secSince(derived.oldestWaiting.ts) : null;
@@ -2523,6 +2594,7 @@ function watchSnapshot() {
   const derived = derivedStatus();
   const watch = watchState(derived);
   const stuck = stuckClaims();
+  const stale = stalePending();
   const h = headline(c, watch, derived, stuck);
   /*
    * Never alarm out of a fresh boot. Heartbeats are in-memory and a restart wipes
@@ -2544,6 +2616,10 @@ function watchSnapshot() {
      */
     stuck: stuck.slice(0, 5),
     stuckCount: stuck.length,
+    // Pending and unclaimed, with a coordinator assigned to answer it — see
+    // stalePending() and nudgeStalePending() below. Same shape as stuck/stuckCount.
+    stalePending: stale.slice(0, 5),
+    stalePendingCount: stale.length,
     /*
      * `bad` is the entire contract, and it is deliberately derived from
      * headline() rather than recomputed: idle and broken must never look the
@@ -2559,6 +2635,39 @@ function watchSnapshot() {
   };
 }
 
+/*
+ * conversationId -> ms timestamp of the last nudge sent for that
+ * conversation's then-oldest stale task. Keyed on the TASK id, not just the
+ * conversation, so that once the stale task is finally claimed a genuinely
+ * new stale task nudges right away instead of waiting out the old task's
+ * cooldown — see nudgeStalePending().
+ */
+const lastNudgeAt = new Map(); // taskId -> ms
+
+/*
+ * THE NUDGE. Same tick as the deadman banner above, same push pipeline
+ * (queueNotify -> debounce -> quiet hours -> hourly budget -> sendToAll), so
+ * it inherits all of that for free rather than duplicating it. What's new is
+ * only: which conversations qualify (stalePending(), 2 minutes, agent
+ * assigned) and how often the same stale task is allowed to nudge again
+ * (NUDGE_RENUDGE_MS) — without that second part this would fire every 15s
+ * tick forever for one still-unclaimed task, which is exactly the spam this
+ * was built to avoid.
+ */
+function nudgeStalePending() {
+  if (!PUSH_ON || notifyDepth > 0) return;
+  const groups = stalePending();
+  const liveIds = new Set(groups.map((g) => g.oldestId));
+  for (const id of lastNudgeAt.keys()) if (!liveIds.has(id)) lastNudgeAt.delete(id);
+  const now = Date.now();
+  for (const g of groups) {
+    const last = lastNudgeAt.get(g.oldestId);
+    if (last !== undefined && now - last < NUDGE_RENUDGE_MS) continue;
+    lastNudgeAt.set(g.oldestId, now);
+    queueNotify('needs-you', nudgeText(g), g.conversationId, g.oldestId);
+  }
+}
+
 function pushWatch() {
   const snap = watchSnapshot();
   const changed = snap.level !== lastWatchLevel;
@@ -2570,6 +2679,7 @@ function pushWatch() {
    * behind a check for whether a page is open.
    */
   if (changed) notifyWatchLevel(snap);
+  nudgeStalePending();
   if (streams.size === 0) return;
   /*
    * Healthy and unchanged: say nothing. A quiet system should produce a quiet
@@ -6064,7 +6174,7 @@ const server = http.createServer((req, res) => {
  * `require('./server.js')` gives you the functions and nothing else — no port
  * bound, no data directory touched, no timers running.
  */
-module.exports = { repairTranscript, metaphone, headline, stuckClaims, classify, browserLabel };
+module.exports = { repairTranscript, metaphone, headline, stuckClaims, stalePending, nudgeText, classify, browserLabel };
 
 if (require.main !== module) return;
 
