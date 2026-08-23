@@ -46,6 +46,22 @@ const UI_FILES = [
 const MAX_BODY = 1024 * 1024; // 1 MiB
 const MAX_TEXT = 8000; // per-message cap for instruction/text; results are only bounded by MAX_BODY
 
+/*
+ * PROGRESS NOTES. A task accepts exactly one result, and posting it closes the
+ * task — so for an agent doing ten minutes of real work, the only way to say
+ * "still here" was to spend the one answer it had. It therefore said nothing,
+ * and silence is indistinguishable from death: the watchdog called healthy
+ * agents dead three times in one night, and a coordinator believed it and
+ * started a second agent on top of the first.
+ *
+ * A note is short and capped, and only the newest few are kept. This is a
+ * running commentary, not an audit log — the event log keeps every one of them
+ * regardless, and the record on the task exists to be READ, by a human on a
+ * phone and by a watchdog deciding whether anyone is home.
+ */
+const MAX_NOTE = 500;      // one note; deliberately far below MAX_TEXT
+const PROGRESS_CAP = 20;   // notes kept on the record; the log keeps them all
+
 // --- conversations ---------------------------------------------------------
 // Every task belongs to exactly one conversation. Records written before
 // conversations existed have no conversationId and replay into DEFAULT_CONV, so
@@ -404,6 +420,26 @@ function applyEvent(ev) {
   } else if (ev.t === 'patch') {
     const task = tasks.get(ev.id);
     if (task) Object.assign(task, ev.patch);
+  } else if (ev.t === 'progress') {
+    /*
+     * One "still working" note against a task that is still open. Appended
+     * rather than patched, so a note costs a couple of hundred bytes instead of
+     * rewriting the whole list every time, and two notes can never lose each
+     * other to a read-modify-write.
+     *
+     * ROLLBACK SAFETY: a build that predates this branch falls off the end of
+     * the chain and ignores the event — see the note there — so a log written
+     * by this version replays on the old one with nothing skipped. `skipped`
+     * counts only lines that fail to PARSE, never ones nothing handles.
+     */
+    const task = tasks.get(ev.id);
+    if (task && ev.entry) {
+      if (!Array.isArray(task.progress)) task.progress = [];
+      task.progress.push(ev.entry);
+      while (task.progress.length > PROGRESS_CAP) task.progress.shift();
+      task.lastProgressAt = ev.entry.at;
+      task.progressCount = (task.progressCount || 0) + 1;
+    }
   } else if (ev.t === 'conv') {
     conversations.set(ev.conv.id, normaliseConv(ev.conv));
   } else if (ev.t === 'convpatch') {
@@ -1413,7 +1449,9 @@ function conversationSummaries() {
       lastText: '',
       spark: new Array(SPARK_BUCKETS).fill(0),
       sparkBucketMs: SPARK_BUCKET_MS,
-      lastActedAt: null,   // a claim or a result: proof an agent actually ran
+      lastActedAt: null,   // a claim, a result or a progress note: proof an agent ran
+      lastProgressAt: null,
+      lastProgressNote: null,
       oldestWaitingTs: null,
     });
   }
@@ -1427,7 +1465,8 @@ function conversationSummaries() {
       a = { ...newConversation(id, id, null), counts: { pending: 0, claimed: 0, done: 0, unrelayed: 0 },
         messages: 0, lastTs: null, lastRole: null, lastText: '', missing: true,
         spark: new Array(SPARK_BUCKETS).fill(0), sparkBucketMs: SPARK_BUCKET_MS,
-        lastActedAt: null, oldestWaitingTs: null };
+        lastActedAt: null, lastProgressAt: null, lastProgressNote: null,
+        oldestWaitingTs: null };
       acc.set(id, a);
     }
     a.counts[t.status]++;
@@ -1435,9 +1474,16 @@ function conversationSummaries() {
     a.messages++;
     // Both halves of a turn count as activity — a conversation where the agent
     // is answering is busy, not idle. An agent posting a message of its own is
-    // acting too: it can only have come from inside a turn.
-    for (const at of [t.claimedAt, t.resultTs, t.role === 'agent' ? t.ts : null]) {
+    // acting too: it can only have come from inside a turn. So is a progress
+    // note, which is the whole point of having them: the long middle of a job,
+    // which used to look exactly like death, now leaves evidence.
+    for (const at of [t.claimedAt, t.resultTs, t.lastProgressAt, t.role === 'agent' ? t.ts : null]) {
       if (at && (!a.lastActedAt || msOf(at) > msOf(a.lastActedAt))) a.lastActedAt = at;
+    }
+    if (t.lastProgressAt && (!a.lastProgressAt || msOf(t.lastProgressAt) > msOf(a.lastProgressAt))) {
+      a.lastProgressAt = t.lastProgressAt;
+      const notes = Array.isArray(t.progress) ? t.progress : [];
+      a.lastProgressNote = notes.length ? notes[notes.length - 1].note : null;
     }
     if (t.status !== 'done' && (!a.oldestWaitingTs || msOf(t.ts) < msOf(a.oldestWaitingTs))) {
       a.oldestWaitingTs = t.ts;
@@ -1478,8 +1524,17 @@ function conversationSummaries() {
 function agentLiveness(c) {
   const seenAgoSec = c.agent && HEARTBEATS.get(c.agent) ? secSince(HEARTBEATS.get(c.agent).at) : null;
   const actedAgoSec = secSince(c.lastActedAt);
+  const progressAgoSec = secSince(c.lastProgressAt);
   const waitingSec = secSince(c.oldestWaitingTs);
-  const base = { seenAgoSec, actedAgoSec, waitingSec };
+  const progressing = progressAgoSec !== null && progressAgoSec * 1000 <= PROGRESS_FRESH_MS;
+  const base = {
+    seenAgoSec, actedAgoSec, waitingSec,
+    // What the agent said it was doing, and when. The two facts that turn
+    // "something is happening" into something a human can act on.
+    progressAgoSec,
+    progressNote: c.lastProgressNote || null,
+    progressing,
+  };
 
   if (!c.agent) return { ...base, state: 'unassigned' };
   if (seenAgoSec === null && actedAgoSec === null) return { ...base, state: 'never' };
@@ -1488,6 +1543,26 @@ function agentLiveness(c) {
   const waited = waitingSec === null ? 0 : waitingSec;   // no waiting work = nothing is stalled
   const stalled = waitingSec === null ? 0 : Math.min(idle, waited);
   const beating = seenAgoSec !== null && seenAgoSec * 1000 <= WATCHING_MS;
+
+  /*
+   * WORKING OUTRANKS EVERY STALL VERDICT BELOW, AND THAT IS THE ENTIRE FIX.
+   *
+   * A claimed task accepts exactly one result, so an agent in the long middle of
+   * a job had nothing it could say without ending the job. It therefore said
+   * nothing — and every check below reads silence as death. Three healthy agents
+   * were reported dead in one night, and a replacement was started on top of one
+   * of them.
+   *
+   * A progress note is not a heartbeat and this is not the mistake this file
+   * warns about elsewhere. A heartbeat is a timer proving a socket is open; it
+   * survives its agent, which is what made it a lie. A note is written by the
+   * agent, from inside a turn, and says what it is doing. Nothing but the work
+   * itself can produce one.
+   *
+   * It is still bounded: PROGRESS_FRESH_MS, after which the note stops vouching
+   * for anything and every verdict below applies again exactly as before.
+   */
+  if (progressing) return { ...base, state: 'working' };
 
   if (stalled * 1000 > WAITING_GRACE_MS) {
     // Work is genuinely sitting there with nothing happening.
@@ -1515,6 +1590,10 @@ function agentLiveness(c) {
  *   unassigned      no agent has ever been assigned. Nothing to stop.
  *   never           assigned, but has not acted or checked in even once.
  *   idle/watching   assigned, acted recently, nothing waiting or being handled.
+ *   working         assigned, holding a task, and REPORTING PROGRESS on it. The
+ *                   state that did not exist and had to: a long job used to be
+ *                   indistinguishable from a dead agent, because the protocol
+ *                   gave it no way to speak without ending the job.
  *   stale/silent/stuck  assigned, work is waiting, nothing is happening.
  *   stop-requested  asked to stop, HAS NOT ANSWERED. Still running, as far as
  *                   anyone here knows. This is the state people will misread as
@@ -2014,6 +2093,20 @@ const MAX_AGENTS = 20;
 const WATCHING_MS = 60 * 1000; // a check-in this recent means *something* is there
 const SILENT_MS = 10 * 60 * 1000; // ...and this stale means nothing is
 /*
+ * How long a progress note vouches for an agent.
+ *
+ * It cannot be WATCHING_MS. Sixty seconds is the right window for "is a socket
+ * open", and the wrong one by an order of magnitude for "is a job running": no
+ * agent regenerating art or running a suite is going to interrupt itself every
+ * minute, and demanding it would rebuild the same lie in a new place — a note
+ * posted to satisfy a timer rather than because anything happened.
+ *
+ * Ten minutes, matching SILENT_MS and the watchdog's own --stuck-after default,
+ * so the queue, the status page and the watchdog cannot disagree about how long
+ * quiet is allowed to last before it means something.
+ */
+const PROGRESS_FRESH_MS = Number(process.env.PROGRESS_FRESH_MS || SILENT_MS);
+/*
  * Health is judged by whether WORK IS WAITING, not by raw silence. An agent
  * quiet for an hour with an empty conversation is perfectly healthy; an agent
  * quiet for a minute with an unanswered message in front of it is not. Fixed
@@ -2048,6 +2141,13 @@ const STUCK_ALARM_MS = Number(process.env.STUCK_ALARM_MS || 60 * 60 * 1000);
  *     inside a turn. Heartbeats deliberately do NOT renew: a heartbeat comes
  *     from a poll loop and proves nothing about whether the agent is awake,
  *     which is the exact lie this file already refuses to tell elsewhere.
+ *   - A PROGRESS NOTE renews too, for the same reason re-claiming does and the
+ *     opposite of the reason a heartbeat does not. It is written by the agent
+ *     inside a turn and carries what it is doing; a poll loop has nothing to
+ *     put in it. Renewal is a side effect — the note exists so the human can
+ *     see "running the suites" instead of fifteen minutes of nothing, and the
+ *     lease simply believes the same evidence the status page does. See
+ *     lastSignalOf(), which is the single place that decides what counts.
  *
  * Same 15 minutes as STUCK_CLAIM_MS above, on purpose: the moment /status starts
  * calling a claim stuck is the moment another agent is allowed to take it, so
@@ -2236,15 +2336,31 @@ function stuckClaims() {
     if (isInternal(t)) continue;
     if (t.status !== 'claimed') continue;
     if (t.result !== null && t.result !== undefined) continue;
-    const since = msOf(t.claimedAt || t.ts);
+    /*
+     * SILENCE, NOT AGE. "Claimed a while ago" and "nobody is home" are two
+     * different facts, and conflating them is what made a working agent look
+     * dead: real jobs take longer than the threshold, and the only thing an
+     * agent could do about it was spend its one result saying "not yet".
+     *
+     * So the clock runs from the last signal — the claim, or the newest
+     * progress note — and `claimedForSec` is carried alongside so the other
+     * fact is still legible. A task held for three hours while posting notes
+     * every minute is a long job, not an orphan, and now reads as one.
+     */
+    const since = lastSignalOf(t);
     const forSec = Math.round((now - since) / 1000);
     if (forSec * 1000 < STUCK_CLAIM_MS) continue;
+    const notes = Array.isArray(t.progress) ? t.progress : [];
     out.push({
       id: t.id,
       conversationId: convIdOf(t),
       claimedBy: t.claimedBy || null,
       claimedAt: t.claimedAt || null,
       stuckForSec: forSec,
+      claimedForSec: Math.round((now - msOf(t.claimedAt || t.ts)) / 1000),
+      lastProgressAt: t.lastProgressAt || null,
+      progressCount: t.progressCount || 0,
+      lastNote: notes.length ? notes[notes.length - 1].note : null,
       text: asText(t.instruction).slice(0, 120),
     });
   }
@@ -4610,11 +4726,28 @@ function setPickRoute(res, entryId, body) {
   return send(res, 200, { changed: true, selection: pickListOf(entryId) });
 }
 
+/*
+ * THE FRESHEST PROOF THAT SOMEONE IS STILL ON THIS TASK.
+ *
+ * One function, used by the lease, by stuckClaims() and by anything else that
+ * asks "how long has this been silent". Three separate answers to that question
+ * is three things to keep in step, and drift between them is how the page ends
+ * up calling a task stuck while the protocol still refuses to reassign it.
+ *
+ * Both inputs are acts from inside a turn: a claim is one, and a progress note
+ * is one. A heartbeat is not, and deliberately does not appear here.
+ */
+function lastSignalOf(task) {
+  const claimed = msOf(task.claimedAt || task.ts);
+  const progressed = task.lastProgressAt ? msOf(task.lastProgressAt) : 0;
+  return progressed > claimed ? progressed : claimed;
+}
+
 /** Is this claim old enough that another agent may take it? See CLAIM_LEASE_MS. */
 function leaseOf(task) {
   if (task.status !== 'claimed') return null;
   if (task.result !== null && task.result !== undefined) return null; // answered: nothing to rescue
-  const since = msOf(task.claimedAt || task.ts);
+  const since = lastSignalOf(task);
   const leftMs = since + CLAIM_LEASE_MS - Date.now();
   return { expired: leftMs <= 0, leftSec: Math.max(0, Math.round(leftMs / 1000)) };
 }
@@ -4792,6 +4925,86 @@ function claimTask(res, id, body) {
   const patch = { status: 'claimed', claimedBy: by, claimedAt: nowIso() };
   appendEvent({ t: 'patch', id, patch });
   send(res, 200, task);
+}
+
+/*
+ * POST /tasks/:id/progress — "still working", said cheaply and repeatedly.
+ *
+ * THE GAP THIS CLOSES. A task accepts exactly one result and posting it CLOSES
+ * the task. So an agent doing ten minutes of legitimate work — running suites,
+ * regenerating art, waiting on a PR — had exactly two options: stay silent, or
+ * spend its one answer saying "not done yet". Every one of them stayed silent,
+ * and silence is the same shape as death. In a single night the watchdog
+ * reported three healthy agents dead, a coordinator believed one of those
+ * reports and started a replacement, and two agents collided in one repo.
+ *
+ * Five explicit instructions to four agents did not fix it, which is the tell:
+ * agents were not misbehaving. The protocol had no move for them to make.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO:
+ *   - It does not close the task and does not touch `result`. The one-result
+ *     rule is the spine of this queue and nothing here bends it.
+ *   - It does not change `status`. A claimed task stays claimed.
+ *   - It does not create a task, so it cannot show up as a backlog, cannot be
+ *     claimed by anyone, and cannot appear in a work poll.
+ *
+ * WHAT IT DOES: appends a note, refreshes the lease (see lastSignalOf), and
+ * feeds `lastActedAt` — so the queue stops confusing a working agent for a dead
+ * one, and the human gets "running the suites" instead of fifteen minutes of
+ * nothing. The note is the point; the liveness is a consequence of it.
+ */
+function progressTask(res, id, body) {
+  const task = tasks.get(id);
+  if (!task) return fail(res, 404, `no task with id "${id}"`);
+  /*
+   * A finished task has nothing left to report. This is refused rather than
+   * ignored because an agent posting progress after its own result has lost
+   * track of which task it is on — worth telling it plainly.
+   */
+  if (task.status === 'done' || (task.result !== null && task.result !== undefined)) {
+    return fail(res, 409, 'task is already answered; progress is only for work still in flight', {
+      status: task.status, id: task.id,
+    });
+  }
+
+  const note = readString(body.note !== undefined ? body.note : body.text, 'note', MAX_NOTE);
+  if (note instanceof Error) return fail(res, 400, note.message);
+  // An agent writing. The page never posts progress, so this can refuse.
+  if (note !== null && isDamaged(note)) return refuseDamaged(res, 'this note');
+
+  /*
+   * THE SAME OWNERSHIP RULE `result` USES, AND FOR THE SAME REASON — drawn
+   * exactly as narrowly. No `by` is allowed (every existing caller keeps
+   * working); `by` matching the holder is obviously fine; nothing holding it is
+   * fine. Only "I am B" about a task held by A is refused, because that is not
+   * sloppiness, it is two agents on one job — and letting the loser refresh the
+   * winner's lease would be this endpoint actively causing the collision it was
+   * built to prevent.
+   */
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim().slice(0, MAX_AUTHOR) : null;
+  if (by && task.claimedBy && by !== task.claimedBy) {
+    return fail(res, 409, `"${task.claimedBy}" holds this task, not "${by}"`, {
+      id: task.id,
+      claimedBy: task.claimedBy,
+      by,
+      hint: 'if you are both on this, one of you should stop. Nothing was written.',
+    });
+  }
+
+  const at = nowIso();
+  appendEvent({ t: 'progress', id, entry: { at, by: by || task.claimedBy || null, note } });
+  const lease = leaseOf(task);
+  send(res, 200, {
+    ok: true,
+    id: task.id,
+    at,
+    note,
+    progressCount: task.progressCount || 0,
+    // Proof the lease moved, so a caller can see this worked rather than assume it.
+    leaseExpiresInSec: lease ? lease.leftSec : null,
+    // Said out loud because the whole value of this route is what it does NOT do.
+    resultStillOpen: true,
+  });
 }
 
 function resultTask(res, id, body) {
@@ -5742,11 +5955,12 @@ async function route(req, res) {
       if (m === 'POST') return setPickRoute(res, id, await readBody(req));
       return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
     }
-    if (action === 'claim' || action === 'result' || action === 'relayed') {
+    if (action === 'claim' || action === 'result' || action === 'relayed' || action === 'progress') {
       if (!need('POST')) return;
       const body = await readBody(req);
       if (action === 'claim') return claimTask(res, id, body);
       if (action === 'result') return resultTask(res, id, body);
+      if (action === 'progress') return progressTask(res, id, body);
       return relayTask(res, id);
     }
   }

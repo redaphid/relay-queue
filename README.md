@@ -1090,11 +1090,18 @@ moves. Clients track the highest `rev` they have seen and upsert entries by `id`
 ```
 POST /tasks                 ->  status: pending    (role: "user")
 POST /tasks/:id/claim       ->  status: claimed    (409 if already claimed or done)
+POST /tasks/:id/progress    ->  status: UNCHANGED  (repeatable; never closes the task)
 POST /tasks/:id/result      ->  status: done       (409 if already done)
 ```
 
 `claim` is optional — you may post a result straight onto a `pending` task. A task takes **one**
 result, so each message gets one reply.
+
+`progress` is the way to say **"still working"** without spending that one reply. It appends a
+short note, renews the claim lease and makes the conversation read `working` rather than `stuck`
+— but it does not change `status` and does not touch `result`. Without it, an agent doing ten
+minutes of real work is indistinguishable from a dead one, which is exactly how healthy agents
+got reported dead and replaced mid-job. See **Never sit silently on a claim** in `COORDINATOR.md`.
 
 In the UI, `pending` / `claimed` / `done` are shown on your own messages as
 **pending** / **claimed** / **answered**.
@@ -1303,6 +1310,7 @@ JSON
 | GET    | `/tasks/:id`          | one task                                                        |
 | POST   | `/tasks/:id/claim`    | pending -> claimed (`404`/`409`); **new** — renews if you already hold it, takes over if the lease expired |
 | POST   | `/tasks/:id/result`   | -> done, **and posts the agent's reply into the thread** (`404`/`409`; **new** `400` on `result: null`) |
+| POST   | `/tasks/:id/progress` | **new** — "still working": appends a note, renews the lease, and does **not** consume the result (`404`; `409` if answered, or if `by` is not the holder) |
 | GET    | `/results`            | answered tasks only; `conversation` `unread` `since` `limit`     |
 | POST   | `/tasks/:id/relayed`  | mark shown to human (idempotent); **new** — `409` if the task has no result |
 | POST   | `/messages`           | **new** — an agent speaking for itself; `channel` makes it agent-only |

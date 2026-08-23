@@ -538,6 +538,60 @@ system entitled to say an agent is gone, which is exactly why no timer will ever
 write it for you: until you send it, the UI correctly assumes you are still
 running and still holding whatever you checked out. Do not send it early.
 
+## Never sit silently on a claim — post progress
+
+**If you have claimed a task and the work will take more than a few minutes,
+post a progress note every few minutes until you answer.**
+
+```sh
+curl -X POST localhost:3901/tasks/<id>/progress \
+  -H 'content-type: application/json' \
+  -d '{"by":"me","note":"running the suites"}'
+```
+
+`note` is optional (a bare POST is a valid "still here"), capped at 500 chars.
+`by` must be whoever holds the claim, or it is refused with a 409 — one agent
+cannot vouch for another.
+
+**It does not consume your result.** The task stays `claimed`, `result` stays
+empty, and `POST /tasks/<id>/result` still works exactly once, afterwards. Post
+as many notes as you like.
+
+### Why this exists
+
+A task accepts exactly ONE result, and posting it CLOSES the task. So an agent
+in the middle of a ten-minute job — running suites, regenerating art, waiting on
+a PR — had two options: stay silent, or spend its one answer saying "not yet".
+Every agent stayed silent. **And silence is the same shape as death.**
+
+On the night of 2026-08-22 that cost real time:
+
+- `relay-watchdog` reported healthy, working agents **dead — three times**.
+- A coordinator believed one of those reports and **spawned a replacement**, so
+  two agents collided in one repo and one conversation.
+- Five explicit instructions to four agents did not change it, which is the
+  tell: **the agents were not misbehaving. The protocol had no move for them.**
+
+### What a note buys you
+
+- **The human sees what you are doing.** "working: running the suites" instead
+  of fifteen minutes of nothing. This is the main point, not a side effect.
+- **Your lease is renewed**, so nobody can take the task off you while you work.
+- **The conversation reads `working`, not `stuck`/`silent`.** `/status` stops
+  listing you as an abandoned claim, and the watchdog has something true to read.
+
+A note vouches for you for **10 minutes**, then stops. That bound is deliberate:
+a signal that never lapses is a heartbeat wearing a better hat, and this file is
+full of scars from those. **So keep posting, or go back to looking dead.**
+
+### It is not a heartbeat, and must never become one
+
+Post a note **because something happened** — a stage finished, a suite started,
+you hit a blocker. Never from a timer, and never to keep a badge green while
+nothing moves. A note is trusted precisely because only an agent inside a turn,
+doing the work, can write what it says. Fake that and you have rebuilt the exact
+lie — an agent that reads healthiest when it is most stuck — somewhere new.
+
 ## Saying what you are doing
 
 Optional, and everything works without it — but a coordinator that reports gets
@@ -556,9 +610,11 @@ durable and survive a restart, because "what is still running out there" is the
 one thing worth keeping. Tool calls are kept in memory only and are dropped on
 restart: they are a live view, not history.
 
-None of this counts as being alive. Liveness is judged on claims and results —
-real work — precisely so that an agent busily reporting tool calls from inside a
-poll loop cannot look healthy while achieving nothing.
+None of this counts as being alive. Liveness is judged on claims, results and
+**progress notes** — real work — precisely so that an agent busily reporting
+tool calls from inside a poll loop cannot look healthy while achieving nothing.
+If you want to be seen as alive while you work, post progress (above); the
+activity panel is decoration by comparison.
 
 **The contract: the parent posts the roster.** `agent` is the coordinator doing
 the reporting; `subagent` is the worker being reported. So:
