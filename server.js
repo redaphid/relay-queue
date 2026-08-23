@@ -19,7 +19,7 @@ const icons = require('./icons.js');
 const share = require('./share.js');
 
 const NAME = 'relay-queue';
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3901);
 /*
@@ -260,6 +260,24 @@ const shares = new Map();
  * message that correctly starts with nothing chosen.
  */
 const picks = new Map();
+/*
+ * CREDITS. A flat 1-credit-per-feature economy: the human awards credits for
+ * genuinely significant real-world completions (a chore), and a coordinator
+ * must spend exactly 1 before implementing any feature, declining if the
+ * balance is 0. Replaces a free-text convention (`POST /messages` with
+ * `channel:"credits"`, latest message's prose parsed as a running balance)
+ * that had no structured amount/reason, no audit trail beyond scrolling, and
+ * raced under two coordinators doing read-then-post-decremented-value.
+ *
+ * `creditsBalance` is the replayed total, not a ledger to sum on every read —
+ * same split `mutations`/`tasks` already use between the append-only log and
+ * the in-memory projection of it. `creditsHistory` is that same replay's
+ * record of individual awards/spends, capped in memory (the log keeps every
+ * one regardless, exactly like PROGRESS_CAP/ACTIVITY_CAP elsewhere).
+ */
+let creditsBalance = 0;
+const creditsHistory = []; // oldest first; capped in memory, log keeps every entry
+const CREDITS_HISTORY_CAP = 200;
 let logFd = null;
 let mutations = 0; // bumped on every applied event; memoisation keys off it
 
@@ -538,6 +556,14 @@ function applyEvent(ev) {
     if (ev.share && ev.share.conversationId) shares.set(ev.share.conversationId, ev.share);
   } else if (ev.t === 'unshare') {
     shares.delete(ev.conversationId);
+  } else if (ev.t === 'creditsAward' || ev.t === 'creditsSpend') {
+    // Both event types carry the signed delta they apply, so replay is one
+    // line regardless of direction — award logs +amount, spend always logs -1
+    // (the flat per-feature cost; see spendCredits for where that is enforced).
+    const delta = ev.t === 'creditsAward' ? ev.amount : -1;
+    creditsBalance += delta;
+    creditsHistory.push({ amount: delta, reason: ev.reason || null, by: ev.by || null, at: ev.at });
+    while (creditsHistory.length > CREDITS_HISTORY_CAP) creditsHistory.shift();
   }
   // An unknown `t` is ignored, as it always has been: a log written by a newer
   // build replays on an older one without tripping it.
@@ -554,6 +580,7 @@ function appendEvent(ev) {
   if (ev.t === 'conv' || ev.t === 'convpatch') broadcastConv(ev.t === 'conv' ? ev.conv.id : ev.id);
   else if (ev.t === 'sub' || ev.t === 'unsub' || ev.t === 'pushcfg') { /* not thread state; nothing to stream */ }
   else if (ev.t === 'share' || ev.t === 'unshare') { /* publication state, not thread content; the panel reads it on open */ }
+  else if (ev.t === 'creditsAward' || ev.t === 'creditsSpend') { /* not thread state; polled via GET /credits, nothing to stream */ }
   else if (ev.t === 'check') broadcast(taskIdOfEntry(ev.entryId));
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
   // An agent acting is what clears the deadman banner, and it must clear at once
@@ -5066,6 +5093,61 @@ function channelSummaries() {
   return [...acc.values()].sort((a, b) => msOf(b.lastTs) - msOf(a.lastTs));
 }
 
+/*
+ * GET /credits, POST /credits/award, POST /credits/spend — the flat 1-credit-
+ * per-feature economy described on `creditsBalance` above.
+ *
+ * ATOMICITY. Node runs this route handler synchronously from the moment the
+ * body finishes parsing (readBody already awaited, back in route()) through
+ * the balance check and the appendEvent call below - no `await` sits between
+ * "read creditsBalance" and "write the event that changes it", so no other
+ * request's handler can interleave in between. This is the same non-
+ * interleaving claimTask leans on for its pending -> claimed check, just
+ * applied to a number instead of a task's status field.
+ */
+function creditsView(limit) {
+  const cap = creditsHistory.length;
+  const n = limit == null ? cap : Math.max(0, Math.min(limit, cap));
+  return {
+    balance: creditsBalance,
+    history: n === cap ? creditsHistory.slice() : creditsHistory.slice(cap - n),
+  };
+}
+
+function awardCredits(res, body) {
+  const amount = Number(body.amount);
+  if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount <= 0) {
+    return fail(res, 400, 'amount is required and must be a positive integer');
+  }
+  const reason = readString(body.reason, 'reason', MAX_NOTE);
+  if (reason instanceof Error) return fail(res, 400, reason.message);
+  if (!reason) return fail(res, 400, 'reason is required');
+  if (isDamaged(reason)) return refuseDamaged(res, 'this reason');
+  const by = readString(body.by, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  appendEvent({ t: 'creditsAward', amount, reason, by: by || null, at: nowIso() });
+  return send(res, 200, creditsView());
+}
+
+function spendCredits(res, body) {
+  const reason = readString(body.reason, 'reason', MAX_NOTE);
+  if (reason instanceof Error) return fail(res, 400, reason.message);
+  if (!reason) return fail(res, 400, 'reason is required');
+  if (isDamaged(reason)) return refuseDamaged(res, 'this reason');
+  const by = readString(body.by, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  // The gate: flat cost is always exactly 1, so there is nothing to read from
+  // the body here - a caller cannot ask to spend more or less than the one
+  // credit a feature costs.
+  if (creditsBalance < 1) {
+    return fail(res, 402, 'insufficient credits: balance is 0, do more chores first', { balance: creditsBalance });
+  }
+  appendEvent({ t: 'creditsSpend', reason, by: by || null, at: nowIso() });
+  return send(res, 200, creditsView());
+}
+
 function claimTask(res, id, body) {
   const task = tasks.get(id);
   if (!task) return fail(res, 404, `no task with id "${id}"`);
@@ -6070,6 +6152,32 @@ async function route(req, res) {
     if (!need('GET')) return;
     const list = channelSummaries();
     return send(res, 200, { count: list.length, defaultChannel: DEFAULT_CHANNEL, channels: list });
+  }
+
+  // /credits — the flat 1-credit-per-feature economy (see creditsBalance
+  // above). Supersedes the old free-text "channel":"credits" convention.
+  if (seg.length === 1 && seg[0] === 'credits') {
+    if (!need('GET')) return;
+    const limitRaw = q.get('limit');
+    let limit = null;
+    if (limitRaw !== null) {
+      const n = Number(limitRaw);
+      if (!Number.isInteger(n) || n < 0) throw httpErr(400, `invalid limit "${limitRaw}"`);
+      limit = n;
+    }
+    return send(res, 200, creditsView(limit));
+  }
+
+  // /credits/award, /credits/spend
+  if (seg.length === 2 && seg[0] === 'credits') {
+    if (seg[1] === 'award') {
+      if (!need('POST')) return;
+      return awardCredits(res, await readBody(req));
+    }
+    if (seg[1] === 'spend') {
+      if (!need('POST')) return;
+      return spendCredits(res, await readBody(req));
+    }
   }
 
   // /results
