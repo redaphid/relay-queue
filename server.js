@@ -4922,7 +4922,46 @@ function updateConversation(res, id, body) {
 
   const agent = readAgent(body);
   if (agent instanceof Error) return fail(res, 400, agent.message);
-  if (agent !== undefined) patch.agent = agent;
+  if (agent !== undefined) {
+    patch.agent = agent;
+    /*
+     * A NEW occupant does not inherit the last one's stop state.
+     *
+     * The reasoning is already written down below, against `stopRequested`: an
+     * agent that stopped and was reassigned must not still be wearing the last
+     * round's "stopped" badge. It was simply never applied to the path that
+     * actually seats a new agent — and that is the path that produces the ghost.
+     * `agentLifecycle` resolves `stop.phase === 'stopped'` BEFORE it falls back
+     * to live state, so a coordinator that is claiming work this second still
+     * renders as stopped because the agent BEFORE it stopped. Seen on `main`:
+     * state "watching", acted 2s ago, lifecycle "stopped" — and unclearable
+     * except by asking for a stop and withdrawing it, which is a nonsense ritual
+     * to have to perform in order to say "someone new is here".
+     *
+     * The pending ask is cleared with it. A stop request is addressed to a
+     * person, not to a chair: "wind down and hand back your worktrees" was
+     * written for whoever sat here before, and must not silently bind whoever
+     * arrives next — least of all with a `requestedBy` and a timestamp that make
+     * it look like they were the one asked.
+     *
+     * Deliberately narrow. Only a genuine change of occupant clears anything:
+     *   - `agent: null`, an explicit unassign, KEEPS it. A conversation whose
+     *     agent stopped cleanly and stood down is coherent history; erasing it
+     *     would collapse "stopped cleanly" back into "never had an agent",
+     *     which is the one distinction stopStateOf goes out of its way to make.
+     *   - re-asserting the SAME name is a no-op. Nobody arrived, so nothing went
+     *     stale, and repeating a PATCH must not have side effects.
+     */
+    if (agent !== null && agent !== conv.agent) {
+      patch.stopAck = null;
+      patch.stopAckAt = null;
+      patch.stoppedAt = null;
+      patch.stopNote = null;
+      patch.stopRequested = false;
+      patch.stopRequestedAt = null;
+      patch.stopRequestedBy = null;
+    }
+  }
 
   if (body.archived !== undefined) {
     if (typeof body.archived !== 'boolean') return fail(res, 400, 'archived must be true or false');
