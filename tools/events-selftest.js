@@ -46,9 +46,9 @@ async function withServer(fn) {
    * "?conversation=<id>") and hands back a live array that every parsed
    * `data:` frame gets pushed onto, in order, for the life of the test.
    */
-  function listen(query) {
+  function listen(query, pathOverride) {
     const frames = [];
-    const req = http.request(`${base}/events${query || ''}`, { headers: { accept: 'text/event-stream' } }, (res) => {
+    const req = http.request(`${base}${pathOverride || '/events'}${query || ''}`, { headers: { accept: 'text/event-stream' } }, (res) => {
       let buf = '';
       res.setEncoding('utf8');
       res.on('data', (c) => {
@@ -89,16 +89,25 @@ async function main() {
     check('conversation A created', !!convA.id, JSON.stringify(convA));
     check('conversation B created', !!convB.id, JSON.stringify(convB));
 
-    // Connect all three before anything is posted, so nobody can win by timing.
+    // Connect all before anything is posted, so nobody can win by timing.
     const firehose = s.listen('');
     const scopedA = s.listen(`?conversation=${convA.id}`);
     const scopedB = s.listen(`?conversation=${convB.id}`);
-    await sleep(300); // let all three connections actually establish
+    // Dedicated firehose URL — must behave identically to bare /events with no
+    // query param. Also probe it WITH a bogus scoping query string, to prove
+    // /events/firehose ignores query params entirely and is always unscoped.
+    const dedicatedFirehose = s.listen('', '/events/firehose');
+    const dedicatedFirehoseWithBogusQuery = s.listen(`?conversation=${convA.id}`, '/events/firehose');
+    await sleep(300); // let all connections actually establish
 
     check('the firehose got its initial watch snapshot on connect',
       firehose.some((f) => f.watch), `${firehose.length} frame(s)`);
     check('a scoped stream does NOT get the initial watch snapshot (it belongs to no single conversation)',
       scopedA.every((f) => !f.watch), JSON.stringify(scopedA));
+    check('/events/firehose also got its initial watch snapshot on connect (same behavior as bare /events)',
+      dedicatedFirehose.some((f) => f.watch), `${dedicatedFirehose.length} frame(s)`);
+    check('/events/firehose ignores a ?conversation= query string and still gets the watch snapshot',
+      dedicatedFirehoseWithBogusQuery.some((f) => f.watch), `${dedicatedFirehoseWithBogusQuery.length} frame(s)`);
 
     console.log('\nposting a task to each conversation in the same window');
     const taskA = await s.api('POST', '/tasks', { conversationId: convA.id, text: 'hello A', from: 'test' });
@@ -118,6 +127,12 @@ async function main() {
     check('the firehose received BOTH — unfiltered mode is unchanged',
       firehose.some((f) => f.conversationId === convA.id) && firehose.some((f) => f.conversationId === convB.id),
       JSON.stringify(firehose));
+    check('/events/firehose received BOTH tasks too — same unscoped content as bare /events',
+      dedicatedFirehose.some((f) => f.conversationId === convA.id) && dedicatedFirehose.some((f) => f.conversationId === convB.id),
+      JSON.stringify(dedicatedFirehose));
+    check('/events/firehose with a bogus ?conversation= query still received BOTH — query string is ignored, always unscoped',
+      dedicatedFirehoseWithBogusQuery.some((f) => f.conversationId === convA.id) && dedicatedFirehoseWithBogusQuery.some((f) => f.conversationId === convB.id),
+      JSON.stringify(dedicatedFirehoseWithBogusQuery));
 
     console.log('\na conversation patch is scoped the same way as a task broadcast');
     await s.api('POST', `/conversations/${convA.id}`, { agent: 'someone' });
@@ -128,6 +143,10 @@ async function main() {
       scopedA.some((f) => f.conversation && f.conversation.id === convA.id), JSON.stringify(scopedA));
     check("scoped-to-A stream did NOT see B's conversation patch",
       scopedA.every((f) => !(f.conversation && f.conversation.id === convB.id)), JSON.stringify(scopedA));
+    check('/events/firehose saw both conversation patches too',
+      dedicatedFirehose.some((f) => f.conversation && f.conversation.id === convA.id) &&
+      dedicatedFirehose.some((f) => f.conversation && f.conversation.id === convB.id),
+      JSON.stringify(dedicatedFirehose));
 
     console.log('\nevery frame a scoped stream ever received belongs to it, start to finish');
     const belongsToA = (f) => f.conversationId === convA.id || (f.conversation && f.conversation.id === convA.id);

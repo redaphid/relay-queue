@@ -1771,12 +1771,19 @@ function broadcastConv(id) {
   push({ now: nowIso(), conversation: conv });
 }
 
-function sseRoute(req, res, q) {
+function sseRoute(req, res, q, opts) {
   if (streams.size >= MAX_STREAMS) return fail(res, 503, 'too many live connections');
   // Same alias convention as /tasks, /thread, /checklists: `conversation` is
   // canonical, `conversationId` accepted too. Absent or empty = unfiltered
   // firehose, exactly the pre-existing behavior.
-  const raw = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+  // `opts.forceFirehose` is set by the dedicated /events/firehose route below:
+  // it is ALWAYS the unscoped stream, so any query string on that URL is
+  // ignored rather than honored — there is no way to make /events/firehose
+  // scoped, on purpose.
+  const forceFirehose = !!(opts && opts.forceFirehose);
+  const raw = forceFirehose
+    ? null
+    : (q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId'));
   const conv = raw !== null && raw !== '' ? raw : null;
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
@@ -5898,6 +5905,17 @@ async function route(req, res) {
   if (seg.length === 1 && seg[0] === 'events') {
     if (!need('GET')) return;
     return sseRoute(req, res, q);
+  }
+
+  // /events/firehose — a dedicated, unmistakable URL for the exact same
+  // unscoped, everything-stream that bare GET /events (no query param) gives
+  // today. Added so reaching for "the events stream" doesn't land a
+  // coordinator on the expensive full firehose by accident; see
+  // COORDINATOR.md "Watch, don't poll". Purely additive: bare /events is
+  // untouched and keeps working exactly as before.
+  if (seg.length === 2 && seg[0] === 'events' && seg[1] === 'firehose') {
+    if (!need('GET')) return;
+    return sseRoute(req, res, q, { forceFirehose: true });
   }
 
   // /stt — raw PCM in, transcript out (relayed to the Wyoming ASR engine)

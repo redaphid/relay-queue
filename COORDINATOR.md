@@ -666,6 +666,44 @@ this project keeps arriving at from new directions: **mark what you
 reconstructed.** A confident wrong number is worse than a visible gap, for the
 same reason you render no counters rather than untrusted zeroes.
 
+## Watch, don't poll
+
+`GET /events` is a Server-Sent Events stream. Prefer it over a poll loop for
+anything that needs to notice a change soon after it happens — see "Arm a
+watcher on your own conversation" above.
+
+**Scope it to your conversation, almost always:**
+
+```sh
+curl -s 'http://127.0.0.1:3901/events?conversation=<id>'
+```
+
+This is filtered server-side (not just by client discipline) — a stream
+scoped this way never even receives another conversation's frames. That is
+the form a coordinator should reach for by default.
+
+**The full, unscoped firehose — every event, every conversation — now has its
+own dedicated URL:**
+
+```sh
+curl -s http://127.0.0.1:3901/events/firehose
+```
+
+Use this only if you genuinely need to watch everything at once. Today the
+one real consumer is `relay-watchdog` (a separate container watching the
+whole system for stuck/unanswered work). Two coordinators accidentally
+subscribed to the unscoped stream on 2026-08-23 and it cost real tokens —
+that is exactly the mistake this URL exists to make harder to make by
+accident: `/events/firehose` says what it is, instead of looking like the
+same convenient default as scoped `/events`.
+
+**Bare `GET /events` with no `?conversation=` still works today and is
+identical to `/events/firehose`** — kept for backward compatibility because
+`relay-watchdog` depends on it right now. It may be locked down or changed
+later (no promised timeline). Don't build new things against the bare
+unscoped form; use `/events/firehose` if you mean the firehose on purpose,
+and scoped `/events?conversation=<id>` otherwise.
+
 ## The human
 
 They post from a phone, usually by voice, so expect transcription errors —
