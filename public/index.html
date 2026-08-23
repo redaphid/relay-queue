@@ -222,7 +222,7 @@
   .spark.quiet i { background: var(--line); opacity: .8; }
   .convagent { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; font-size: 12px; }
   .convagent .adot { flex: 0 0 auto; font-size: 11px; }
-  .convagent.watching { color: #1a7f4b; }
+  .convagent.watching, .convagent.working { color: #1a7f4b; }
   .convagent.idle { color: var(--muted); }
   .convagent.stale { color: var(--off); }
   /* Beating but not acting. This used to render as the healthiest row here. */
@@ -231,7 +231,7 @@
      "NOT RESPONDING" and swaps the glyph for an exclamation mark. */
   .convagent.silent { color: var(--rec); font-weight: 700; }
   .convagent.never, .convagent.unassigned { color: var(--muted); }
-  @media (prefers-color-scheme: dark) { .convagent.watching { color: #4ade80; } }
+  @media (prefers-color-scheme: dark) { .convagent.watching, .convagent.working { color: #4ade80; } }
   #statusopen {
     margin-top: 12px; width: 100%; min-height: 48px;
     font: inherit; font-size: 15px; color: var(--fg);
@@ -2913,6 +2913,10 @@
    */
   var AGENT_STATE = {
     watching: 'working',
+    // Reporting progress on a task it still holds. Distinct from `watching`,
+    // which only means something checked in recently — this one is the agent
+    // telling you what it is doing, and the note is shown alongside it.
+    working: 'working',
     idle: 'idle, nothing waiting',
     stuck: 'STUCK — checking in but doing nothing',
     stale: 'not responding',
@@ -2932,12 +2936,25 @@
     line.className = 'convagent ' + st.state;
     var dot = document.createElement('span');
     dot.className = 'adot';
-    dot.textContent = st.state === 'watching' ? '●'
+    dot.textContent = st.state === 'watching' || st.state === 'working' ? '●'
       : st.state === 'stuck' ? '!'
         : st.state === 'silent' || st.state === 'stale' ? '!'
           : st.state === 'idle' ? '·' : '○';
     line.appendChild(dot);
-    var label = c.agent ? c.agent + ' · ' + AGENT_STATE[st.state] : AGENT_STATE.unassigned;
+    /*
+     * Fall back to the raw state word rather than rendering "undefined". A page
+     * cached on his phone outlives any given deploy, so a server that learns a
+     * new state must never make an older client print nonsense at him.
+     */
+    var word = AGENT_STATE[st.state] || st.state;
+    var label = c.agent ? c.agent + ' · ' + word : AGENT_STATE.unassigned;
+    /*
+     * WHAT it is doing, not just THAT it is doing something. This is the half
+     * that fixes his experience rather than the watchdog's: "working: running
+     * the suites" is worth reading, "working" on its own is barely worth the
+     * pixels, and fifteen minutes of nothing is what it replaces.
+     */
+    if (st.state === 'working' && st.progressNote) label += ': ' + st.progressNote;
     // For the states that mean trouble, say how long — "stuck" is only credible
     // with a duration attached, and it is the number that makes it actionable.
     if ((st.state === 'stuck' || st.state === 'stale' || st.state === 'silent')
