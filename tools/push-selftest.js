@@ -425,8 +425,8 @@ async function overHttp() {
       PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
     },
     // PUSH must be ON, or the counters never move (see above); the hourly
-    // ceiling must be the compiled-in default, because that is what is asserted.
-    unsetEnv: ['PUSH', 'PUSH_PER_HOUR'],
+    // ceiling(s) must be the compiled-in defaults, because that is what is asserted.
+    unsetEnv: ['PUSH', 'PUSH_PER_HOUR', 'PUSH_PER_HOUR_ALERTS'],
   });
 
   try {
@@ -447,7 +447,9 @@ async function overHttp() {
     check('push is enabled, so the counters mean something', cfg0.enabled === true);
     check('no notification has been queued yet', cfg0.stats.queued === 0, JSON.stringify(cfg0.stats));
     check('quiet hours are unset, so nothing is suppressed for the wrong reason', cfg0.quiet.configured === false);
-    check('the hourly ceiling defaults to 6, not 20', cfg0.budgetLeft === 6, String(cfg0.budgetLeft));
+    check('the "done" ceiling defaults to 6', cfg0.budgetLeftDone === 6, String(cfg0.budgetLeftDone));
+    check('the alerts ceiling defaults to 20, so needs-you/broken get their own room', cfg0.budgetLeftAlerts === 20, String(cfg0.budgetLeftAlerts));
+    check('budgetLeft is still the sum, for back-compat readers', cfg0.budgetLeft === 26, String(cfg0.budgetLeft));
 
     console.log('\nover HTTP: agent chatter queues NOTHING');
     check('an agent message with no hint queues nothing',
@@ -524,8 +526,17 @@ async function overHttp() {
     check('all of them flushed', end.stats.flushed === 5, String(end.stats.flushed));
     check('none were suppressed by quiet hours (none are set)', end.stats.suppressedQuiet === 0);
     check('none were suppressed by the hourly budget', end.stats.suppressedBudget === 0);
-    check('the budget spent matches the flushes', end.budgetLeft === 6 - end.stats.flushed,
-      `${end.budgetLeft} left after ${end.stats.flushed} flushes`);
+    /*
+     * Of the 5: 2 are "done" (his own task answered by voice, and the explicit
+     * "done" hint), 2 are "needs-you" (the agent-posted task, and the explicit
+     * hint), 1 is "broken" (the explicit hint) — so the "done" pool spent 2 of
+     * its 6 and the alerts pool spent 3 of its 20, from two independent
+     * counters that a shared budget would have conflated.
+     */
+    check('the "done" pool spent matches its 2 flushes', end.budgetLeftDone === 6 - 2, String(end.budgetLeftDone));
+    check('the alerts pool spent matches its 3 flushes', end.budgetLeftAlerts === 20 - 3, String(end.budgetLeftAlerts));
+    check('budgetLeft is still the sum of both pools', end.budgetLeft === end.budgetLeftDone + end.budgetLeftAlerts,
+      `${end.budgetLeft} vs ${end.budgetLeftDone}+${end.budgetLeftAlerts}`);
     check('NOTHING was delivered — there was never a device to deliver to', end.stats.delivered === 0);
     check('the server never tried the network', srv.out.indexOf('[push] sent') === -1);
   } catch (e) {

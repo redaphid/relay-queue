@@ -197,7 +197,8 @@ interleave and each process only sees its own in-memory state.
 | `PUSH`          | `1`            | Web push notifications. `0` disables the feature entirely. |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | — | Override the auto-generated pair. Normally unset: the server mints one on first boot and keeps it in `data/push-keys.json` (mode `600`). **Deleting that file invalidates every existing subscription**, because the browser pinned the public key when it subscribed. |
 | `VAPID_SUBJECT` | `mailto:relay@hypnodroid.com` | The contact address the push service is given. |
-| `PUSH_PER_HOUR` | `20`           | Hard ceiling on notifications sent per hour.         |
+| `PUSH_PER_HOUR` | `6`            | Hard ceiling on `done` notifications sent per hour (was `20`; this row was stale). |
+| `PUSH_PER_HOUR_ALERTS` | `20`     | Separate hard ceiling shared by `needs-you` and `broken`, so routine `done` volume can never crowd out a real alert. |
 | `PUSH_DEBOUNCE_MS` | —           | Override the per-category batching delay (normally 15s; 3s for `broken`). |
 
 ---
@@ -586,7 +587,9 @@ traffic is internal by construction and the notifier drops it before anything el
   post-a-task-then-answer-it pattern costs one buzz instead of two.
 - **Collapsed in transit.** Each category is sent with a push `Topic`, so a phone that has been
   offline receives the *latest* of each kind rather than a week of backlog.
-- **Capped.** `PUSH_PER_HOUR` (default 20) is a hard ceiling.
+- **Capped, in two pools.** `PUSH_PER_HOUR` (default 6) caps `done` alone; `PUSH_PER_HOUR_ALERTS`
+  (default 20) is a separate ceiling shared by `needs-you` and `broken`. Split 2026-08-23 after the
+  shared version was found dropping real alerts alongside routine `done` chatter on a busy day.
 
 ### Quiet hours
 

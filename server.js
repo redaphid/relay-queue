@@ -164,8 +164,20 @@ const MAX_PUSH_BODY = 140; // chars of preview; the rest is on the page
  * never fired once during the incident it should have caught. 6 an hour is
  * about the most a human wants from a channel he cannot walk away from. The
  * env override is intact for an operator who disagrees.
+ *
+ * TWO POOLS, not one, added 2026-08-23 after checking the actual log rather
+ * than trusting the theory above. A single shared counter meant "done" spam
+ * and real alerts drew from the same six slots, so on a busy day the ceiling
+ * did the opposite of its job: in one hour it dropped 11 "needs-you" and 3
+ * "broken" pushes — the ones he actually has to act on — right alongside the
+ * routine "done" chatter it was built to cap. Splitting the pool keeps the
+ * original spam cap on "done" (still 6, still the number that mattered on
+ * 2026-08-08) while giving needs-you/broken — rare by construction, since
+ * they only fire on a real question or a real failure — their own, more
+ * generous ceiling so routine noise can never crowd out something urgent.
  */
-const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 6);
+const PUSH_PER_HOUR = Number(process.env.PUSH_PER_HOUR || 6); // "done" pool
+const PUSH_PER_HOUR_ALERTS = Number(process.env.PUSH_PER_HOUR_ALERTS || 20); // needs-you + broken, shared
 
 const CATEGORIES = ['needs-you', 'done', 'broken'];
 const NOTIFY_VALUES = new Set([...CATEGORIES, 'none']);
@@ -3031,7 +3043,14 @@ function pushSnapshot(deviceId) {
     categories: { ...pushConfig.categories },
     brokenOverridesQuiet: !!pushConfig.brokenOverridesQuiet,
     quiet,
-    budgetLeft: pushBudget,
+    // budgetLeft stays a single number for back-compat (older UI/tooling
+    // reads it as "how much room is left overall") — it is now the sum of
+    // both pools. budgetLeftDone / budgetLeftAlerts are the precise view:
+    // spam ("done") and real alerts ("needs-you"/"broken") no longer share
+    // one counter, so a busy "done" hour can never suppress a "broken" push.
+    budgetLeft: pushBudgetDone + pushBudgetAlerts,
+    budgetLeftDone: pushBudgetDone,
+    budgetLeftAlerts: pushBudgetAlerts,
     stats: { ...pushStats },
   };
 }
@@ -3130,8 +3149,13 @@ function readNotifyHint(body) {
 }
 
 // ---- the outbound queue
-let pushBudget = PUSH_PER_HOUR;
-setInterval(() => { pushBudget = PUSH_PER_HOUR; }, 3600000).unref();
+// Two independent budgets, reset on the same hourly clock. "done" spends
+// pushBudgetDone; "needs-you" and "broken" share pushBudgetAlerts, so one
+// cannot starve the other of the pool that matters most.
+let pushBudgetDone = PUSH_PER_HOUR;
+let pushBudgetAlerts = PUSH_PER_HOUR_ALERTS;
+setInterval(() => { pushBudgetDone = PUSH_PER_HOUR; pushBudgetAlerts = PUSH_PER_HOUR_ALERTS; }, 3600000).unref();
+function budgetFor(category) { return category === 'done' ? 'done' : 'alerts'; }
 /** @type {Map<string, object>} category -> { count, body, url, taskIds:Set, timer } */
 const pushPending = new Map();
 /*
@@ -3210,12 +3234,15 @@ function flushNotify(category) {
     console.log(`[push] suppressed ${category} x${slot.count} — quiet hours ${quiet.from}-${quiet.to} ${quiet.timezone} (now ${quiet.zoneNow})`);
     return;
   }
-  if (pushBudget <= 0) {
+  const pool = budgetFor(category);
+  const left = pool === 'done' ? pushBudgetDone : pushBudgetAlerts;
+  const ceiling = pool === 'done' ? PUSH_PER_HOUR : PUSH_PER_HOUR_ALERTS;
+  if (left <= 0) {
     pushStats.suppressedBudget++;
-    console.log(`[push] suppressed ${category} x${slot.count} — hourly budget of ${PUSH_PER_HOUR} spent`);
+    console.log(`[push] suppressed ${category} x${slot.count} — hourly ${pool} budget of ${ceiling} spent`);
     return;
   }
-  pushBudget--;
+  if (pool === 'done') pushBudgetDone--; else pushBudgetAlerts--;
   pushStats.flushed++;
 
   const payload = JSON.stringify({

@@ -227,9 +227,13 @@ async function pushChecks() {
        * seconds, so the real default of 6/hour would run out midway and every
        * later assertion would fail for the wrong reason (it did, the first
        * time this ran after the default dropped from 20 to 6). The ceiling
-       * itself is pinned in tools/push-selftest.js, on a fresh instance.
+       * itself is pinned in tools/push-selftest.js, on a fresh instance. Both
+       * pools need the same treatment since 2026-08-23: "done" and
+       * "needs-you"/"broken" now spend from separate budgets, and this suite
+       * exercises all three categories.
        */
       PUSH_PER_HOUR: '1000',
+      PUSH_PER_HOUR_ALERTS: '1000',
     },
   });
   /*
