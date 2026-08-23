@@ -10,9 +10,19 @@
 #   - **--ff-only, never a reset.** If local commits have diverged from
 #     origin/main the merge simply refuses and the checkout is left exactly as
 #     it was. Unpushed work is never destroyed, and never silently discarded.
-#   - **Quiet when origin is missing or unreachable.** The repo has no remote
-#     until someone publishes it (see .github-drafts/PUBLISH.md), so a bare
-#     checkout must idle harmlessly rather than spin on errors.
+#   - **Quiet when there is no origin at all.** A bare checkout with no remote
+#     must idle harmlessly rather than spin on errors.
+#   - **Honest about WHY a fetch failed, and only says it once.** The repo DOES
+#     have a remote now (git@github.com:redaphid/relay-queue.git), so "no origin"
+#     is no longer the interesting case — a fetch that fails does so for a
+#     reason, and the reason matters. This script used to send fetch's stderr to
+#     /dev/null and then announce "origin unreachable" for every failure alike.
+#     That is a specific, confident diagnosis made after deliberately destroying
+#     the only evidence, and it has been wrong: the live failure is `Host key
+#     verification failed` — a missing known_hosts entry, i.e. AUTH — against an
+#     origin that `git ls-remote` reaches perfectly well from the host. Two
+#     separate people burned time hunting a network fault that did not exist.
+#     So: print what git actually said, and diagnose nothing.
 set -u
 
 REPO=${REPO:-/repo}
@@ -26,8 +36,12 @@ git config --global --add safe.directory "$REPO" 2>/dev/null || true
 
 echo "[sync] watching $REPO for origin/$BRANCH, every ${SYNC_INTERVAL}s"
 warned_no_origin=0
-warned_unreachable=0
 warned_diverged=0
+# The last fetch error we printed. Warn-once is keyed on the TEXT, not on a flag,
+# so a steady failure stays quiet but a failure that CHANGES (auth cleared and
+# now the network is down, say) still gets said. A flag would swallow that
+# forever, which is the same silence this script is being fixed for.
+last_fetch_err=''
 
 while :; do
   if ! git rev-parse --git-dir >/dev/null 2>&1; then
@@ -39,8 +53,12 @@ while :; do
     warned_no_origin=1
   else
     warned_no_origin=0
-    if git fetch --quiet origin 2>/dev/null; then
-      warned_unreachable=0
+    # Keep stderr. It is the only thing that distinguishes "cannot log in" from
+    # "cannot get there", and those have completely different fixes.
+    fetch_err=$(git fetch --quiet origin 2>&1)
+    fetch_rc=$?
+    if [ "$fetch_rc" -eq 0 ]; then
+      last_fetch_err=''
       before=$(git rev-parse HEAD 2>/dev/null)
       if git merge --ff-only --quiet "origin/$BRANCH" 2>/dev/null; then
         warned_diverged=0
@@ -56,8 +74,20 @@ while :; do
         warned_diverged=1
       fi
     else
-      [ "$warned_unreachable" -eq 0 ] && echo "[sync] origin unreachable — will keep trying quietly"
-      warned_unreachable=1
+      # Report git's words, not our guess at them. No claim about the network,
+      # the remote, or whose fault it is — just what failed and what git said.
+      if [ "$fetch_err" != "$last_fetch_err" ]; then
+        echo "[sync] git fetch origin failed (exit $fetch_rc) — not syncing, tree untouched"
+        if [ -n "$fetch_err" ]; then
+          printf '%s\n' "$fetch_err" | while IFS= read -r line; do
+            [ -n "$line" ] && echo "[sync]   $line"
+          done
+        else
+          echo "[sync]   (git printed nothing to explain itself)"
+        fi
+        echo "[sync] will keep retrying every ${SYNC_INTERVAL}s; silent until this changes"
+        last_fetch_err=$fetch_err
+      fi
     fi
   fi
   sleep "$SYNC_INTERVAL"

@@ -385,6 +385,79 @@ async function main() {
       (await stateOf(work)).lifecycle === 'never',
       (await stateOf(work)).lifecycle);
 
+    // ------------------------------------------------------------- handover
+    /*
+     * A new agent does not inherit the last one's stop state.
+     *
+     * This is the bug the badge actually shipped with: `agentLifecycle` resolves
+     * a `stopped` ack BEFORE it looks at live state, so a coordinator that was
+     * claiming work seconds ago rendered as "stopped" purely because the agent
+     * before it had stopped. Observed on `main`: state "watching", acted 2s ago,
+     * lifecycle "stopped" — and the only known way to clear it was to ask for a
+     * stop and immediately withdraw it, a ritual nobody should have to know.
+     */
+    console.log('\nreassigning hands the chair over, not the last agent\'s badge');
+
+    const handover = await newConv('one agent leaves, another arrives', 'coord-alpha');
+    await post(`/conversations/${handover}`, { stopRequested: true, stopRequestedBy: 'human' });
+    await post(`/conversations/${handover}/stop-ack`, {
+      agent: 'coord-alpha', phase: 'stopped', worktrees: [], note: 'alpha is done',
+    });
+    check('setup: alpha really is stopped before anyone replaces it',
+      await lifecycleOf(handover) === 'stopped', await lifecycleOf(handover));
+
+    const reassign = await post(`/conversations/${handover}`, { agent: 'coord-beta' });
+    check('a new agent can be assigned over a stopped one', reassign.status === 200, `HTTP ${reassign.status}`);
+    // Make beta demonstrably alive, so the two halves of the bug are both in
+    // play: a live liveness verdict AND a stale ack competing to name the badge.
+    const bt = await post('/tasks', { instruction: 'beta picks up the work', conversationId: handover });
+    await post(`/tasks/${bt.body.id}/claim`, { by: 'coord-beta' });
+
+    let hs = await stateOf(handover);
+    check('*** a brand-new agent does NOT wear the previous one\'s "stopped" badge ***',
+      hs.lifecycle !== 'stopped', `lifecycle=${hs.lifecycle}`);
+    check('...it shows ITS OWN liveness instead', hs.lifecycle === 'watching',
+      `lifecycle=${hs.lifecycle} state=${hs.state} acted=${hs.actedAgoSec}s`);
+    check('the previous occupant\'s acknowledgement is gone',
+      hs.stop.ack === null && hs.stop.stoppedAt === null && hs.stop.note === null,
+      `ack=${hs.stop.ack} stoppedAt=${hs.stop.stoppedAt} note=${JSON.stringify(hs.stop.note)}`);
+    check('the pending stop request does not silently bind the new agent',
+      hs.stop.requested === false && hs.stop.requestedAt === null && hs.stop.requestedBy === null,
+      `requested=${hs.stop.requested} by=${hs.stop.requestedBy}`);
+    check('the new agent is the one on the row',
+      (await get(`/conversations/${handover}`)).agent === 'coord-beta');
+
+    /*
+     * The two things this must NOT do. Both are deliberate: clearing on any
+     * `agent` key at all would erase real history and make an idempotent PATCH
+     * load-bearing.
+     */
+    console.log('\n...but only a genuine change of occupant clears anything');
+
+    const standDown = await newConv('stood down, nobody replaced it', 'coord-gamma');
+    await post(`/conversations/${standDown}`, { stopRequested: true, stopRequestedBy: 'human' });
+    await post(`/conversations/${standDown}/stop-ack`, { agent: 'coord-gamma', phase: 'stopping', note: 'winding down' });
+    const unassign = await post(`/conversations/${standDown}`, { agent: null });
+    check('an explicit unassign is accepted', unassign.status === 200, `HTTP ${unassign.status}`);
+    const ds = await stateOf(standDown);
+    check('*** unassigning does NOT erase that the agent stood down ***',
+      ds.stop.ack === 'stopping' && ds.lifecycle === 'stopping',
+      `ack=${ds.stop.ack} lifecycle=${ds.lifecycle}`);
+    check('...and the original request is still on the record',
+      ds.stop.requested === true && ds.stop.requestedBy === 'human',
+      `requested=${ds.stop.requested} by=${ds.stop.requestedBy}`);
+
+    const samename = await newConv('same agent, said twice', 'coord-delta');
+    await post(`/conversations/${samename}`, { stopRequested: true, stopRequestedBy: 'human' });
+    await post(`/conversations/${samename}/stop-ack`, { agent: 'coord-delta', phase: 'stopping', note: 'on it' });
+    const again = await post(`/conversations/${samename}`, { agent: 'coord-delta' });
+    check('re-asserting the same agent is accepted', again.status === 200, `HTTP ${again.status}`);
+    const ss = await stateOf(samename);
+    check('*** re-asserting the SAME agent changes no stop state ***',
+      ss.stop.ack === 'stopping' && ss.stop.requested === true && ss.stop.note === 'on it',
+      `ack=${ss.stop.ack} requested=${ss.stop.requested} note=${JSON.stringify(ss.stop.note)}`);
+    check('...and the badge is unmoved', ss.lifecycle === 'stopping', ss.lifecycle);
+
     // ---------------------------------------------------------------- replay
     console.log('\nrestarting the server (the real test: does any of it survive?)');
     await stop(proc);
@@ -409,6 +482,17 @@ async function main() {
       afterGhost.lifecycle !== 'stopped' && afterGhost.stop.ack === null, afterGhost.lifecycle);
     check('the ghost is still counted on /status after a restart',
       (await get('/status?engines=0')).coordinators.ghosts >= 1);
+
+    const afterHandover = await stateOf(handover);
+    check('*** a cleared-by-reassignment badge STAYS cleared after a restart ***',
+      afterHandover.lifecycle !== 'stopped' && afterHandover.stop.ack === null,
+      `lifecycle=${afterHandover.lifecycle} ack=${afterHandover.stop.ack}`);
+    check('...and the replaced agent\'s stop request did not come back',
+      afterHandover.stop.requested === false && afterHandover.stop.requestedBy === null);
+
+    const afterStandDown = await stateOf(standDown);
+    check('an unassigned-but-stood-down conversation keeps its ack across a restart',
+      afterStandDown.stop.ack === 'stopping', afterStandDown.stop.ack);
 
     const afterFeed = await get(`/conversations/${work}/activity`);
     check('subagent lifecycle survives a restart', afterFeed.subagents.length === 2,
