@@ -680,6 +680,56 @@ function mojibakeDetail(buf) {
   };
 }
 
+/*
+ * THE WRITE THAT SUCCEEDS AND CORRUPTS IS THE WORST OF THE THREE OUTCOMES.
+ *
+ * `buf.toString('utf8')` - what stood here - SILENTLY substitutes U+FFFD
+ * for every byte it cannot decode. So a shell that re-encoded an em-dash
+ * into a lone CP1252 0x97 got back a cheerful 201, and the replacement
+ * character went into an append-only archive where the original is now
+ * unrecoverable. 26 of the 3060 events in the live log are damaged this
+ * way, by ten different authors - the shared write path, not one bad shell.
+ *
+ * Verified on a scratch server rather than assumed: a body containing a
+ * lone 0x97 stored as U+FFFD with HTTP 201, while the same text sent as
+ * proper UTF-8 stored byte for byte. The corruption was this line.
+ *
+ * REFUSING IS SAFE FOR HIM, and that is the constraint that decides it.
+ * His messages arrive from the page through `fetch` with a
+ * `JSON.stringify` body, and that path encodes JS strings to UTF-8
+ * itself - it cannot emit a malformed sequence, not even from a lone
+ * surrogate, which it encodes as a well-formed U+FFFD. So this refuses
+ * mangled agent writes and can never refuse a typed or dictated message.
+ * Dictation does not pass through here at all: /stt reads raw audio bytes.
+ *
+ * Pulled out of readBody() as its own function so the v2 (Hono) routes
+ * below can parse a body with IDENTICAL semantics — same empty-body-is-{},
+ * same malformed-JSON message, same UTF-8 strictness — without a second,
+ * drifting implementation. Throws the same httpErr shapes readBody rejected
+ * with; callers that don't already return a Promise (Hono handlers) can
+ * try/catch this synchronously.
+ */
+function parseBodyBuffer(buf) {
+  let raw;
+  try {
+    raw = UTF8_STRICT.decode(buf);
+  } catch {
+    throw Object.assign(
+      httpErr(400, 'the request body is not valid UTF-8, so nothing was stored'),
+      { detail: mojibakeDetail(buf) },
+    );
+  }
+  raw = raw.trim();
+  if (!raw) return {}; // empty body is a valid "no fields" request
+  try {
+    const body = JSON.parse(raw);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
+    return body;
+  } catch {
+    throw httpErr(400, 'malformed JSON body');
+  }
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -691,46 +741,10 @@ function readBody(req) {
     });
     req.on('error', () => reject(httpErr(400, 'request stream error')));
     req.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      /*
-       * THE WRITE THAT SUCCEEDS AND CORRUPTS IS THE WORST OF THE THREE OUTCOMES.
-       *
-       * `buf.toString('utf8')` - what stood here - SILENTLY substitutes U+FFFD
-       * for every byte it cannot decode. So a shell that re-encoded an em-dash
-       * into a lone CP1252 0x97 got back a cheerful 201, and the replacement
-       * character went into an append-only archive where the original is now
-       * unrecoverable. 26 of the 3060 events in the live log are damaged this
-       * way, by ten different authors - the shared write path, not one bad shell.
-       *
-       * Verified on a scratch server rather than assumed: a body containing a
-       * lone 0x97 stored as U+FFFD with HTTP 201, while the same text sent as
-       * proper UTF-8 stored byte for byte. The corruption was this line.
-       *
-       * REFUSING IS SAFE FOR HIM, and that is the constraint that decides it.
-       * His messages arrive from the page through `fetch` with a
-       * `JSON.stringify` body, and that path encodes JS strings to UTF-8
-       * itself - it cannot emit a malformed sequence, not even from a lone
-       * surrogate, which it encodes as a well-formed U+FFFD. So this refuses
-       * mangled agent writes and can never refuse a typed or dictated message.
-       * Dictation does not pass through here at all: /stt reads raw audio bytes.
-       */
-      let raw;
       try {
-        raw = UTF8_STRICT.decode(buf);
-      } catch {
-        return reject(Object.assign(
-          httpErr(400, 'the request body is not valid UTF-8, so nothing was stored'),
-          { detail: mojibakeDetail(buf) },
-        ));
-      }
-      raw = raw.trim();
-      if (!raw) return resolve({}); // empty body is a valid "no fields" request
-      try {
-        const body = JSON.parse(raw);
-        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
-        resolve(body);
-      } catch {
-        reject(httpErr(400, 'malformed JSON body'));
+        resolve(parseBodyBuffer(Buffer.concat(chunks)));
+      } catch (err) {
+        reject(err);
       }
     });
   });
@@ -5764,6 +5778,310 @@ function relayTask(res, id) {
   send(res, 200, task); // idempotent: re-flagging keeps the original relayedAt
 }
 
+/*
+ * ---------------------------------------------------------------- v2 (Hono + OpenAPI proof-of-concept)
+ *
+ * A BOUNDED, ADDITIVE experiment, not a migration. It mounts a second app,
+ * built on Hono (https://hono.dev) plus @hono/zod-openapi, under the /v2
+ * prefix, covering exactly 5 routes: claim, result, relayed, progress, and
+ * the tasks list. Everything else — every other route in this file — is
+ * untouched and keeps answering exactly as before. See HONO-POC.md for the
+ * why and the honest assessment of whether to continue.
+ *
+ * THE MIGRATION TECHNIQUE, on purpose: these Hono routes do NOT reimplement
+ * claimTask/resultTask/progressTask/relayTask/applyFilters. They validate
+ * and document the request with Hono/zod, then hand off to the SAME handler
+ * functions above via a tiny `res` shim that records what would have been
+ * written to a real http.ServerResponse. That is not a shortcut — it is the
+ * only way to be confident "equivalent behavior" is actually true rather
+ * than merely believed: the mutation logic is not duplicated, so it cannot
+ * drift. A real migration would gradually inline each handler's body into
+ * its Hono route and delete the shim one route at a time; this POC stops
+ * one step before that to keep the diff reviewable.
+ *
+ * THE ONE PLACE THIS DELIBERATELY DOES NOT USE HONO'S OWN VALIDATION: request
+ * bodies. @hono/zod-openapi's automatic body validator treats a genuinely
+ * EMPTY body as malformed JSON — even when the schema marks the body as
+ * `required: false` — which would silently break two behaviors this project
+ * explicitly relies on: `POST /tasks/:id/claim` with no body, and
+ * `POST /tasks/:id/progress` with no body ("a bare POST is a valid 'still
+ * here'", see COORDINATOR.md). So these routes parse the body themselves
+ * with `parseBodyBuffer()` — the exact function readBody() uses — and the
+ * documented request-body schemas below are wired into the generated OpenAPI
+ * document by hand (`injectRequestBodies`), for docs and CLI-flag generation
+ * only. This is the single biggest behavioral gap found while building this
+ * POC; see HONO-POC.md for the verification that produced it.
+ */
+const { OpenAPIHono, createRoute, z } = require('@hono/zod-openapi');
+const { getRequestListener } = require('@hono/node-server');
+const { swaggerUI } = require('@hono/swagger-ui');
+
+// A loose, passthrough response schema. Task records carry a growing set of
+// optional fields (images, resultImages, progressCount, takenOverFrom, ...)
+// depending on which routes have touched them; documenting the common core
+// and passing the rest through is truer to the actual (untyped) shape than a
+// strict schema that would need editing every time server.js grows a field.
+const TaskSchema = z.object({
+  id: z.string(),
+  conversationId: z.string(),
+  instruction: z.string(),
+  from: z.string().nullable(),
+  ts: z.string(),
+  status: z.enum(STATUSES),
+  claimedBy: z.string().nullable(),
+  claimedAt: z.string().nullable(),
+  result: z.any().nullable(),
+  resultTs: z.string().nullable(),
+  relayed: z.boolean(),
+  relayedAt: z.string().nullable(),
+}).passthrough().openapi('Task');
+
+const ErrorSchema = z.object({
+  error: z.string(),
+}).passthrough().openapi('Error');
+
+const IdParams = z.object({
+  id: z.string().min(1).openapi({ param: { name: 'id', in: 'path', required: true }, example: 'md3x9k-4f2a1c' }),
+});
+
+// ---- the res shim: capture what a legacy handler would have written -------
+function v2ShimRes() {
+  let code = 200;
+  let outBody = '';
+  return {
+    writeHead(c) { code = c; },
+    end(b) { outBody = b || ''; },
+    get status() { return code; },
+    get outBody() { return outBody; },
+  };
+}
+
+function v2LegacyResponse(shim) {
+  return new Response(shim.outBody, {
+    status: shim.status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
+
+// Body parsing that matches readBody() exactly (see the comment above) —
+// deliberately NOT Hono's automatic json validator.
+async function v2ReadBody(c) {
+  const buf = Buffer.from(await c.req.raw.arrayBuffer());
+  if (buf.length > MAX_BODY) throw httpErr(413, 'body too large');
+  return parseBodyBuffer(buf);
+}
+
+async function v2DispatchLegacy(c, id, fn) {
+  let body;
+  try {
+    body = await v2ReadBody(c);
+  } catch (err) {
+    const code = Number(err && err.code) || 500;
+    const detail = err && err.detail && typeof err.detail === 'object' ? err.detail : null;
+    return c.json({ error: String((err && err.message) || 'internal error'), ...(detail ? { detail } : {}) }, code);
+  }
+  const shim = v2ShimRes();
+  fn(shim, id, body);
+  return v2LegacyResponse(shim);
+}
+
+const v2 = new OpenAPIHono();
+
+// ---- GET /v2/tasks — list, mirroring applyFilters() exactly ---------------
+const listRoute = createRoute({
+  method: 'get',
+  path: '/v2/tasks',
+  tags: ['v2 proof-of-concept'],
+  summary: 'List tasks',
+  description: 'POC mirror of GET /tasks. Same filters (only conversation/status are wired up here — '
+    + 'channel/unread/expired/since/limit exist on v1 and are intentionally out of scope for this POC), '
+    + 'served by the same applyFilters() used by v1.',
+  request: {
+    query: z.object({
+      conversation: z.string().optional().openapi({ description: 'filter by conversationId (alias: conversationId)' }),
+      conversationId: z.string().optional(),
+      status: z.enum(STATUSES).optional().openapi({ description: 'filter by task status' }),
+    }),
+  },
+  responses: {
+    200: {
+      description: 'matching tasks',
+      content: { 'application/json': { schema: z.object({ count: z.number(), tasks: z.array(TaskSchema) }) } },
+    },
+    400: { description: 'invalid filter', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+});
+v2.openapi(listRoute, (c) => {
+  const q = new URL(c.req.url).searchParams;
+  try {
+    const list = applyFilters([...tasks.values()], q);
+    return c.json({ count: list.length, tasks: list }, 200);
+  } catch (err) {
+    const code = Number(err && err.code) || 500;
+    return c.json({ error: String((err && err.message) || 'internal error') }, code);
+  }
+}, (result, c) => {
+  if (result.success) return;
+  const statusIssue = result.error.issues.find((i) => i.path[0] === 'status');
+  if (statusIssue) {
+    const raw = new URL(c.req.url).searchParams.get('status');
+    return c.json({ error: `invalid status "${raw}"` }, 400);
+  }
+  return c.json({ error: result.error.issues[0]?.message || 'invalid query' }, 400);
+});
+
+// ---- POST /v2/tasks/:id/claim ----------------------------------------------
+const claimRoute = createRoute({
+  method: 'post',
+  path: '/v2/tasks/{id}/claim',
+  tags: ['v2 proof-of-concept'],
+  summary: 'Claim a task',
+  description: 'POC mirror of POST /tasks/:id/claim, delegating to the same claimTask() handler. '
+    + 'Body { by? } is optional — see the file-level comment on why this route parses its own body '
+    + 'instead of using Hono\'s automatic validator.',
+  request: { params: IdParams },
+  responses: {
+    200: { description: 'claimed, renewed, or taken over from an expired lease', content: { 'application/json': { schema: TaskSchema } } },
+    404: { description: 'no such task', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'already claimed (lease not expired) or already done', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+});
+v2.openapi(claimRoute, (c) => v2DispatchLegacy(c, c.req.valid('param').id, claimTask));
+
+// ---- POST /v2/tasks/:id/result ---------------------------------------------
+const resultRoute = createRoute({
+  method: 'post',
+  path: '/v2/tasks/{id}/result',
+  tags: ['v2 proof-of-concept'],
+  summary: 'Post a result, closing the task',
+  description: 'POC mirror of POST /tasks/:id/result, delegating to the same resultTask() handler — '
+    + 'including the "result is required" / "result is null" distinction from a malformed-JSON 400.',
+  request: { params: IdParams },
+  responses: {
+    200: { description: 'answered', content: { 'application/json': { schema: TaskSchema } } },
+    400: { description: 'result missing, result is null, or bad images/select', content: { 'application/json': { schema: ErrorSchema } } },
+    404: { description: 'no such task', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'already done, or held by a different claimant', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+});
+v2.openapi(resultRoute, (c) => v2DispatchLegacy(c, c.req.valid('param').id, resultTask));
+
+// ---- POST /v2/tasks/:id/relayed --------------------------------------------
+const relayedRoute = createRoute({
+  method: 'post',
+  path: '/v2/tasks/{id}/relayed',
+  tags: ['v2 proof-of-concept'],
+  summary: 'Mark a task\'s result as delivered',
+  description: 'POC mirror of POST /tasks/:id/relayed, delegating to the same relayTask() handler. No body.',
+  request: { params: IdParams },
+  responses: {
+    200: { description: 'relayed (idempotent)', content: { 'application/json': { schema: TaskSchema } } },
+    404: { description: 'no such task', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'no result yet — nothing to deliver', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+});
+v2.openapi(relayedRoute, (c) => {
+  const shim = v2ShimRes();
+  relayTask(shim, c.req.valid('param').id);
+  return v2LegacyResponse(shim);
+});
+
+// ---- POST /v2/tasks/:id/progress -------------------------------------------
+const progressRoute = createRoute({
+  method: 'post',
+  path: '/v2/tasks/{id}/progress',
+  tags: ['v2 proof-of-concept'],
+  summary: 'Post a progress note without closing the task',
+  description: 'POC mirror of POST /tasks/:id/progress, delegating to the same progressTask() handler. '
+    + 'Body { note?, by? } is optional — a bare POST with no body is a valid "still here", exactly as on v1.',
+  request: { params: IdParams },
+  responses: {
+    200: { description: 'noted; lease renewed; result still open', content: { 'application/json': { schema: z.object({ ok: z.boolean(), id: z.string(), at: z.string(), note: z.string().nullable(), progressCount: z.number(), leaseExpiresInSec: z.number().nullable(), resultStillOpen: z.boolean() }) } } },
+    404: { description: 'no such task', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'already answered, or held by a different claimant', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+});
+v2.openapi(progressRoute, (c) => v2DispatchLegacy(c, c.req.valid('param').id, progressTask));
+
+// ---- discovery + the OpenAPI document + Swagger UI -------------------------
+v2.get('/v2', (c) => c.json({
+  name: 'relay-queue v2 (proof-of-concept)',
+  scope: '5 routes only — claim, result, relayed, progress, tasks list. See HONO-POC.md.',
+  openapi: '/v2/openapi.json',
+  docs: '/v2/docs',
+}));
+
+/*
+ * Request bodies for claim/result/progress are deliberately NOT wired into
+ * Hono's own validator (see the file-level comment), so they don't appear in
+ * the auto-generated document. Patched in here by hand — for documentation
+ * and CLI-flag generation only, never enforced at runtime — so the OpenAPI
+ * doc these 5 routes produce is actually complete.
+ */
+function v2InjectRequestBodies(doc) {
+  const bodies = {
+    '/v2/tasks/{id}/claim': {
+      required: false,
+      content: { 'application/json': { schema: {
+        type: 'object',
+        properties: { by: { type: 'string', description: 'agent name taking the claim' } },
+        additionalProperties: true,
+      }, example: { by: 'iceland' } } },
+    },
+    '/v2/tasks/{id}/result': {
+      required: true,
+      content: { 'application/json': { schema: {
+        type: 'object',
+        required: ['result'],
+        properties: {
+          result: { description: 'the answer (any JSON value) — required, must not be null' },
+          by: { type: 'string', description: 'must match the current claim holder, if the task is claimed' },
+          images: { type: 'array', items: { type: 'string' }, description: 'image blob ids to attach to the answer' },
+          select: { type: 'string', enum: ['one', 'many', 'none'] },
+          selected: { type: 'array', items: { type: 'string' } },
+        },
+        additionalProperties: true,
+      }, example: { result: 'done', by: 'iceland' } } },
+    },
+    '/v2/tasks/{id}/progress': {
+      required: false,
+      content: { 'application/json': { schema: {
+        type: 'object',
+        properties: {
+          note: { type: 'string', maxLength: MAX_NOTE, description: 'short progress note (alias: text); omit for a bare "still here"' },
+          by: { type: 'string', description: 'must match the current claim holder, if the task is claimed' },
+        },
+        additionalProperties: true,
+      }, example: { note: 'running the suites' } } },
+    },
+  };
+  for (const [p, body] of Object.entries(bodies)) {
+    const op = doc.paths && doc.paths[p] && doc.paths[p].post;
+    if (op) op.requestBody = body;
+  }
+  return doc;
+}
+
+v2.get('/v2/openapi.json', (c) => {
+  const doc = v2.getOpenAPIDocument({
+    openapi: '3.0.0',
+    info: {
+      title: 'relay-queue v2 (proof-of-concept)',
+      version: '0.1.0-poc',
+      description: 'A bounded Hono + @hono/zod-openapi proof-of-concept covering 5 of relay-queue\'s '
+        + '~40 routes. Generated from the same route definitions the server validates requests with. '
+        + 'See HONO-POC.md for scope and an honest assessment of whether to continue this migration.',
+    },
+    servers: [{ url: `http://${HOST}:${PORT}` }],
+  });
+  v2InjectRequestBodies(doc);
+  return c.json(doc);
+});
+
+v2.get('/v2/docs', swaggerUI({ url: '/v2/openapi.json' }));
+
+const v2Listener = getRequestListener(v2.fetch);
+
 // ---------------------------------------------------------------- router
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -5775,6 +6093,13 @@ async function route(req, res) {
     fail(res, 405, `method ${m} not allowed here`, { allow: want });
     return false;
   };
+
+  // /v2/* — the bounded Hono/OpenAPI proof-of-concept, mounted as a distinct
+  // prefix so it runs ALONGSIDE the routes below rather than replacing any of
+  // them. See the "v2 (Hono + OpenAPI proof-of-concept)" comment right before
+  // this function for what it covers and why. Checked first and
+  // unconditionally: nothing below this line ever sees a /v2 request.
+  if (seg[0] === 'v2') return v2Listener(req, res);
 
   // / — the mobile web UI
   if (seg.length === 0) {

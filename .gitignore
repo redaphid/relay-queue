@@ -2,10 +2,15 @@
 data/
 *.jsonl
 
-# Node (there are no dependencies, but keep this honest)
+# Node. The server itself still has zero runtime dependencies; the /v2
+# Hono+OpenAPI proof-of-concept (see HONO-POC.md) added real ones, so the
+# lockfile is now committed for reproducible installs.
 node_modules/
 npm-debug.log*
-package-lock.json
+
+# ocli's local profile/spec cache, created by `npx ocli profiles add` when
+# generating a CLI against /v2/openapi.json — machine-local test state.
+.ocli/
 
 # Editor / OS noise
 .DS_Store

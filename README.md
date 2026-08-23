@@ -8,8 +8,10 @@ the thread. It is also still the agent-to-agent hand-off channel it started as �
 (posts tasks, reads results back) and a **Coordinator** (claims tasks, posts results) — so that
 nothing is lost while long background work is running. The agent side is driven by hand with `curl`.
 
-- **Zero runtime dependencies.** Node built-ins only (`node:http`). No npm install, no `node_modules`.
-  The UI is one self-contained HTML file — inline CSS and JS, no frameworks, no CDN, no external requests.
+- **Zero runtime dependencies for the API and UI you're actually using.** The core server is Node
+  built-ins only (`node:http`), and the UI is one self-contained HTML file — inline CSS and JS, no
+  frameworks, no CDN, no external requests. The one exception is `/v2`, a bounded Hono + OpenAPI
+  proof-of-concept covering 5 routes; see [`HONO-POC.md`](HONO-POC.md) for what it adds and why.
 - **Durable.** Every mutation is appended to `data/events.jsonl` and fsynced *before* the HTTP
   response is sent, then replayed into memory on boot. A crash right after a `200` cannot lose a write.
 - **Local.** Bare Node binds `127.0.0.1`. The container currently publishes `3901` on **all**
