@@ -1710,24 +1710,49 @@ function activitySummary(id) {
  * eats it) the page keeps working exactly as it did before, just less instantly.
  * The comment heartbeat is what stops an idle proxy from closing the connection.
  */
+// Each entry is { res, conv } — `conv` is the conversationId a connection
+// scoped itself to via `?conversation=`, or null for the unfiltered firehose
+// (GET /events with no query param, unchanged from before this existed).
 const streams = new Set();
 const MAX_STREAMS = 50;
 const SSE_PING_MS = 25000; // under the ~100 s idle timeout proxies typically use
 const SSE_RETRY_MS = 3000; // client reconnect delay
 
+/*
+ * What conversation a payload belongs to, for server-side stream filtering.
+ * Task broadcasts carry `conversationId` directly; conversation broadcasts
+ * carry the conversation object itself. Anything with neither (e.g. a global
+ * watch tick — see pushWatch) belongs to no single conversation and is
+ * dropped for a scoped subscriber rather than guessed at.
+ */
+function payloadConvId(payload) {
+  if (payload.conversationId) return payload.conversationId;
+  if (payload.conversation && payload.conversation.id) return payload.conversation.id;
+  return null;
+}
+
 function push(payload) {
   if (streams.size === 0) return;
   const frame = `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of streams) {
-    try { res.write(frame); } catch { /* socket already going away; 'close' will evict it */ }
+  const pconv = payloadConvId(payload);
+  for (const conn of streams) {
+    // A scoped connection (conn.conv set) only receives events belonging to
+    // that conversation. An unscoped connection (conn.conv === null) still
+    // gets everything, unchanged — that is what lets a full-firehose watcher
+    // (e.g. relay-watchdog) see every conversation over one connection.
+    if (conn.conv !== null && conn.conv !== pconv) continue;
+    try { conn.res.write(frame); } catch { /* socket already going away; 'close' will evict it */ }
   }
 }
 
 /*
  * Every frame names its conversation, so a page showing one conversation can
- * merge its own updates and merely *flag* the others. Deliberately not filtered
- * server-side: one stream carries everything, which is what lets the menu light
- * up for a conversation you are not looking at without a second connection.
+ * merge its own updates and merely *flag* the others. The firehose (no
+ * `?conversation=`) still carries everything over one connection, unfiltered,
+ * which is what lets the menu light up for a conversation you are not looking
+ * at without opening a second connection. A connection that opted into
+ * `?conversation=<id>` gets only that conversation's frames — filtered in
+ * push() above, before the frame is ever written to that socket.
  */
 function broadcast(taskId) {
   if (streams.size === 0) return;
@@ -1746,8 +1771,13 @@ function broadcastConv(id) {
   push({ now: nowIso(), conversation: conv });
 }
 
-function sseRoute(req, res) {
+function sseRoute(req, res, q) {
   if (streams.size >= MAX_STREAMS) return fail(res, 503, 'too many live connections');
+  // Same alias convention as /tasks, /thread, /checklists: `conversation` is
+  // canonical, `conversationId` accepted too. Absent or empty = unfiltered
+  // firehose, exactly the pre-existing behavior.
+  const raw = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+  const conv = raw !== null && raw !== '' ? raw : null;
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store',
@@ -1757,18 +1787,25 @@ function sseRoute(req, res) {
   if (res.socket) { res.socket.setNoDelay(true); res.socket.setTimeout(0); }
   res.write(`retry: ${SSE_RETRY_MS}\n\n`);
   res.write(`: connected ${nowIso()}\n\n`);
-  streams.add(res);
+  const conn = { res, conv };
+  streams.add(conn);
   // A page opening into an already-stranded state must see it immediately, not
   // on the next tick. Reconnects land here too, so a dropped stream self-heals.
-  try {
-    res.write(`data: ${JSON.stringify({ now: nowIso(), watch: watchSnapshot() })}\n\n`);
-  } catch { /* the close handler below will evict it */ }
+  // Only for an unscoped connection: the watch snapshot is global health, not
+  // one conversation's, so it has no conversationId to match a scoped filter
+  // against — sending it to a scoped subscriber would break the contract that
+  // a scoped stream carries only that conversation's own events.
+  if (conv === null) {
+    try {
+      res.write(`data: ${JSON.stringify({ now: nowIso(), watch: watchSnapshot() })}\n\n`);
+    } catch { /* the close handler below will evict it */ }
+  }
 
   const ping = setInterval(() => {
     try { res.write(': ping\n\n'); } catch { /* closing */ }
   }, SSE_PING_MS);
   if (ping.unref) ping.unref(); // never hold shutdown open
-  const done = () => { clearInterval(ping); streams.delete(res); };
+  const done = () => { clearInterval(ping); streams.delete(conn); };
   req.on('close', done);
   res.on('close', done);
   res.on('error', done);
@@ -5856,10 +5893,11 @@ async function route(req, res) {
     return damageRoute(res, q);
   }
 
-  // /events — Server-Sent Events push of every change
+  // /events — Server-Sent Events push of every change. Add ?conversation=<id>
+  // to scope the stream server-side to just that conversation's own events.
   if (seg.length === 1 && seg[0] === 'events') {
     if (!need('GET')) return;
-    return sseRoute(req, res);
+    return sseRoute(req, res, q);
   }
 
   // /stt — raw PCM in, transcript out (relayed to the Wyoming ASR engine)
