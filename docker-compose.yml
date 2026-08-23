@@ -84,3 +84,19 @@ services:
     volumes:
       # Writable: this one is here to update the working tree.
       - D:/projects/relay-queue:/repo
+      # origin is a PRIVATE repo, so the fetch needs a credential. This is a
+      # dedicated READ-ONLY DEPLOY KEY for relay-queue alone — not the human's
+      # personal key, which can push to everything he owns. GitHub refuses
+      # pushes for it, so the worst this container can do with it is read the
+      # one repo it already serves. It lives in ~/.ssh on the host and is never
+      # committed; only this path references it.
+      #
+      # `origin`'s URL is deliberately left alone. The key is selected inside
+      # the container via GIT_SSH_COMMAND (see tools/sync-repo.sh), so his own
+      # pushes from the host still authenticate with his own key as before.
+      - C:/Users/hypnodroid/.ssh/relay_queue_deploy:/keys/deploy_key:ro
+      # GitHub's published host keys, verified against api.github.com/meta.
+      # This is what makes StrictHostKeyChecking=yes possible: the original
+      # breakage was a missing known_hosts, and the shortcut fix would have been
+      # to stop checking host keys at all.
+      - C:/Users/hypnodroid/.ssh/github_known_hosts:/keys/known_hosts:ro

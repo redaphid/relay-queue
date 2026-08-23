@@ -18,11 +18,13 @@
 #     reason, and the reason matters. This script used to send fetch's stderr to
 #     /dev/null and then announce "origin unreachable" for every failure alike.
 #     That is a specific, confident diagnosis made after deliberately destroying
-#     the only evidence, and it has been wrong: the live failure is `Host key
-#     verification failed` — a missing known_hosts entry, i.e. AUTH — against an
-#     origin that `git ls-remote` reaches perfectly well from the host. Two
+#     the only evidence, and it was wrong: the failure it hid for days was `Host
+#     key verification failed` — a missing known_hosts entry, i.e. AUTH — against
+#     an origin that `git ls-remote` reaches perfectly well from the host. Two
 #     separate people burned time hunting a network fault that did not exist.
-#     So: print what git actually said, and diagnose nothing.
+#     So: print what git actually said, and diagnose nothing. (That auth failure
+#     is fixed below — a mounted read-only deploy key and a real known_hosts —
+#     but the honesty rule stays; it is what made the fix findable.)
 set -u
 
 REPO=${REPO:-/repo}
@@ -33,6 +35,45 @@ cd "$REPO" || { echo "[sync] $REPO is not readable — nothing to do"; exit 1; }
 
 # The mount is owned by the host user; git refuses to operate otherwise.
 git config --global --add safe.directory "$REPO" 2>/dev/null || true
+
+# --- the credential this sidecar fetches with --------------------------------
+# origin is PRIVATE, so there is no anonymous fetch to fall back on: this
+# container needs a credential of its own. It gets a DEDICATED READ-ONLY DEPLOY
+# KEY, mounted from the host at /keys and never committed — deliberately NOT the
+# human's personal key. The sidecar only ever needs to *read* one repo, and a
+# key GitHub refuses pushes for cannot rewrite history, cannot deploy anything
+# by accident, and cannot reach any of his other repositories. It also leaves
+# the shared `origin` URL alone, so his own pushes from the host keep working
+# exactly as before; everything here is scoped to this container.
+#
+# known_hosts is SUPPLIED, and StrictHostKeyChecking stays ON. The failure this
+# fixes was `Host key verification failed`, and the lazy repair is
+# StrictHostKeyChecking=no — which "works" by agreeing to trust whatever answers
+# to the name github.com, i.e. by deleting the check instead of satisfying it.
+# The mounted known_hosts carries GitHub's published host keys, so the check
+# still runs; it simply has the answer now.
+#
+# The key is copied out of the mount before use: OpenSSH refuses a private key
+# whose file is group- or world-readable, and a Windows bind mount always
+# presents one. Copying is what makes the mounted key usable, not paranoia.
+SSH_KEY_SRC=${SSH_KEY_SRC:-/keys/deploy_key}
+SSH_KNOWN_HOSTS_SRC=${SSH_KNOWN_HOSTS_SRC:-/keys/known_hosts}
+if [ -f "$SSH_KEY_SRC" ] && [ -f "$SSH_KNOWN_HOSTS_SRC" ]; then
+  mkdir -p /etc/relay-sync-ssh
+  cp "$SSH_KEY_SRC" /etc/relay-sync-ssh/deploy_key
+  cp "$SSH_KNOWN_HOSTS_SRC" /etc/relay-sync-ssh/known_hosts
+  chmod 700 /etc/relay-sync-ssh
+  chmod 600 /etc/relay-sync-ssh/deploy_key
+  chmod 644 /etc/relay-sync-ssh/known_hosts
+  GIT_SSH_COMMAND="ssh -i /etc/relay-sync-ssh/deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/relay-sync-ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+  export GIT_SSH_COMMAND
+  echo "[sync] fetching with the mounted read-only deploy key, host key checking ON"
+else
+  # Say this plainly rather than letting it surface later as a confusing auth
+  # error. A private origin plus no key is not a transient fault; it is a
+  # missing mount, and nothing below will succeed until someone adds it.
+  echo "[sync] no deploy key mounted at $SSH_KEY_SRC — an SSH fetch of a private origin will fail"
+fi
 
 echo "[sync] watching $REPO for origin/$BRANCH, every ${SYNC_INTERVAL}s"
 warned_no_origin=0
