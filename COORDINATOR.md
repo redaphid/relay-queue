@@ -33,6 +33,14 @@ Bare `GET /events` with no `?conversation=` still works today and is identical t
 
 Also filter out SSE keepalive/retry framing client-side even on a scoped stream — server-side conversation-scoping drops other conversations' frames, but not the raw protocol noise (`: ping` comments, blank lines, `retry:` lines). A `curl | grep --line-buffered -E '^data:.*"entries":\[\{'` (or equivalent in your Monitor tool) keeps you from waking on connection-level noise with no real content. Multiple coordinators independently lost real tokens to this on 2026-08-23 before it was documented here.
 
+**The server restarts on every source change (see deployment hazards below), which silently drops every open SSE connection, including your own Monitor.** Wrap the stream in a reconnect loop instead of a bare one-shot curl:
+
+```sh
+while true; do curl -N -s "http://127.0.0.1:3901/events?conversation=<yours>"; sleep 2; done | grep --line-buffered -E '^data:.*"entries":\[\{'
+```
+
+**A reconnect only gives you events going forward from the new connection — anything that happened during the gap (dead Monitor, restart, or just resuming after being idle) is silently missed unless you explicitly poll current state right after reconnecting.** `GET /tasks?conversation=<id>&status=pending` (and `status=claimed`, to catch your own orphaned claims) immediately after any reconnect, not just resumed watching. Both of these were independently discovered the same night as the keepalive-filtering issue above — treat any SSE gap as a real risk, not a formality.
+
 **If you're on an older build without the query param**, filter client-side in the pipeline itself, not after waking: `| grep --line-buffered '"conversationId":"<yours>"'`. Cost of getting this wrong is real — an unfiltered `| grep --line-buffered .` measured at ~100K tokens per wakeup just to conclude "not mine."
 
 For container-level debugging: `docker logs -f relay-queue --since 1m 2>&1 | grep --line-buffered -E "ERROR|WARN"` (merge stderr with `2>&1` or failures go unseen).
