@@ -60,6 +60,7 @@ For container-level debugging: `docker logs -f relay-queue --since 1m 2>&1 | gre
 | request stop (advisory) | `POST /conversations/<id> {"stopRequested":true,"stopRequestedBy":"..."}` |
 | stop-ack | `POST /conversations/<id>/stop-ack {"agent":"...","phase":"stopping"\|"stopped","note"?,"worktrees"?}` |
 
+- **On claiming a conversation, check `GET /checklists?conversation=<id>` before concluding anything is clear — not just `GET /tasks?status=pending`.** A conversation can have zero pending tasks and still have real outstanding work sitting in checklists (a message with `- [ ]` items). One coordinator declared a 17-item, 6-checklist backlog "clear" on 2026-08-23 by checking only the pending-tasks queue. `?status=pending` shows the newest unanswered item, not full outstanding state.
 - No delete route exists for conversations. Archive is the only "clear" and it's always reversible (`{"archived":false}`).
 - Archiving hides from the default list only — it does NOT affect `/status`, `/health`, pending counts, or the watchdog. A pending task in an archived conversation still counts as pending.
 - `agent:null` preserves stop history (`stopAck`/`stopNote`/etc stay). Setting a *different* non-null agent name clears all of it. Re-asserting the same name is a no-op.
