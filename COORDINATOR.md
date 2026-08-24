@@ -33,6 +33,8 @@ Bare `GET /events` with no `?conversation=` still works today and is identical t
 
 Also filter out SSE keepalive/retry framing client-side even on a scoped stream — server-side conversation-scoping drops other conversations' frames, but not the raw protocol noise (`: ping` comments, blank lines, `retry:` lines). A `curl | grep --line-buffered -E '^data:.*"entries":\[\{'` (or equivalent in your Monitor tool) keeps you from waking on connection-level noise with no real content. Multiple coordinators independently lost real tokens to this on 2026-08-23 before it was documented here.
 
+**If you only care about STATE (a task reaching its final answer), not every lifecycle transition, filter narrower than just conversationId.** A single checklist tick on an actively-worked conversation can produce a claim event, a progress event, a result event, and a relayed event — 4+ separate wakes for one logical change, each costing a turn even if you correctly no-op on the duplicates. For a consumer that only needs to know "this settled," filter for `"status":"done"` and `"relayed":true` together, or for checklist-sourced changes specifically, `"from":"checklist"`. This cuts the redundancy from ~4x down to ~1x on a busy conversation. Found on 2026-08-23 by a sync agent whose broad `"conversationId"` filter fixed its original never-fires bug but left this 4x-wakeup cost in place.
+
 **The server restarts on every source change (see deployment hazards below), which silently drops every open SSE connection, including your own Monitor.** Wrap the stream in a reconnect loop instead of a bare one-shot curl:
 
 ```sh
