@@ -7,6 +7,26 @@ actually working (e.g. `D:\mechs\<harness>\CLAUDE.md`), not here.
 
 Base URL: `http://127.0.0.1:3901`. No auth of its own — see **Safety** below.
 
+## Announce yourself before you work
+
+**The moment you are attached to a conversation, post one line into it — before reading a file, before arming a watcher, before anything else.** This is a liveness mechanic, not etiquette, which is why it lives here.
+
+```sh
+curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/json' \
+  -d '{"conversationId":"<yours>","agent":"<YourName>","text":"**<YourName>** starting - <one line on what you were asked to do>."}'
+```
+
+**A silently-working agent is indistinguishable from a dead one — to the human and to relay itself.** On 2026-08-26 a router attached two coordinators (`ConfigCoord`, `VikunjaCoord`) to fresh tabs and briefed them to go do the work, without telling them to announce themselves. Both went heads-down. One had already answered the question and was mid-edit; the other's tab read `messages: 0`, `state: "never"`. Within ~3 minutes the human posted "Poke", then "Neither tab is responsive". **Neither agent was dead.** `relay-watchdog` was at the same time nagging that `ConfigCoord` was silent — while `ConfigCoord` was the agent fixing the watchdog.
+
+- **The ack is not a claim and not a progress note.** Those both need a task to exist; a freshly-attached coordinator usually has none yet, which is exactly the window where the tab reads `never`. `POST /messages` needs nothing but the conversation id.
+- **This applies to every agent, at every depth** — a coordinator attached to a tab, and a subagent dispatched into one. If you are expected to produce work, say so before you start producing it.
+- **Keep posting while you work.** One dump at the end is the failure mode, not the fix — see **Tasks** for the lease arithmetic that makes silence expensive.
+- **Post a closing line when you finish**, so the tab does not simply go quiet again and re-enter the same ambiguity.
+- **If you were briefed to do something and the brief did not tell you to ack, ack anyway.** The two coordinators above followed their briefs exactly.
+- Plain ASCII in the body (see **Tasks**).
+
+**If you dispatch agents, brief them with this rule.** The failure above was not the workers' — it was in the dispatch. Naming and announcing are covered in **Activity reporting**.
+
 ## Watch, don't poll
 
 Use the Monitor tool against the SSE stream instead of a sleep-loop. **Scope the stream server-side — don't rely on client-side grep as your only filter:**
@@ -76,14 +96,16 @@ For container-level debugging: `docker logs -f relay-queue --since 1m 2>&1 | gre
 |---|---|
 | post | `POST /tasks {"conversationId":"...", "text"/"instruction":"...", ...}` |
 | list | `GET /tasks?conversation=<id>&status=pending` |
-| claim | `POST /tasks/<id>/claim` |
+| claim | `POST /tasks/<id>/claim {"by":"..."}` — the field is `by`, **not** `agent` |
 | result | `POST /tasks/<id>/result {"result":"...", "by":"..."}` — one-shot; 409 if already done; `result:null` refused 400 |
 | mark relayed | `POST /tasks/<id>/relayed {"by":"..."}` |
 | progress | `POST /tasks/<id>/progress {"by":"...", "note"?}` |
 
+- **The claim field is `by`, not `agent` — and getting it wrong fails silently and unrecoverably.** `POST /tasks/<id>/claim {"agent":"Name"}` returns **200** and sets `status:"claimed"` with **`claimedBy: null`**: `claimTask()` reads `body.by` only (`const by = typeof body.by === 'string' && body.by ? body.by : null`), and it cannot reject a missing one because a bare bodyless claim is deliberately still supported. The task is now held by nobody for the full 15-minute `CLAIM_LEASE_MS`, and **you cannot fix your own mistake** — re-claiming correctly with `{"by":"Name"}` returns `409 task is already claimed` reporting `claimedBy: null`. Nothing else flags it: `progress` still returns 200 (it allows an unheld task by design), and `result` has no ownership guard either, so a *different* agent that was refused the claim can still post the answer — an ownerless claim is a live double-answer hazard, not just cosmetic. The deadman banner renders `claimedBy || 'an agent'`, so the stuck task also reports namelessly. **The trap is that `agent` is the correct field for `POST /conversations/<id>` and for `/activity`, so the wrong body reads right.** Two different agents hit this independently on 2026-08-26; verified end-to-end the same day against a throwaway instance (own `DATA_DIR`, own port), not inferred from source.
 - **Never mark `relayed` before you've seen the `result` POST return 200.** Chaining them blind can leave a task `claimed` with `result:null` but `relayed:true` — closed with the question silently unanswered.
 - No bulk-cancel/bulk-close route exists. Every pending task is answered individually.
-- `progress` doesn't consume the result slot — post as many as you like while a claim is in flight. `by` must match whoever holds the claim (409 otherwise). A progress note vouches for you for 10 minutes, then stops counting — post again if you're still working past that, from inside real work, never from a timer.
+- `progress` doesn't consume the result slot — post as many as you like while a claim is in flight. The ownership rule is narrower than it looks: no `by` is fine, `by` matching the holder is fine, and `by` on a task **nobody** holds is fine; only "I am B" about a task held by A is refused 409. A progress note vouches for you for 10 minutes, then stops counting — post again if you're still working past that, from inside real work, never from a timer.
+- **Report progress *while* working, not one dump at the end.** Work longer than ~10 minutes without a signal and relay treats you as dead, and **re-claiming does not reset that clock** — a claim is not a signal, only results and progress notes are. This is the same failure as never acking at all (see **Announce yourself before you work**), just arriving later: the human and the watchdog both read a long quiet stretch as death, and neither can tell a wedged agent from a thorough one. If the work has no task to hang a `progress` note on, post a plain message into the conversation instead.
 - Build result JSON with a serializer, not a hand-rolled heredoc — a malformed body reads back as `"result is required"`, which looks like a missing field, not a parse failure. PowerShell + `ConvertTo-Json` + a UTF-8 byte body is reliable on this box; `node -e` hits Git-Bash path translation.
 - **Plain ASCII only in any JSON body.** This box's shell re-encodes em-dashes/smart quotes into bytes the server rejects outright: `"the request body is not valid UTF-8, so nothing was stored"`. Use `-`, not `—` or `–`.
 
@@ -154,7 +176,7 @@ A flat 1-credit-per-feature economy: a "Chores" coordinator awards credits at it
 
 **Atomicity.** Event-sourced like everything else here (`t:"creditsAward"` / `t:"creditsSpend"` in `data/events.jsonl`, replayed into `creditsBalance`/`creditsHistory` in memory on boot) — a restart never loses the balance. The spend race (two coordinators calling spend at once when balance is exactly 1) cannot both succeed: the balance check and the `appendEvent` call that acts on it run synchronously in one turn of Node's event loop, with no `await` in between, so no other request can interleave. Verified in `tools/credits-selftest.js` by firing two real concurrent HTTP `POST /credits/spend` calls at balance=1 and asserting exactly one gets `200` and the balance settles at `0`, never negative — and by deliberately breaking that guarantee (inserting an `await` between the check and the write) to confirm the test actually goes red, not just green by construction.
 
-## Activity reporting (optional)
+## Activity reporting — naming subagents
 
 ```sh
 curl -X POST http://127.0.0.1:3901/conversations/<id>/activity -H 'content-type: application/json' \
@@ -163,9 +185,11 @@ curl -X POST http://127.0.0.1:3901/conversations/<id>/activity -H 'content-type:
   -d '{"agent":"me","kind":"finished","subagent":"agent-foo","ok":true}'
 ```
 
+**Every subagent gets a name, and the name is reported.** Not an internal label — the `spawned`/`finished` rows render in the conversation UI, so the name is what the human actually sees while the work is in flight. "an agent is doing something" is not a status; `VikunjaCoord` is. Give it a name that says what it is for, use that same name in the subagent's own ack line (see **Announce yourself before you work**) and in its `by` on any claim, so one name follows the work across the UI, the queue, and the thread.
+
 - `kind`: `spawned` | `finished` | `tool` | `note`. Only the parent posts `spawned`/`finished`, exactly once each — a worker never announces itself (a stray self-`spawned` overwrites its own row and can resurrect a finished worker as `running:true`, `nameCollision:true`).
 - `spawned` and `finished` pair on the subagent NAME. Post `spawned` at actual spawn time — a backfilled roster carries backfill timestamps, not true start times.
-- None of this counts as liveness. Liveness is claims, results, and progress notes only.
+- None of this counts as liveness. Liveness is claims, results, and progress notes only — an activity row does not vouch for you, and neither, strictly, does the opening ack, which is a plain `POST /messages`. The ack answers the human and puts something in an otherwise-empty tab; `progress` is what answers the watchdog. Past the first ten minutes you need both.
 
 ## This repository's own deployment hazards
 
