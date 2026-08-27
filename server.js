@@ -71,6 +71,13 @@ const DEFAULT_CONV = 'main';
 const DEFAULT_CONV_TITLE = 'Main';
 const MAX_TITLE = 200;
 const MAX_AGENT = 200;
+/*
+ * Session boundaries kept per conversation. This rides along on every
+ * /conversations read, which the page polls, so it is capped rather than
+ * unbounded — and capped at a number far larger than anyone will ever scroll
+ * past, so the cap never silently eats a boundary he was looking for.
+ */
+const MAX_CONTEXT_MARKS = 100;
 
 // --- speech to text (POST /stt) -------------------------------------------
 // Audio is relayed to a Wyoming ASR server (wyoming-whisper) over a plain TCP
@@ -405,6 +412,38 @@ function newConversation(id, title, agent) {
     // What the agent says it was holding when it wound down. Reported, never
     // observed: this server does not touch git and cannot verify a word of it.
     worktrees: null,
+    /*
+     * WHO SPAWNED THE AGENT — and therefore who, if anyone, is able to kill it.
+     *
+     * This queue cannot stop a process and never will (see FORCE_KILL_NOTE).
+     * The only thing that can is the top-level session that started the agent,
+     * so a "stop it for real" control is only honest if it knows WHICH session
+     * that was. Null is the truthful default and means exactly one thing: this
+     * server has no record, so nothing may claim a kill is available. It is
+     * never inferred — a guess here would put a confident button in front of a
+     * process nobody can reach, which is the failure the whole stop/ack design
+     * exists to refuse.
+     */
+    spawnedBy: null,
+    /*
+     * The context watermark for a cleared session. A fresh agent seated in this
+     * conversation reads `?since=<contextFrom>` instead of the whole backlog, so
+     * "clear" means the next occupant genuinely starts blank while the history
+     * stays readable to the human. Null means never cleared, which is not the
+     * same as cleared-at-the-beginning and must not render as it.
+     */
+    contextFrom: null,
+    /*
+     * EVERY watermark ever set here, oldest first, as `{ at, agent }` — where
+     * `agent` is whoever was being cleared AWAY, the only occupant known at the
+     * time. `contextFrom` alone is a single scalar and answers the agent's
+     * question ("where do I start reading?"); it cannot answer the human's
+     * ("where did each session begin?"), because setting a second watermark
+     * overwrites the first. The thread draws one divider per entry here, so a
+     * tab cleared five times shows five session boundaries instead of silently
+     * losing four of them.
+     */
+    contextMarks: [],
   };
 }
 
@@ -419,6 +458,7 @@ function normaliseConv(conv) {
     archived: false, archivedAt: null,
     stopRequested: false, stopRequestedAt: null, stopRequestedBy: null,
     stopAck: null, stopAckAt: null, stoppedAt: null, stopNote: null, worktrees: null,
+    spawnedBy: null, contextFrom: null, contextMarks: [],
   };
   for (const [k, v] of Object.entries(base)) if (conv[k] === undefined) conv[k] = v;
   return conv;
@@ -5470,6 +5510,66 @@ function updateConversation(res, id, body) {
      */
   }
 
+  /*
+   * WHO CAN ACTUALLY KILL THIS ONE. Declared by the session that spawned the
+   * agent, at the moment it spawns it — never inferred here, because the only
+   * thing worse than a control that cannot kill is one that says it can and is
+   * wrong. Absent, it stays null and every client is obliged to say "no record".
+   */
+  if (body.spawnedBy !== undefined) {
+    if (body.spawnedBy === null || body.spawnedBy === '') patch.spawnedBy = null;
+    else if (typeof body.spawnedBy !== 'string') return fail(res, 400, 'spawnedBy must be a string or null');
+    else patch.spawnedBy = body.spawnedBy.trim().slice(0, MAX_AGENT);
+  } else if (patch.agent !== undefined && patch.agent !== conv.agent) {
+    /*
+     * A new occupant arrived without saying who started it. The previous
+     * agent's spawner describes the previous agent and nothing else, so it is
+     * dropped rather than inherited — an inherited value would point a kill
+     * button at a session that never started the process now sitting here.
+     */
+    patch.spawnedBy = null;
+  }
+
+  /*
+   * THE CONTEXT WATERMARK. `true` means "from now", which is the only thing a
+   * UI ever wants to say; an explicit timestamp is accepted so a clear can be
+   * replayed or corrected, and null undoes it. A watermark in the future, or
+   * one that is not a date at all, would silently hide the entire thread from
+   * the next agent, so both are refused rather than clamped.
+   */
+  if (body.contextFrom !== undefined) {
+    if (body.contextFrom === null || body.contextFrom === false) patch.contextFrom = null;
+    else if (body.contextFrom === true) patch.contextFrom = nowIso();
+    else if (typeof body.contextFrom === 'string') {
+      const t = Date.parse(body.contextFrom);
+      if (!Number.isFinite(t)) return fail(res, 400, 'contextFrom must be an ISO timestamp, true, or null');
+      if (t > Date.now() + 60000) return fail(res, 400, 'contextFrom cannot be in the future');
+      patch.contextFrom = new Date(t).toISOString();
+    } else return fail(res, 400, 'contextFrom must be an ISO timestamp, true, or null');
+
+    /*
+     * The human-facing half. `contextFrom` moves; this only ever grows, so the
+     * thread can draw a boundary for every session the tab has had rather than
+     * just the current one. `agent` is the OUTGOING occupant, captured here
+     * because it is the last moment anyone knows who it was — after the clear
+     * the seat is empty and the name is gone.
+     *
+     * Clearing the watermark (null) drops the marks too. A divider drawn for a
+     * boundary that no longer governs what anything reads is a line across the
+     * thread with nothing on either side of it.
+     */
+    const marks = Array.isArray(conv.contextMarks) ? conv.contextMarks.slice() : [];
+    if (patch.contextFrom === null) {
+      patch.contextMarks = [];
+    } else if (!marks.some((m) => m && m.at === patch.contextFrom)) {
+      marks.push({ at: patch.contextFrom, agent: conv.agent || null });
+      marks.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+      // Bounded, oldest dropped first: a tab cleared hundreds of times must not
+      // grow an unbounded array that ships on every /conversations read.
+      patch.contextMarks = marks.slice(-MAX_CONTEXT_MARKS);
+    }
+  }
+
   if (body.stopRequested !== undefined) {
     if (typeof body.stopRequested !== 'boolean') {
       return fail(res, 400, 'stopRequested must be true or false');
@@ -5496,7 +5596,7 @@ function updateConversation(res, id, body) {
   }
 
   if (!Object.keys(patch).length) {
-    return fail(res, 400, 'nothing to update (title, agent, archived or stopRequested)');
+    return fail(res, 400, 'nothing to update (title, agent, archived, stopRequested, spawnedBy or contextFrom)');
   }
   appendEvent({ t: 'convpatch', id, patch });
   /*
