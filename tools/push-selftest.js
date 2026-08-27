@@ -859,6 +859,55 @@ async function overHttpSweep() {
     const stopAfter = await getJson(`/conversations/${stopping.id}`);
     check('a conversation mid-stop is not swept out from under the request',
       stopAfter.agent === 'coord-stop', JSON.stringify(stopAfter.agent));
+
+    /*
+     * SEATING SOMEONE NEW IN A CHAIR THE SWEEP JUST EMPTIED.
+     *
+     * The sweep's clock reads the TAB's activity — last message, last progress
+     * note, last heartbeat. That is the right clock for "has the occupant gone
+     * quiet", and the wrong one for "is anybody sitting here", because a tab
+     * that has been quiet for an hour is quiet no matter who just sat down in
+     * it. So the moment a new agent is attached to a long-quiet tab, the very
+     * next sweep sees a named agent over an hour-old clock and vacates them —
+     * and because appendEvent() ends in pushWatch(), which calls the sweep,
+     * that "next sweep" runs INSIDE the attach request, between the write and
+     * the reply. The route then serialises the live record it just wrote and
+     * ships `agent: null` under a 200.
+     *
+     * That is the bug, and the 200 is the worse half of it. On 2026-08-27 it
+     * cost a coordinator two attach attempts, a stack of GETs and a wrong
+     * conclusion ("this tab is somehow special") before anyone looked at the
+     * sweep, because every single observation said the call had succeeded.
+     *
+     * Both halves are asserted, and the honesty one is asserted FIRST and
+     * separately from the success one. A route that refuses this on purpose is
+     * a defensible design; a route that refuses it while returning the success
+     * shape is not, and that distinction has to survive someone later deciding
+     * the refusal was right.
+     */
+    console.log('\nover HTTP: a chair the sweep emptied can be filled again');
+    const attach = await post(`/conversations/${gone.id}`, { agent: 'coord-new' });
+    check('*** attaching to a long-quiet tab never returns 200 over a write that did not land ***',
+      !(attach.status === 200 && attach.body.agent !== 'coord-new'),
+      `HTTP ${attach.status} carrying agent=${JSON.stringify(attach.body.agent)} — a success `
+      + 'status over a body that shows the write was undone is the silent-success shape');
+    check('...and the new occupant is seated rather than refused',
+      attach.status === 200 && attach.body.agent === 'coord-new',
+      `HTTP ${attach.status} agent=${JSON.stringify(attach.body.agent)}`);
+    check('...a later GET agrees, so the reply was not a one-off view',
+      (await getJson(`/conversations/${gone.id}`)).agent === 'coord-new',
+      JSON.stringify((await getJson(`/conversations/${gone.id}`)).agent));
+
+    /*
+     * ...and stays seated. The write landing for one instant is not the fix;
+     * the fix is that the new occupant gets the same full CHAIR_VACANT_MS of
+     * grace the constant promises everyone else, measured from when THEY sat
+     * down rather than from the last thing the previous occupant did.
+     */
+    await sleep(TICK_MS * 4);
+    check('...and the sweep does not evict them again on the very next tick',
+      (await getJson(`/conversations/${gone.id}`)).agent === 'coord-new',
+      JSON.stringify((await getJson(`/conversations/${gone.id}`)).agent));
   } catch (e) {
     failures++;
     console.log(`  FAIL the sweep HTTP section did not run — ${e && e.message}`);
@@ -869,7 +918,83 @@ async function overHttpSweep() {
   }
 }
 
-overHttp().then(overHttpNudge).then(overHttpEscalation).then(overHttpSweep).then(() => {
+/*
+ * THE ROUTE MUST NOT REPORT A SUCCESS IT DID NOT PERFORM.
+ *
+ * The section above proves the sweep no longer evicts a freshly-seated agent,
+ * which removes the only known way for an attach to be silently undone. That
+ * leaves the guard in updateConversation() covering a case nothing exercises —
+ * and a check nobody has ever watched fire is not a check. So this section
+ * forces the clobber back into existence by other means and insists the route
+ * says so out loud.
+ *
+ * CHAIR_VACANT_MS=0 is the lever: it means "presume every chair vacant the
+ * instant you look", so the sweep evicts an agent seated microseconds ago. That
+ * is a nonsense configuration and deliberately so — the point is not that
+ * anyone would run it, but that it reliably reproduces the SHAPE of the bug
+ * (a conversation patch undone inside the request that made it) without
+ * depending on the specific sweep clock this change just fixed. If some future
+ * write-during-write is introduced, this is the assertion that refuses to let
+ * it return 200.
+ *
+ * Verified red: against the code before the guard, this section reports HTTP
+ * 200 with `agent: null` in the body — byte for byte the shape that cost a
+ * coordinator two attach attempts and a wrong conclusion on 2026-08-27.
+ */
+async function overHttpAttachHonesty() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-honest-'));
+  srv = await startServer({
+    dir,
+    port: TEST_PORT,
+    label: 'attach-honesty',
+    env: {
+      WATCH_TICK_MS: '200',
+      CHAIR_VACANT_MS: '0', // every chair is presumed vacant on sight
+      NUDGE_RENUDGE_MS: '100000',
+      PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
+    },
+    unsetEnv: ['PUSH', 'PUSH_PER_HOUR', 'PUSH_PER_HOUR_ALERTS'],
+    timeoutMs: 20000,
+  });
+
+  try {
+    // Created with no agent, so the create itself is honest: an empty chair is
+    // what was asked for and an empty chair is what comes back. The attach is
+    // the call under test.
+    const c = (await post('/conversations', { title: 'doomed chair' })).body;
+    const attach = await post(`/conversations/${c.id}`, { agent: 'coord-doomed' });
+
+    console.log('\nover HTTP: an attach that gets undone in-flight is refused, not reported as done');
+    check('*** it is NOT a 200 — the write did not survive the request ***', attach.status !== 200,
+      `HTTP ${attach.status} with body agent=${JSON.stringify(attach.body && attach.body.agent)}`);
+    check('...it is a 409: the state moved under the request', attach.status === 409,
+      `HTTP ${attach.status}`);
+    check('...and it says which field was overwritten',
+      Array.isArray(attach.body.fields) && attach.body.fields.includes('agent'),
+      JSON.stringify(attach.body.fields));
+    check('...naming both what was asked and what is actually stored',
+      attach.body.asked && attach.body.asked.agent === 'coord-doomed'
+      && attach.body.stored && attach.body.stored.agent === null,
+      JSON.stringify({ asked: attach.body.asked, stored: attach.body.stored }));
+    check('...and pointing at the sweep rather than at the caller',
+      typeof attach.body.likelyCause === 'string' && /sweep/i.test(attach.body.likelyCause),
+      JSON.stringify(attach.body.likelyCause));
+    // The refusal has to be TRUE, not just loud: a 409 over a write that
+    // actually landed would be its own kind of lie.
+    check('...and the refusal is accurate — the agent really is not seated',
+      (await getJson(`/conversations/${c.id}`)).agent === null,
+      JSON.stringify((await getJson(`/conversations/${c.id}`)).agent));
+  } catch (e) {
+    failures++;
+    console.log(`  FAIL the attach-honesty section did not run — ${e && e.message}`);
+    if (srv.out) console.log(srv.out.split('\n').slice(-8).map((l) => `       | ${l}`).join('\n'));
+  } finally {
+    await srv.stop();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows can hold it briefly */ }
+  }
+}
+
+overHttp().then(overHttpNudge).then(overHttpEscalation).then(overHttpSweep).then(overHttpAttachHonesty).then(() => {
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
 }).catch((err) => {
