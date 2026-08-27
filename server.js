@@ -2440,6 +2440,55 @@ const NUDGE_PENDING_MS = Number(process.env.NUDGE_PENDING_MS || 2 * 60 * 1000);
 // only if it is STILL the oldest unclaimed task after this long.
 const NUDGE_RENUDGE_MS = Number(process.env.NUDGE_RENUDGE_MS || 5 * 60 * 1000);
 /*
+ * THE EMPTY CHAIR THAT STILL HAS A NAME ON IT.
+ *
+ * On 2026-08-27 he got 390 push notifications in 24 hours and 328 of them —
+ * 84% — came from nudgeStalePending() alone. Not one described a real problem.
+ * The cause is this: `conv.agent` is set when a coordinator takes a tab and is
+ * cleared only by stopAckRoute(), which an agent reaches ONLY when a human has
+ * asked it to stop. An agent that simply finishes its work and exits — which is
+ * what every well-behaved agent does — never calls it. Its name stays on the
+ * tab forever.
+ *
+ * That single stale string is load-bearing in the worst way. stalePending()
+ * deliberately fires only for tabs that HAVE a coordinator, on the reasoning
+ * that someone is there to answer. So every finished agent left behind a tab
+ * that looked permanently staffed, and anything posted into it re-nudged him
+ * every NUDGE_RENUDGE_MS forever. Twenty agents finished that day. Twelve
+ * pushes an hour each, and the hourly budget was repeatedly exhausted — so the
+ * phantoms were not merely noise, they were spending the ceiling that GENUINE
+ * alerts needed and relay was dropping real ones on the floor.
+ *
+ * The obvious fix — "agents should stand down as their last act" — is not a
+ * fix. It is a step an agent must remember, and a step an agent must remember
+ * is a step an agent will forget; that is precisely the bug, restated as a
+ * rule. So the clock does it instead, here, where nothing can skip it.
+ *
+ * WHAT THIS DOES NOT DO, and the distinction is the whole design. It does NOT
+ * mark the conversation `stopped`. stopAckRoute() is the only thing entitled to
+ * say that, because only the agent itself knows, and inventing that confirmation
+ * on a timer is exactly what the comment there refuses to do. This makes a
+ * weaker and honest claim: NOBODY HAS BEEN IN THIS CHAIR FOR A LONG TIME, so
+ * stop addressing work to whoever used to sit in it. stopAck stays null, so
+ * "finished cleanly" and "presumed gone" remain tellable apart forever.
+ *
+ * It is also reversible and self-correcting: the vacated name is kept in
+ * `agentLeft`, and an agent that was merely busy re-takes the tab by acting.
+ * Generous on purpose — 45 minutes of TOTAL silence (no claim, no result, no
+ * progress note, no heartbeat). A coordinator in the long middle of a job posts
+ * progress notes and is never touched; see PROGRESS_FRESH_MS and the `working`
+ * state, which exists for exactly that agent.
+ */
+const CHAIR_VACANT_MS = Number(process.env.CHAIR_VACANT_MS || 45 * 60 * 1000);
+/*
+ * HOW LONG THE ROUTER GETS BEFORE A LIVENESS PROBLEM BECOMES HIS PROBLEM.
+ * See routeLiveness(). Liveness is an agent-operations concern and he asked, in
+ * as many words, not to be paged about it — but "not paged" must never become
+ * "unreachable", so the escalation stays. It fires only when the Router itself
+ * has gone quiet, which is the one case where no agent is left to handle it.
+ */
+const LIVENESS_ESCALATE_MS = Number(process.env.LIVENESS_ESCALATE_MS || 15 * 60 * 1000);
+/*
  * THE CLAIM LEASE. A claim used to last forever, so an agent that died still
  * held its message: one sat 3h14m and another 32m, and nothing but luck found
  * either. The lease is deliberately PERMISSIVE rather than pre-emptive:
@@ -2891,26 +2940,213 @@ function watchSnapshot() {
 const lastNudgeAt = new Map(); // taskId -> ms
 
 /*
- * THE NUDGE. Same tick as the deadman banner above, same push pipeline
- * (queueNotify -> debounce -> quiet hours -> hourly budget -> sendToAll), so
- * it inherits all of that for free rather than duplicating it. What's new is
- * only: which conversations qualify (stalePending(), 2 minutes, agent
- * assigned) and how often the same stale task is allowed to nudge again
- * (NUDGE_RENUDGE_MS) — without that second part this would fire every 15s
- * tick forever for one still-unclaimed task, which is exactly the spam this
- * was built to avoid.
+ * THE LIVENESS CHANNEL — where "is an agent alive?" goes instead of his phone.
+ *
+ * Same shape as CHECK_CHANNEL and PICK_CHANNEL above, and deliberately so: a
+ * record born `visibility:'internal'`, `status:'done'`, `relayed:true`, on its
+ * own `#liveness` conversation. Three consequences, all of them the point:
+ *
+ *   - classify() returns null on isInternal() before it looks at anything else
+ *     (rule zero), so a record here CANNOT push. Not "does not by default" —
+ *     cannot, even if some future caller passes a notify hint.
+ *   - It is `done` and `relayed` at birth, so it creates NO TASK and no chore.
+ *     Routing liveness away from his phone must not simply move the pile into
+ *     his queue instead; that is the same interruption wearing a different hat.
+ *   - It is still durable and pollable: GET /messages?channel=liveness&since=…
+ *     Nothing is thrown away. It is re-addressed.
+ *
+ * WHY THIS EXISTS. Every alert this file used to send him about agent liveness
+ * was asking a human to solve an agent-operations problem, at 3am, from a
+ * phone, with no way to act on it. He said so directly: "Don't page me about
+ * liveness." relay-watchdog already worked this way — routine findings to a
+ * channel, escalate only if unanswered — and escalated zero times in twelve
+ * hours while this file sent 344. The pattern was already here and proven; the
+ * two functions below simply never used it.
+ */
+const LIVENESS_CHANNEL = 'liveness';
+/** key -> { firstAt, escalated } — see routeLiveness(). */
+const livenessSeen = new Map();
+
+/*
+ * Post a liveness finding to the channel, and escalate to him ONLY if the
+ * Router has gone quiet too.
+ *
+ * The escalation test is `main`'s lastActedAt, which is what the Router acts
+ * through, and it is read in-process — no extra hop, nothing to keep in sync.
+ * The rule is: if the Router has done ANYTHING since this finding first
+ * appeared, it has the finding and this is none of his business. Only if the
+ * Router has itself been silent for LIVENESS_ESCALATE_MS does it reach him.
+ *
+ * That test is deliberately coarse and deliberately biased toward silence. A
+ * busy Router suppresses the page, which is correct: the entire complaint was
+ * being paged about things an agent was already handling. The case it still
+ * catches is the one that actually strands him — the Router itself being gone,
+ * where no amount of channel-posting would ever be read by anybody.
+ *
+ * Escalation fires ONCE per finding (`escalated`), never on a repeat. The bug
+ * being fixed here was a re-nudge loop; a re-escalation loop would be the same
+ * bug with a longer period.
+ */
+function routeLiveness(category, text, conversationId, taskId, escalates = true) {
+  if (notifyDepth > 0) return;
+  const ts = nowIso();
+  const now = Date.now();
+
+  /*
+   * notifyDepth guards the appendEvent -> pushWatch -> nudgeStalePending ->
+   * routeLiveness -> appendEvent cycle. Without it this recurses on its own
+   * first write, because appendEvent() ends by calling pushWatch() and
+   * pushWatch() is what called us. Same guard, same reason, as the unsub
+   * writes inside sendToAll().
+   */
+  notifyDepth++;
+  try {
+    appendEvent({
+      t: 'create',
+      task: {
+        id: newId(),
+        role: 'agent',
+        instruction: text,
+        from: LIVENESS_CHANNEL,
+        author: LIVENESS_CHANNEL,
+        ts,
+        status: 'done',
+        claimedBy: null, claimedAt: null, result: null, resultTs: null,
+        relayed: true, relayedAt: ts,
+        visibility: 'internal',
+        channel: LIVENESS_CHANNEL,
+        conversationId: `#${LIVENESS_CHANNEL}`,
+        // Which real tab this is about, so a channel reader can go there.
+        about: conversationId || null,
+      },
+    });
+  } finally { notifyDepth--; }
+
+  /*
+   * Some findings are pure bookkeeping and must never reach him no matter how
+   * long anyone stays quiet — "this chair has been empty for an hour" is an
+   * observation about agents, and waking him with it at 4am would reintroduce
+   * the exact complaint this change answers. They stop at the channel.
+   */
+  if (!escalates) return;
+
+  const key = taskId || `${category}:${conversationId || DEFAULT_CONV}`;
+  let rec = livenessSeen.get(key);
+  if (!rec) { rec = { firstAt: now, escalated: false }; livenessSeen.set(key, rec); }
+  if (rec.escalated) return;
+  if (now - rec.firstAt < LIVENESS_ESCALATE_MS) return;
+  /*
+   * Has the Router done anything at all since this was first reported?
+   *
+   * READ THIS FROM THE SUMMARY, NOT FROM conversations.get(). `lastActedAt` is
+   * NOT a stored field on a conversation — it is derived in
+   * conversationSummaries() by scanning tasks for claims, results, progress
+   * notes and agent posts. The raw record has no such property, so the obvious
+   * spelling yields undefined, msOf() turns that into 0, and the comparison is
+   * false forever: every finding would escalate to his phone on a timer,
+   * rebuilding the exact spam this replaces while looking correct. The
+   * escalation selftest caught this; it is not hypothetical.
+   */
+  const router = conversationSummaries().find((c) => c.id === DEFAULT_CONV);
+  if (router && msOf(router.lastActedAt) > rec.firstAt) return;
+  rec.escalated = true;
+  queueNotify(category, text, conversationId, taskId);
+}
+
+/*
+ * THE SWEEP. Vacate chairs nobody has sat in for CHAIR_VACANT_MS — read the
+ * comment on that constant, which is where the reasoning lives.
+ *
+ * Runs on the watch tick, before the nudge, so that a tab whose owner is long
+ * gone has already stopped counting as staffed by the time stalePending() is
+ * asked about it.
+ */
+function sweepVacantChairs() {
+  if (notifyDepth > 0) return;
+  const now = Date.now();
+  /*
+   * Summaries, not conversations.values() — same trap as routeLiveness above,
+   * and far more dangerous here. `lastActedAt` and `lastProgressAt` are derived
+   * fields; on a raw conversation record they are undefined, both maxes collapse
+   * to 0, and every chair would fall through to the createdAt fallback and be
+   * vacated 45 minutes after the tab was made no matter how busy its agent was.
+   * That is unassigning live coordinators wholesale, on a timer.
+   */
+  for (const c of conversationSummaries()) {
+    if (!c.agent) continue;
+    // Mid-stop conversations belong to stopAckRoute and to whoever asked. Do
+    // not race a stop that is already under way, or answer it on the agent's
+    // behalf — "asked to stop and never answered" is a report someone wants.
+    if (c.stopRequested || c.stopAck) continue;
+    /*
+     * Every kind of evidence that anyone is home, weakest included. A heartbeat
+     * is a weak signal and this file says so everywhere — but for the ONLY
+     * question asked here, "is this chair occupied", weak evidence of presence
+     * is still evidence, and the cost of being wrong is unassigning a live
+     * agent. So take the most generous reading and require all of them silent.
+     */
+    const beat = HEARTBEATS.get(c.agent);
+    const seenAt = beat ? msOf(beat.at) : 0;
+    const lastLife = Math.max(msOf(c.lastActedAt), msOf(c.lastProgressAt), seenAt)
+      // Never acted at all? Then the clock runs from when it was given the tab,
+      // so an agent that was assigned and never showed up is still swept.
+      || msOf(c.createdAt);
+    if (!lastLife || now - lastLife < CHAIR_VACANT_MS) continue;
+
+    const who = c.agent;
+    const quietFor = humanFor(Math.round((now - lastLife) / 1000));
+    notifyDepth++;
+    try {
+      appendEvent({
+        t: 'convpatch',
+        id: c.id,
+        patch: {
+          agent: null,
+          // Kept, not discarded: "PushCoord, presumed gone" is a far more
+          // useful thing for a UI or a human to read than an empty chair with
+          // no history, and it is what makes this reversible by hand.
+          agentLeft: who,
+          agentLeftAt: nowIso(),
+          agentLeftReason: 'presumed-gone',
+        },
+      });
+    } finally { notifyDepth--; }
+    // Never escalates: see routeLiveness's `escalates`. Housekeeping, not an alarm.
+    routeLiveness('needs-you', `${who} left ${c.title || c.id} — silent ${quietFor}, chair vacated`, c.id, null, false);
+  }
+}
+
+/*
+ * THE NUDGE. Same tick as the deadman banner above. It used to end in
+ * queueNotify() — i.e. straight to his phone — and that one line produced 328
+ * of the 390 pushes he got in 24 hours, every one of them a phantom. It now
+ * ends in routeLiveness() instead.
+ *
+ * Nothing else about it changes: same qualifying set (stalePending(), 2
+ * minutes, agent assigned), same NUDGE_RENUDGE_MS cooldown so one still-
+ * unclaimed task cannot re-report every 15s tick forever. Only the destination
+ * is different, because the destination was the bug.
+ *
+ * Read together with sweepVacantChairs() above, which removes most of the
+ * qualifying set at source: a tab whose coordinator finished hours ago no
+ * longer has an agent, so stalePending() never returns it in the first place
+ * and this reports nothing at all about it.
  */
 function nudgeStalePending() {
   if (!PUSH_ON || notifyDepth > 0) return;
   const groups = stalePending();
   const liveIds = new Set(groups.map((g) => g.oldestId));
   for (const id of lastNudgeAt.keys()) if (!liveIds.has(id)) lastNudgeAt.delete(id);
+  // A finding that has gone away stops being tracked, so if it ever comes back
+  // it is a NEW finding with a fresh escalation clock rather than one that
+  // inherits an expired one and pages him instantly.
+  for (const k of livenessSeen.keys()) if (!liveIds.has(k) && k.indexOf(':') === -1) livenessSeen.delete(k);
   const now = Date.now();
   for (const g of groups) {
     const last = lastNudgeAt.get(g.oldestId);
     if (last !== undefined && now - last < NUDGE_RENUDGE_MS) continue;
     lastNudgeAt.set(g.oldestId, now);
-    queueNotify('needs-you', nudgeText(g), g.conversationId, g.oldestId);
+    routeLiveness('needs-you', nudgeText(g), g.conversationId, g.oldestId);
   }
 }
 
@@ -2925,6 +3161,9 @@ function pushWatch() {
    * behind a check for whether a page is open.
    */
   if (changed) notifyWatchLevel(snap);
+  // Before the nudge, deliberately: a chair vacated on this tick must already
+  // be empty when stalePending() is asked who is responsible for the tab.
+  sweepVacantChairs();
   nudgeStalePending();
   if (streams.size === 0) return;
   /*
@@ -3750,15 +3989,52 @@ function notify(kind, task, hint) {
   queueNotify(category, text, task.conversationId, task.id);
 }
 
-/** The deadman banner, but for a phone with no page open. */
+/*
+ * The deadman banner, but for a phone with no page open.
+ *
+ * This one is NOT the spam. Measured over the same 24 hours that produced 328
+ * phantom nudges, it fired 16 times, and every one of them was the orphaned-
+ * claim branch — a task an agent took and never answered, which nothing else
+ * in the system will ever pick up again. Those are real and must not be
+ * suppressed.
+ *
+ * But they are still liveness, and he asked not to be paged about liveness. So
+ * they take the same road: onto the channel immediately, where the Router sees
+ * them, and through to his phone only if the Router has itself gone quiet for
+ * LIVENESS_ESCALATE_MS. Re-routed, not muted — an alarm nobody picks up still
+ * reaches him, just fifteen minutes later and only when there is genuinely
+ * nobody else left to handle it.
+ *
+ * A WARNING FOR WHOEVER TIGHTENS THIS NEXT, learned by walking straight into it
+ * while writing this very function. An agent doing a long, honest piece of work
+ * holds its claims for the whole of it, and is from here byte-for-byte
+ * identical to an agent that died holding them. No test distinguishes them. The
+ * ONLY thing that does is a progress note - POST /tasks/:id/progress - which
+ * vouches for the claim for PROGRESS_FRESH_MS; that is what the `working` state
+ * exists for. So do NOT "fix" the false positives here by lengthening
+ * STUCK_CLAIM_MS or by dropping the orphan branch: in that pairing the alert is
+ * right and the agent is wrong. Agents doing multi-minute work must post
+ * progress or they will page him for nothing, and this is the only comment
+ * sitting next to the code that actually does the paging.
+ */
 function notifyWatchLevel(snap) {
   if (!PUSH_ON || notifyDepth > 0) return;
   // A restart is not a breakage. watchSnapshot() already refuses to alarm out
   // of a fresh boot; this server restarts itself on every source change, so
   // without that the deploy loop alone would buzz him.
   if (snap.starting) return;
-  if (snap.level !== 'alarm') return; // `warn` is not worth a buzz; `alarm` is
-  queueNotify('broken', snap.text || 'The queue has stopped being answered.', DEFAULT_CONV, null);
+  if (snap.level !== 'alarm') {
+    /*
+     * Recovered. Forget the finding, so that if the queue breaks again later it
+     * is a NEW one with its own fifteen-minute clock. Without this line the
+     * first alarm of the process would consume the only escalation this key
+     * ever gets, and every later one would be silently swallowed — a mute
+     * disguised as a re-route, which is the one outcome he must not get.
+     */
+    livenessSeen.delete(`broken:${DEFAULT_CONV}`);
+    return; // `warn` is not worth a buzz; `alarm` is
+  }
+  routeLiveness('broken', snap.text || 'The queue has stopped being answered.', DEFAULT_CONV, null);
 }
 
 /*

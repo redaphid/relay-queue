@@ -635,23 +635,41 @@ async function overHttpNudge() {
     check('the watch snapshot names the stale conversation', w1.stalePendingCount === 1, JSON.stringify(w1.stalePending));
     check('...with the right title and count', w1.stalePending[0] && w1.stalePending[0].title === conv.title && w1.stalePending[0].count === 1,
       JSON.stringify(w1.stalePending));
+    /*
+     * THE 84%. This assertion is the whole point of the change: on 2026-08-27
+     * this line queued a push, and that one line accounted for 328 of the 390
+     * notifications he received in 24 hours. It must now queue NOTHING.
+     */
     const afterFirst = (await getJson('/push/config')).stats.queued;
-    check('exactly one nudge queued for the one stale task', afterFirst - before === 1, String(afterFirst - before));
+    check('the stale task did NOT page him — this line was 84% of the noise', afterFirst - before === 0,
+      String(afterFirst - before));
+    const chan1 = (await getJson('/messages?channel=liveness')).count;
+    check('...it went to the liveness channel instead — re-routed, not discarded', chan1 === 1, String(chan1));
+    /*
+     * And it must not have moved the interruption into his queue instead. A
+     * liveness record that arrived as a task would be the same demand on him
+     * wearing a different hat, so: still exactly the one task he posted.
+     */
+    const pend1 = (await getJson('/tasks?status=pending')).count;
+    check('...and it created no task for anyone to answer', pend1 === 1, String(pend1));
 
     console.log('\nover HTTP: it does NOT repeat every tick — that would be the spam this replaces');
     // T0+4500: several more ticks, still well inside even the earliest
     // possible re-nudge cooldown expiry (5500).
     await sleep(1500);
-    const stillOne = (await getJson('/push/config')).stats.queued;
-    check('no repeat nudge before the re-nudge cooldown elapses', stillOne === afterFirst, String(stillOne));
+    const stillOne = (await getJson('/messages?channel=liveness')).count;
+    check('no repeat record before the re-nudge cooldown elapses', stillOne === chan1, String(stillOne));
 
-    console.log('\nover HTTP: still unclaimed after the re-nudge cooldown DOES nudge again');
+    console.log('\nover HTTP: still unclaimed after the re-nudge cooldown DOES report again');
     // T0+7000: past even the LATEST possible cooldown expiry (worst-case
-    // first nudge at T0+2500, +4000 = 6500), so the second nudge has
-    // definitely happened, and definitely not a third (7000 < 6500+4000).
+    // first record at T0+2500, +4000 = 6500), so the second has definitely
+    // happened, and definitely not a third (7000 < 6500+4000).
     await sleep(2500);
+    const chan2 = (await getJson('/messages?channel=liveness')).count;
+    check('a second liveness record is written once the cooldown has passed', chan2 - chan1 === 1, String(chan2 - chan1));
     const afterSecond = (await getJson('/push/config')).stats.queued;
-    check('a second nudge fires once the cooldown has passed', afterSecond - afterFirst === 1, String(afterSecond - afterFirst));
+    check('...and it STILL has not pushed him — not once, either time', afterSecond - before === 0,
+      String(afterSecond - before));
 
     console.log('\nover HTTP: claiming it stops the nudges');
     await post(`/tasks/${task.id}/claim`, { by: 'coord-props' });
@@ -681,7 +699,177 @@ async function overHttpNudge() {
   }
 }
 
-overHttp().then(overHttpNudge).then(() => {
+/*
+ * ESCALATION — the half of the re-route that stops it being a mute.
+ *
+ * Routing liveness to a channel is only safe if there is a way back out. He
+ * asked not to be paged about liveness, not to be made unreachable, and the
+ * difference between those two is entirely this mechanism: if the Router is
+ * gone, nobody is reading the channel, and a finding that stopped there would
+ * be a finding nobody ever sees.
+ *
+ * Both directions are checked, because only the pair is meaningful. A test that
+ * proved solely "a silent Router escalates" would still pass if escalation had
+ * been wired to fire unconditionally — which is the old spam, restored.
+ */
+async function overHttpEscalation() {
+  const TICK_MS = 200;
+  const STALE_MS = 1000;
+  const ESCALATE_MS = 2500;
+
+  async function run(label, routerActs, expectPush) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-escalate-'));
+    srv = await startServer({
+      dir,
+      port: TEST_PORT,
+      label: 'escalate',
+      env: {
+        WATCH_TICK_MS: String(TICK_MS),
+        NUDGE_PENDING_MS: String(STALE_MS),
+        NUDGE_RENUDGE_MS: '600',
+        LIVENESS_ESCALATE_MS: String(ESCALATE_MS),
+        PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
+      },
+      unsetEnv: ['PUSH', 'PUSH_PER_HOUR', 'PUSH_PER_HOUR_ALERTS'],
+      timeoutMs: 20000,
+    });
+    try {
+      const conv = (await post('/conversations', { title: label, agent: 'coord-x' })).body;
+      const before = (await getJson('/push/config')).stats.queued;
+      await post('/tasks', { text: 'still waiting', from: 'web', conversationId: conv.id });
+
+      if (routerActs) {
+        /*
+         * The Router doing ANY queue work in `main` is the signal. Deliberately
+         * unrelated to the finding: the claim is not "the Router fixed this",
+         * it is "an agent is alive and reading, so this is not his problem".
+         */
+        await sleep(STALE_MS + 600);
+        const t = (await post('/tasks', { text: 'router busy', from: 'agent', conversationId: 'main' })).body;
+        await post(`/tasks/${t.id}/claim`, { by: 'Router' });
+      }
+
+      await sleep(ESCALATE_MS + 1800);
+      const queued = (await getJson('/push/config')).stats.queued - before;
+      const chan = (await getJson('/messages?channel=liveness')).count;
+      check(`${label}: the finding reached the liveness channel either way`, chan >= 1, String(chan));
+      if (expectPush) {
+        check(`${label}: a silent Router escalates to him — NOT a mute`, queued >= 1, String(queued));
+      } else {
+        // `main` gets its own "a task needs you" for the router-busy post above
+        // (from:'agent'), so an exact zero is not the honest assertion here;
+        // what matters is that no `needs-you` escalation was added on top.
+        check(`${label}: a Router that is alive suppresses the escalation`, queued <= 1, String(queued));
+      }
+    } catch (e) {
+      failures++;
+      console.log(`  FAIL ${label} did not run — ${e && e.message}`);
+    } finally {
+      await srv.stop();
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows can hold it briefly */ }
+    }
+  }
+
+  console.log('\nover HTTP: liveness escalates to him ONLY when the Router is gone too');
+  await run('router silent', false, true);
+  await run('router alive', true, false);
+}
+
+/*
+ * THE SWEEP — vacating chairs whose occupant left without saying so.
+ *
+ * This is the half of the fix that works at source, and it is also the most
+ * dangerous thing in the change: it unassigns coordinators, on a timer, with no
+ * human in the loop. So the NEGATIVE case is written first and deliberately
+ * runs PAST the threshold. A test that only proved "a silent chair is vacated"
+ * would pass just as happily against a sweep that vacated everything, which
+ * would quietly unassign every working agent on the box.
+ *
+ * The other assertion that earns its keep is `stopAck === null`. A vacated
+ * chair must never be mistakable for an agent that finished and said so:
+ * stopAckRoute() is the only thing entitled to claim that, and if a timer could
+ * forge it then "clean shutdown" and "vanished without a word" become the same
+ * record and the distinction is gone from the system for good.
+ */
+async function overHttpSweep() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-sweep-'));
+  const TICK_MS = 200;
+  const VACANT_MS = 1500;
+  srv = await startServer({
+    dir,
+    port: TEST_PORT,
+    label: 'sweep',
+    env: {
+      WATCH_TICK_MS: String(TICK_MS),
+      CHAIR_VACANT_MS: String(VACANT_MS),
+      NUDGE_PENDING_MS: '600',
+      NUDGE_RENUDGE_MS: '100000', // irrelevant here; keep it out of the way
+      PUSH_DEBOUNCE_MS: String(DEBOUNCE_MS),
+    },
+    unsetEnv: ['PUSH', 'PUSH_PER_HOUR', 'PUSH_PER_HOUR_ALERTS'],
+    timeoutMs: 20000,
+  });
+
+  try {
+    const busy = (await post('/conversations', { title: 'long build', agent: 'coord-busy' })).body;
+    const gone = (await post('/conversations', { title: 'finished hours ago', agent: 'coord-gone' })).body;
+    const stopping = (await post('/conversations', { title: 'asked to stop', agent: 'coord-stop' })).body;
+    await post(`/conversations/${stopping.id}`, { stopRequested: true });
+
+    // The busy one holds a claim for the whole run and reports progress, which
+    // is exactly the shape of an agent in the long middle of a real job.
+    const t = (await post('/tasks', { text: 'render it', from: 'web', conversationId: busy.id })).body;
+    await post(`/tasks/${t.id}/claim`, { by: 'coord-busy' });
+    // Something is waiting in the abandoned tab too — this is the whole 84%:
+    // a pending task in a tab whose owner left is what re-nudged him forever.
+    await post('/tasks', { text: 'anyone there?', from: 'web', conversationId: gone.id });
+
+    // Run PAST the threshold, keeping only the busy one alive.
+    const deadline = Date.now() + VACANT_MS + 1200;
+    while (Date.now() < deadline) {
+      await sleep(400);
+      await post(`/tasks/${t.id}/progress`, { by: 'coord-busy', note: 'still rendering' });
+    }
+    await sleep(TICK_MS * 4);
+
+    console.log('\nover HTTP: a coordinator that is still working is NEVER swept');
+    const busyAfter = await getJson(`/conversations/${busy.id}`);
+    check('a progress-reporting agent keeps its chair past the threshold', busyAfter.agent === 'coord-busy',
+      JSON.stringify(busyAfter.agent));
+
+    console.log('\nover HTTP: a chair nobody has sat in is vacated, without inventing a shutdown');
+    const goneAfter = await getJson(`/conversations/${gone.id}`);
+    check('the silent coordinator was unassigned', goneAfter.agent === null || goneAfter.agent === undefined,
+      JSON.stringify(goneAfter.agent));
+    check('...its name is kept, so the tab can say who left', goneAfter.agentLeft === 'coord-gone',
+      JSON.stringify(goneAfter.agentLeft));
+    check('...labelled presumed-gone, not confirmed', goneAfter.agentLeftReason === 'presumed-gone',
+      JSON.stringify(goneAfter.agentLeftReason));
+    check('...and it was NOT marked stopped — only the agent may say that',
+      !goneAfter.stopAck && !goneAfter.stoppedAt,
+      `stopAck=${JSON.stringify(goneAfter.stopAck)} stoppedAt=${JSON.stringify(goneAfter.stoppedAt)}`);
+
+    console.log('\nover HTTP: vacating the chair is what kills the nudge at source');
+    const w = await getJson('/watch');
+    const listed = (w.stalePending || []).some((g) => g.conversationId === gone.id);
+    check('the abandoned tab no longer counts as staffed, so it never nudges again', !listed,
+      JSON.stringify(w.stalePending));
+
+    console.log('\nover HTTP: a stop already in flight is left alone');
+    const stopAfter = await getJson(`/conversations/${stopping.id}`);
+    check('a conversation mid-stop is not swept out from under the request',
+      stopAfter.agent === 'coord-stop', JSON.stringify(stopAfter.agent));
+  } catch (e) {
+    failures++;
+    console.log(`  FAIL the sweep HTTP section did not run — ${e && e.message}`);
+    if (srv.out) console.log(srv.out.split('\n').slice(-8).map((l) => `       | ${l}`).join('\n'));
+  } finally {
+    await srv.stop();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* windows can hold it briefly */ }
+  }
+}
+
+overHttp().then(overHttpNudge).then(overHttpEscalation).then(overHttpSweep).then(() => {
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
   process.exit(failures ? 1 : 0);
 }).catch((err) => {
