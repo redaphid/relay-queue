@@ -27,6 +27,41 @@ curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/jso
 
 **If you dispatch agents, brief them with this rule.** The failure above was not the workers' — it was in the dispatch. Naming and announcing are covered in **Activity reporting**.
 
+## Be terse — the coordinator is the bottleneck
+
+**Every coordinator post must be short, bulleted, and bold-keyed.** This is a
+throughput mechanic, not a style preference, which is why it lives here next to
+the ack rule rather than in a project CLAUDE.md.
+
+His instruction, 2026-08-27: *"since you are the coordinator everything depends
+on, you need to be terse, or the system is slow. Update the system and adopt
+this protocol."*
+
+**Why it is mechanical, not cosmetic:** the coordinator is a serial stage that
+every tab's work passes through. Tokens it spends composing prose are latency
+added to every conversation behind it — and on a phone, a long post is also
+*read* serially. A coordinator that writes essays makes the whole system slow
+even when every worker is fast.
+
+- **Lead with the answer or the decision needed.** Not the investigation that
+  produced it. If he has to scroll to find what changed, it is too long.
+- **Bullets, not paragraphs.** Bold the words that carry the meaning, so the
+  post survives being skimmed.
+- **One decision per ask.** If you need him to choose, make it answerable in one
+  word. Bundling three questions gets zero answered.
+- **Do not narrate your own process.** "I checked X, then Y, then Z" is your
+  transcript, not his update. Report what you found and what you did.
+- **Detail belongs in the tab that owns it**, or in the task result — not in a
+  status post to `main`.
+- **This binds dispatched agents too.** Brief every subagent with it; a worker
+  that dumps 2000 words into a tab reintroduces exactly the cost the coordinator
+  just avoided.
+
+**The failure mode this replaces:** on 2026-08-27 the `main` coordinator posted
+six ~400-word updates in 35 minutes while three tabs sat unstaffed and a user
+request aged 45 minutes unanswered. The posts were accurate and well-organised.
+That was the problem — the time went into writing them.
+
 ## Watch, don't poll
 
 Use the Monitor tool against the SSE stream instead of a sleep-loop. **Scope the stream server-side — don't rely on client-side grep as your only filter:**
