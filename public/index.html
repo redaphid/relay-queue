@@ -2988,7 +2988,24 @@
       try { j = JSON.parse(e.data); } catch (err) { return; }
       fails = 0; setConn(true);
       // A conversation was created, renamed, reassigned or archived.
-      if (j && j.conversation) { loadConvs(); return; }
+      if (j && j.conversation) {
+        loadConvs();
+        /*
+         * A tab-list write broadcasts on its CONVERSATION, so this is also the
+         * signal that the list changed - and nothing was listening for it.
+         *
+         * Without this the list only refreshed on its own 10s repair poll, so a
+         * coordinator creating one took a MEASURED 5.7s to appear and an edit
+         * 9.9s. The write was always fine; the surface just said nothing for
+         * long enough that he reasonably concluded it had failed and reloaded.
+         * A feature that works but looks like it did not is the same defect as
+         * one that silently does nothing.
+         */
+        if (j.conversation.id === activeConv) {
+          try { tlLoad(); } catch (e) { /* the thread must not depend on the list */ }
+        }
+        return;
+      }
       /*
        * One stream carries every conversation, so a change to one you are not
        * looking at must NOT be merged into the thread on screen — it is only
