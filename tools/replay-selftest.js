@@ -964,6 +964,99 @@ async function protocolChecks() {
     check('an empty message is refused', (await p_('/messages', { text: '   ' })).status === 400);
     check('a bad channel name is refused', (await p_('/messages', { text: 'x', channel: 'has spaces' })).status === 400);
 
+    /*
+     * READING BACK WHAT YOU JUST WROTE.
+     *
+     * The production symptom, 2026-08-27: an agent posted into its own tab,
+     * then asked `GET /messages?conversationId=<tab>` to confirm the write and
+     * got 33 rows for a tab whose conversation object said 53 - none of them
+     * its own, and `since=<a moment before it posted>` came back 0. It
+     * concluded, reasonably, that its post had not landed.
+     *
+     * It had landed. The route simply did not know the word `conversationId`.
+     * Its filter was `isInternal(t) && channelOf(t) === channel`, with channel
+     * defaulting to `agents`, so an unrecognised selector was dropped on the
+     * floor and the reply was the GLOBAL #agents channel - the identical answer
+     * you get from `GET /messages` with no query string at all.
+     *
+     * That is the same defect class as the attach route returning 200 with the
+     * seat unfilled: a success shape over an answer to a different question.
+     * `POST /messages {conversationId}` stores `visibility:"conversation"`;
+     * `POST /messages {channel}` stores `visibility:"internal"`. The GET read
+     * only the second bucket, so it was not the inverse of the POST, and no
+     * caller could tell "these are all the messages" from "these are some
+     * messages, of something you did not ask about".
+     */
+    console.log('\nmessages — an agent can read back what it just wrote');
+    const mark = new Date(Date.now() - 1).toISOString();
+    const own = await p_('/messages', { text: 'did this land', agent: 'msgfix', conversationId: 'main' });
+    check('a conversation-scoped message is accepted', own.status === 201, `HTTP ${own.status}`);
+    check('...and stored against the conversation, not a channel',
+      own.body.visibility === 'conversation' && own.body.conversationId === 'main',
+      `${own.body.visibility} / ${own.body.conversationId}`);
+
+    const mineBack = await g('/messages?conversationId=main');
+    check('*** the post just written is in its own conversation read-back ***',
+      mineBack.messages.some((msg) => msg.id === own.body.id),
+      `count=${mineBack.count} ${JSON.stringify(mineBack.messages.map((msg) => msg.id))}`);
+    check('*** and the reply is NOT silently the global agents channel ***',
+      !mineBack.messages.some((msg) => /hands off/.test(msg.text || '')),
+      JSON.stringify(mineBack).slice(0, 200));
+    check('...`conversation` is accepted as the same selector, as everywhere else',
+      (await g('/messages?conversation=main')).count === mineBack.count);
+    check('...and a since window the post falls inside is not empty',
+      (await g(`/messages?conversationId=main&since=${encodeURIComponent(mark)}`)).count >= 1,
+      `since=${mark}`);
+
+    /*
+     * The half that matters even if the filtering above were correct by design:
+     * the caller has to be able to SEE what it was given. A bare count with no
+     * total is the thing that made 33-of-53 look like a complete answer.
+     */
+    check('a read says what it counted, not just how many it returned',
+      mineBack.scope && mineBack.scope.kind === 'conversation' && mineBack.scope.conversationId === 'main',
+      JSON.stringify(mineBack.scope));
+    check('...and reports a total, so a full answer is distinguishable from a clipped one',
+      mineBack.total === mineBack.count && mineBack.truncated === false,
+      `count=${mineBack.count} total=${mineBack.total} truncated=${mineBack.truncated}`);
+    /*
+     * The two numbers that disagreed in production - "33" from this route and
+     * "53" off the conversation object - are now the same number by
+     * construction. If a future filter quietly drops a kind of message from
+     * this view, this is the check that notices.
+     */
+    const convRow = (await g('/conversations')).conversations.find((c) => c.id === 'main');
+    check('*** and that total agrees with the conversation object, which is what 33-of-53 was ***',
+      mineBack.total === convRow.messages,
+      `/messages total=${mineBack.total} vs conversation.messages=${convRow.messages}`);
+    const clipped = await g('/messages?conversationId=main&limit=1');
+    check('*** a clipped read SAYS it is clipped ***',
+      clipped.count === 1 && clipped.total > 1 && clipped.truncated === true,
+      JSON.stringify({ count: clipped.count, total: clipped.total, truncated: clipped.truncated }));
+    const chanRead = await g('/messages?channel=agents');
+    check('a channel read is labelled a channel read',
+      chanRead.scope && chanRead.scope.kind === 'channel', JSON.stringify(chanRead.scope));
+    const bareRead = await g('/messages');
+    check('...and one that named no channel admits it defaulted',
+      bareRead.scope && bareRead.scope.defaulted === true, JSON.stringify(bareRead.scope));
+
+    /*
+     * The two selectors address disjoint stores, so their intersection is
+     * always empty. Answering it with an empty list would be a third way to
+     * say "nothing here" when the truth is "that question is malformed".
+     */
+    // `g` throws away the status, and "refused" is a claim about the status.
+    const gs = async (p) => { const r = await fetch(srv.base + p); return { status: r.status, body: await r.json() }; };
+    const both = await gs('/messages?channel=agents&conversationId=main');
+    check('asking for a channel AND a conversation is refused, not answered empty',
+      both.status === 400, `HTTP ${both.status} ${JSON.stringify(both.body).slice(0, 120)}`);
+    const ghost = await gs('/messages?conversationId=nope');
+    check('reading back a conversation that does not exist is refused',
+      ghost.status === 404, `HTTP ${ghost.status} - must not be the agents channel`);
+    const laundered = await gs('/messages?conversationId=%23agents');
+    check('...and an internal channel id cannot be laundered through it either',
+      laundered.status >= 400, `HTTP ${laundered.status}`);
+
     console.log('\nit all survives a restart, because it is only ever the event log');
     // A fresh process on a fresh port, and `g`/`p_` follow it. The CLAIM_LEASE
     // override is carried over by the handle.

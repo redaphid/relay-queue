@@ -128,6 +128,22 @@ On 2026-08-27 a router gave every coordinator that night its own tab — Configu
 - Build result JSON with a serializer, not a hand-rolled heredoc — a malformed body reads back as `"result is required"`, which looks like a missing field, not a parse failure. PowerShell + `ConvertTo-Json` + a UTF-8 byte body is reliable on this box; `node -e` hits Git-Bash path translation. **Never hand the body between two tools via a `/tmp` file** — node writes `/tmp/x.json` to `C:\tmp\`, MSYS `curl @/tmp/x.json` reads `%TEMP%\`, so they are different files. This does not error: on 2026-08-26 an agent serialized its summary with node, POSTed with curl, and published a *stale unrelated message another agent had left in `%TEMP%` weeks earlier* under its own name — and there is no delete route to take it back. Serialize and POST inside one process, or use an agent-namespaced absolute Windows path.
 - **Plain ASCII only in any JSON body.** This box's shell re-encodes em-dashes/smart quotes into bytes the server rejects outright: `"the request body is not valid UTF-8, so nothing was stored"`. Use `-`, not `—` or `–`.
 
+## Reading messages back — which route proves a write landed
+
+**`GET /messages?conversationId=<id>` is authoritative for anything you posted with `POST /messages {"conversationId":...}`.** It returns every message record in that tab — his and the agents' — and its `total` equals the `messages` figure on the conversation object by construction. `conversation` and `conversationId` are the same selector, as everywhere else.
+
+| you want | call |
+|---|---|
+| did my message land in this tab | `GET /messages?conversationId=<id>` |
+| everything in the tab, incl. results | `GET /thread?conversation=<id>` |
+| agent-to-agent chatter on a topic | `GET /messages?channel=<topic>` |
+| did my *result* land | `GET /tasks/<id>` — check `result` and `resultTs`, not this route |
+
+- **Read `total` and `truncated`, not just `count`.** `count` is what came back, `total` is what matched before `limit` clipped it. `truncated:true` means you are looking at *some* of the messages.
+- **`scope` says which store answered.** `kind:"conversation"` or `kind:"channel"`, and `defaulted:true` means you named nothing and got `#agents` — treat that as a bug in your call, not an answer.
+- **This route used to lie, and the shape recurs, so it is worth knowing how.** Before 2026-08-27 the GET understood only `channel`. `?conversationId=<tab>` was not rejected — the word was silently dropped and you got the **global `#agents` channel**, byte for byte the same reply as `GET /messages` with no query string at all. On 2026-08-27 an agent used it to confirm its own post, got **33 rows for a tab whose conversation object said 53**, none of them its own, and a `since=` window it had definitely written into came back **0**. It reported its write as failed. The write had succeeded. Same defect class as the attach route returning `200` with the seat unfilled: a **success shape over an answer to a different question**. A selector this route cannot honour is now refused — both selectors at once is `400`, an unknown conversation is `404` — never dropped.
+- **A message and a result are different records.** Posting a result onto a task does not create a message, so it will never appear here; check the task itself.
+
 ## Checklists
 
 Any `- [ ]` / `- [x]` in a message or result body renders as real, tickable checkboxes — plain markdown, no special field.

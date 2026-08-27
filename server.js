@@ -5761,15 +5761,162 @@ function createMessage(res, body) {
   send(res, 201, task);
 }
 
-/** The channel's own view of a message: no queue machinery, because there is none. */
+/**
+ * The channel's own view of a message: no queue machinery, because on a channel
+ * there is none. `role`, `from` and `status` are here for the CONVERSATION read
+ * below, where there can be — a human's message in a tab is a real task that may
+ * still be waiting on an answer, and rendering it identically to a statement is
+ * how a reader concludes nobody has said anything.
+ */
 const messageView = (t) => ({
   id: t.id,
-  channel: channelOf(t),
+  channel: isInternal(t) ? channelOf(t) : null,
+  conversationId: isInternal(t) ? null : convIdOf(t),
+  role: t.role || 'user',
+  from: t.from || null,
   author: t.author || null,
   to: t.to || null,
   text: asText(t.instruction),
   ts: t.ts,
+  status: t.status,
+  answered: t.result !== null && t.result !== undefined,
 });
+
+/*
+ * GET /messages — THE READ-BACK SIDE OF POST /messages, AND IT HAS TO BE ITS INVERSE.
+ *
+ * It was not, and the way it failed is the reason this function exists instead
+ * of six lines inline. `POST /messages {channel}` stores `visibility:"internal"`
+ * under the synthetic conversation `#<channel>`; `POST /messages
+ * {conversationId}` stores `visibility:"conversation"` under a real tab. Two
+ * disjoint stores, one route. The GET read only the first, and it recognised
+ * only one selector — `channel`, defaulting to `agents`.
+ *
+ * So `GET /messages?conversationId=<tab>` did not filter by tab. It did not
+ * fail either. It dropped the word it did not know and answered a completely
+ * different question — byte for byte the same reply as `GET /messages` with no
+ * query string at all. On 2026-08-27 an agent used it to confirm its own post
+ * had landed, got 33 rows for a tab whose conversation object said 53, none of
+ * them its own, and a `since` window it had definitely written into came back
+ * 0. It reported the write as failed. The write had succeeded.
+ *
+ * That is the attach-route defect again (see updateConversation): a success
+ * SHAPE over an answer that is not true. An agent cannot verify a write against
+ * a route that silently answers a different question, and re-posting "just in
+ * case" duplicates into the human's thread. Hence three rules here:
+ *
+ *   1. Every selector this route understands actually filters. `conversation` /
+ *      `conversationId` is the same selector every other list route takes
+ *      (applyFilters, /thread, /checklists, /picks); /messages was the lone
+ *      outlier that ignored it, which is precisely why it was reached for.
+ *   2. A selector it cannot honour is REFUSED, never dropped. Both selectors at
+ *      once is malformed rather than empty; an unknown conversation is a 404,
+ *      not the agents channel.
+ *   3. The reply says what it counted. `total` beside `count`, an explicit
+ *      `truncated`, and a `scope` naming the store — including when the caller
+ *      named nothing and got the default channel. "These are all the messages"
+ *      and "these are some messages, of something you did not ask about" were
+ *      indistinguishable, and that, not the row count, was the real damage.
+ */
+function readMessages(res, q) {
+  const channelRaw = q.get('channel');
+  const convRaw = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+  const hasChannel = channelRaw !== null && channelRaw !== '';
+  const hasConv = convRaw !== null && convRaw !== '';
+
+  /*
+   * Disjoint stores, so the intersection is ALWAYS empty. Returning an empty
+   * list would be a third way of saying "nothing here" to a caller whose real
+   * problem is that the question cannot be asked.
+   */
+  if (hasChannel && hasConv) {
+    return fail(res, 400, 'ask for a channel or a conversation, never both', {
+      channel: channelRaw,
+      conversationId: convRaw,
+      why: `a channel message is filed under "${INTERNAL_PREFIX}${channelRaw}" and belongs to no conversation, so this pair can never match anything`,
+    });
+  }
+
+  let list;
+  let scope;
+  if (hasConv) {
+    if (convRaw.startsWith(INTERNAL_PREFIX)) {
+      return fail(res, 400, `"${convRaw}" is an internal channel, not a conversation`, {
+        use: `/messages?channel=${encodeURIComponent(convRaw.slice(INTERNAL_PREFIX.length))}`,
+      });
+    }
+    if (!conversations.has(convRaw)) {
+      return fail(res, 404, `no conversation with id "${convRaw}"`, {
+        conversationId: convRaw,
+        hint: 'GET /conversations lists them. This used to answer 200 with the global agents channel.',
+      });
+    }
+    /*
+     * BOTH ROLES, deliberately. Returning only the agent's own posts would make
+     * `count` disagree with the `messages` figure on the conversation object —
+     * which is the exact comparison that produced "33 of 53" — and would rebuild
+     * the same trap one layer down: a reader who does not check `scope` would
+     * conclude the human had said nothing. This is every message record in the
+     * tab, so the two numbers agree by construction.
+     */
+    list = [...tasks.values()].filter((t) => !isInternal(t) && convIdOf(t) === convRaw);
+    scope = {
+      kind: 'conversation',
+      conversationId: convRaw,
+      channel: null,
+      defaulted: false,
+      includes: 'every message record in this conversation, both his and the agents\' — the same set the conversation object counts as `messages`',
+      excludes: 'results. An answer posted onto a task is part of that task, not a message of its own',
+      whole: `/thread?conversation=${encodeURIComponent(convRaw)}`,
+    };
+  } else {
+    const channel = hasChannel ? channelRaw : DEFAULT_CHANNEL;
+    list = [...tasks.values()].filter((t) => isInternal(t) && channelOf(t) === channel);
+    scope = {
+      kind: 'channel',
+      conversationId: null,
+      channel,
+      // Said out loud, because the default is what an unrecognised selector used
+      // to silently fall through to.
+      defaulted: !hasChannel,
+      includes: `internal agent-to-agent traffic on #${channel}, which is invisible to his thread by design`,
+      excludes: 'anything posted to a conversation. Pass ?conversationId=<id> for that',
+      whole: null,
+    };
+  }
+
+  list.sort((a, b) => msOf(a.ts) - msOf(b.ts));
+
+  const since = q.get('since');
+  if (since !== null) {
+    const ms = parseSince(since);
+    if (ms === null) throw httpErr(400, `invalid since "${since}" (want ISO 8601 or epoch ms)`);
+    list = list.filter((t) => Date.parse(t.ts) > ms);
+  }
+  // `total` is taken HERE: after the scope and `since` narrowed it, before
+  // `limit` clipped it. That is the only reading that lets a caller tell a
+  // complete answer from a clipped one, which is the whole point.
+  const total = list.length;
+
+  const limit = q.get('limit');
+  if (limit !== null) {
+    const n = Number(limit);
+    if (!Number.isInteger(n) || n < 0) throw httpErr(400, `invalid limit "${limit}"`);
+    list = n === 0 ? [] : list.slice(-n); // most recent N — a channel reads from the end
+  }
+
+  return send(res, 200, {
+    count: list.length,
+    total,
+    truncated: list.length < total,
+    // Kept at the top level as well as inside `scope`: every caller written
+    // before this change reads `channel` from here, and a channel read still
+    // answers exactly as it always did.
+    channel: scope.channel,
+    scope,
+    messages: list.map(messageView),
+  });
+}
 
 function channelSummaries() {
   const acc = new Map();
@@ -7308,25 +7455,11 @@ async function route(req, res) {
   // /messages — an agent speaking for itself, and the agent-to-agent channel
   if (seg.length === 1 && seg[0] === 'messages') {
     if (m === 'POST') return createMessage(res, await readBody(req));
-    if (m === 'GET') {
-      // Reading is by channel; there is no "all messages" view, because the
-      // human's thread is already that and this is deliberately not in it.
-      const channel = q.get('channel') || DEFAULT_CHANNEL;
-      let list = [...tasks.values()].filter((t) => isInternal(t) && channelOf(t) === channel);
-      const since = q.get('since');
-      if (since !== null) {
-        const ms = parseSince(since);
-        if (ms === null) throw httpErr(400, `invalid since "${since}" (want ISO 8601 or epoch ms)`);
-        list = list.filter((t) => Date.parse(t.ts) > ms);
-      }
-      const limit = q.get('limit');
-      if (limit !== null) {
-        const n = Number(limit);
-        if (!Number.isInteger(n) || n < 0) throw httpErr(400, `invalid limit "${limit}"`);
-        list = n === 0 ? [] : list.slice(-n); // most recent N — a channel reads from the end
-      }
-      return send(res, 200, { count: list.length, channel, messages: list.map(messageView) });
-    }
+    // Reading is by channel OR by conversation, and it refuses rather than
+    // guesses. See readMessages() for why that is not a nicety: it used to
+    // ignore `conversationId` outright and answer with the global agents
+    // channel, so an agent could not tell its own post had landed.
+    if (m === 'GET') return readMessages(res, q);
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
   }
 
