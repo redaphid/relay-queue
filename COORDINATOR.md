@@ -121,6 +121,30 @@ On 2026-08-27 a router gave every coordinator that night its own tab — Configu
 - **Prefer spawning a fresh agent over resuming one when a tab moves to new work.** Resuming replays the entire transcript — several coordinators ran past **300k tokens** on 2026-08-26/27, and a resumed agent carries all of it. Resume only when continuity genuinely matters.
 - **The server cannot enforce any of this.** It does not spawn, resume, or terminate anything (see **Conversations** on `stopRequested`). Whoever dispatches agents chooses fresh-spawn over resume; relay can only record the intent.
 
+## Auto-seat — a tab with a message and no agent seats itself
+
+**A tab is no longer guaranteed to be empty just because nobody was sent to it.** `tools/autoseat.js` runs on the HOST, watches the queue, and dispatches a coordinator into any tab that has an unanswered message from the human and nobody sitting in it. If you attach to a tab and find an `auto-…` agent already there, that is this, working — not a stray.
+
+**Why it is a host process, when everything else here is a container.** relay-queue is a passive queue that deliberately never spawns anything, and `relay-watchdog` — which already finds unstaffed tabs correctly — is a container too. Neither can start a Claude process. The thing that actually dispatched coordinators was **a Claude session seated as agent `Router` in `main`**, running a self-paced loop; that is what `--router-conversation main --router-agent Router` on the watchdog points at. Its own design note records the flaw: *"the router is a single point of failure and nothing restarts it but the human."* When it dies, the watchdog reports `router unreachable, N tabs need dispatch` into a channel nobody is reading, and the human has to ask for a reseat by hand. **Detection was never the gap. The gap was that the remedy had to run somewhere that can execute `claude`.**
+
+```sh
+node tools/autoseat.js                       # the real thing
+node tools/autoseat.js --once --dry --explain  # decide, spawn nothing, show every message and why
+node tools/autoseat-selftest.js              # fixtures + mutation
+```
+
+**The trigger is `role === "user"` AND `from === "web"`, and that is the whole test.** It is structural rather than a heuristic, which is what makes the dangerous loops impossible rather than merely unlikely: agent posts carry `role:"agent"`, the watchdog's own pokes carry `from:"relay-watchdog"`, and checklist settles carry `from:"checklist"`. **A dispatched agent therefore cannot dispatch anything by writing**, and the watchdog cannot amplify itself through this.
+
+Refused, each for its own reason: a tab whose `agent` is set (re-read live in the instant before the spawn, because the race that matters is a human seating it while the decision was in flight); an archived tab or one with `stopAck:"stopped"` (those are finished, not forgotten); anything inside the grace window; and a second message in a tab already being seated this pass.
+
+- **The dedupe is on identity, not rate, and this is the point.** State is keyed on **task id** and written **before** the spawn. A rate limit bounds volume per window and then resets, so against a fault that does not clear it refires forever — that is how 215 of 220 pending items once became a watchdog nagging about its own dead agents. "At most one dispatch per thing the human actually said" cannot build a backlog however long the fault lasts, because he only says a finite number of things.
+- **Written before the spawn, deliberately.** A crash in between loses the coordinator, not the memory that one was sent — the watchdog still alarms on that. The other order would re-dispatch every message in the file on every restart.
+- **All of a tab's pending human messages are recorded as covered, not just the one that triggered it**, because one coordinator answers the whole tab.
+- **Every dispatch writes its own child log**, and `--explain` prints every message considered with the reason it was or was not seated. A selector that only reported what it accepted could not be audited: "refused everything" and "looked at nothing" produce identical output.
+- Stop it and nothing else changes — the watchdog goes back to reporting unstaffed tabs to a router that may or may not be alive.
+
+**`tools/autoseat-selftest.js` mutates each guard out, one at a time, and asserts the suite goes red.** A suite this full of refusals is otherwise worthless, since refusing everything and examining nothing look the same from outside. The mutation is applied **in memory** and its match count asserted to be exactly 1 — `sed -i`/`perl -0pi` match nothing against this box's CRLF files and exit 0, which reports every mutation as "survived". It has already earned this: with the default concurrency cap, deleting the one-agent-per-tab guard changed no result, because the cap was refusing the second message instead. **That guard was passing on another guard's work**, and only the mutation showed it.
+
 ## Conversations
 
 | action | call |
