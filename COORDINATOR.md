@@ -69,6 +69,23 @@ For container-level debugging: `docker logs -f relay-queue --since 1m 2>&1 | gre
 
 **The server backs this up itself.** If a conversation has an assigned agent and a task sits `pending` (unclaimed) for more than 2 minutes, `nudgeStalePending()` (server.js, same `WATCH_TICK_MS` tick as the deadman banner) queues one short push through the same pipeline as `notifyWatchLevel`, e.g. `"1 unclaimed 3 min in <title>"`. Re-nudges at most every few minutes while it stays unclaimed, never every tick — not a substitute for arming your own watcher, it's the backstop for when that watcher died or was never armed.
 
+## One coordinator, one tab
+
+**Every coordinator gets its own conversation, named for its purpose. Never attach a coordinator to an existing tab — including the tab where the request was raised.** Create the tab and attach the agent in the same call, so there is no ownerless window:
+
+```sh
+curl -s -X POST http://127.0.0.1:3901/conversations -H 'content-type: application/json' \
+  -d '{"title":"Clear tab session state","agent":"TabLifecycle"}'
+```
+
+On 2026-08-27 a router gave every coordinator that night its own tab — Configure relay, Vikunja to-do, Instagram, Queue Scout, Push, Fix mindmeld — then reused the general "Relay" tab for one more because that was where the human had raised the request. He replied: **"I don't see the tablifecycle coordinator tab."** He could not tell which coordinator owned what, or where its context lived.
+
+**This is not tidiness.** It happened in the middle of him asking for a way to clear a tab's session state *to save tokens and stop context confusion*. **A coordinator sharing a tab with unrelated history is exactly the context bleed he is paying for** — it reads a backlog that was never addressed to it, and its own work is buried in someone else's thread. Predictable naming is half of any tab-lifecycle feature; a clear/close control over unpredictably-named tabs just gives you a tidier way to be lost.
+
+- **Name the tab for the work, not for the agent's cleverness.** The human scans this list on a phone.
+- **Prefer spawning a fresh agent over resuming one when a tab moves to new work.** Resuming replays the entire transcript — several coordinators ran past **300k tokens** on 2026-08-26/27, and a resumed agent carries all of it. Resume only when continuity genuinely matters.
+- **The server cannot enforce any of this.** It does not spawn, resume, or terminate anything (see **Conversations** on `stopRequested`). Whoever dispatches agents chooses fresh-spawn over resume; relay can only record the intent.
+
 ## Conversations
 
 | action | call |
