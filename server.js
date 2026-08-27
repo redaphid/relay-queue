@@ -444,6 +444,23 @@ function newConversation(id, title, agent) {
      * losing four of them.
      */
     contextMarks: [],
+    /*
+     * A REQUEST ABOUT THIS TAB THAT IS CURRENTLY SITTING IN SOMEONE'S QUEUE.
+     * `{ kind, at, taskId }`, or null when nothing is outstanding.
+     *
+     * This exists because of a race that happened within minutes of the clear
+     * control shipping: a clear was queued for the Router, the Router acted on
+     * it and spawned a fresh coordinator, and the tab was archived two seconds
+     * later — so a brand new agent woke up inside a closed tab. It was caught
+     * only because a human happened to be watching that tab. Nothing told
+     * anyone, because a queued request had no representation anywhere except as
+     * prose in a message.
+     *
+     * Recorded on the conversation rather than inferred from the queue so that
+     * archiving can cancel it in the same write that archives, with no text
+     * matching and no second round trip that could be interrupted half way.
+     */
+    pendingDispatch: null,
   };
 }
 
@@ -458,7 +475,7 @@ function normaliseConv(conv) {
     archived: false, archivedAt: null,
     stopRequested: false, stopRequestedAt: null, stopRequestedBy: null,
     stopAck: null, stopAckAt: null, stoppedAt: null, stopNote: null, worktrees: null,
-    spawnedBy: null, contextFrom: null, contextMarks: [],
+    spawnedBy: null, contextFrom: null, contextMarks: [], pendingDispatch: null,
   };
   for (const [k, v] of Object.entries(base)) if (conv[k] === undefined) conv[k] = v;
   return conv;
@@ -5503,6 +5520,22 @@ function updateConversation(res, id, body) {
     patch.archived = body.archived;
     patch.archivedAt = body.archived ? nowIso() : null;
     /*
+     * ARCHIVING CANCELS ANY OUTSTANDING REQUEST ABOUT THIS TAB.
+     *
+     * Not a convenience: it is the whole reason `pendingDispatch` exists. A
+     * queued clear says "stop the coordinator here and spawn a fresh one", and
+     * acting on that AFTER the tab was closed is how a new agent ends up
+     * working inside an archived conversation nobody is reading. The window is
+     * seconds wide and it has already been hit once.
+     *
+     * Cancelled in the SAME write that archives, so there is no interval in
+     * which the tab is closed and the request still looks live. Whether anyone
+     * has already acted on it is a separate question this server cannot answer
+     * — which is exactly why the reply reports what was cancelled rather than
+     * claiming it was stopped in time.
+     */
+    if (body.archived && conv.pendingDispatch) patch.pendingDispatch = null;
+    /*
      * Archiving says nothing whatsoever about the agent, and must not be allowed
      * to imply otherwise. It files the conversation away; the agent carries on.
      * If you want it to wind down you have to ask, separately and explicitly,
@@ -5570,6 +5603,25 @@ function updateConversation(res, id, body) {
     }
   }
 
+  /*
+   * Set when a request about this tab is handed to someone else's queue, and
+   * cleared when it is answered or overtaken. `taskId` is carried so a reader
+   * can go and look at what was actually queued instead of trusting this row.
+   */
+  if (body.pendingDispatch !== undefined) {
+    if (body.pendingDispatch === null || body.pendingDispatch === false) patch.pendingDispatch = null;
+    else if (typeof body.pendingDispatch !== 'object') {
+      return fail(res, 400, 'pendingDispatch must be an object { kind, taskId } or null');
+    } else {
+      const kind = readString(body.pendingDispatch.kind, 'pendingDispatch.kind', 40);
+      if (kind instanceof Error) return fail(res, 400, kind.message);
+      if (!kind) return fail(res, 400, 'pendingDispatch.kind is required');
+      const taskId = readString(body.pendingDispatch.taskId, 'pendingDispatch.taskId', 100);
+      if (taskId instanceof Error) return fail(res, 400, taskId.message);
+      patch.pendingDispatch = { kind, taskId: taskId || null, at: nowIso() };
+    }
+  }
+
   if (body.stopRequested !== undefined) {
     if (typeof body.stopRequested !== 'boolean') {
       return fail(res, 400, 'stopRequested must be true or false');
@@ -5596,8 +5648,14 @@ function updateConversation(res, id, body) {
   }
 
   if (!Object.keys(patch).length) {
-    return fail(res, 400, 'nothing to update (title, agent, archived, stopRequested, spawnedBy or contextFrom)');
+    return fail(res, 400, 'nothing to update (title, agent, archived, stopRequested, spawnedBy, contextFrom or pendingDispatch)');
   }
+  /*
+   * Read BEFORE the write. `conv` is the live stored object and appendEvent
+   * mutates it in place, so after the next line the thing this archive just
+   * cancelled is already gone and the reply would report nothing at all.
+   */
+  const cancelledDispatch = patch.pendingDispatch === null ? conv.pendingDispatch || null : null;
   appendEvent({ t: 'convpatch', id, patch });
   /*
    * Answer with the honest truth about what just happened, so no client can
@@ -5615,7 +5673,24 @@ function updateConversation(res, id, body) {
    * made by accident.
    */
   if (patch.archived === true) {
-    return send(res, 200, { ...conv, ghost: ghostWarning(conv) });
+    return send(res, 200, {
+      ...conv,
+      ghost: ghostWarning(conv),
+      /*
+       * What this archive invalidated on its way past. Null is the normal
+       * answer. When it is not null, whoever archived needs to know that a
+       * request naming this tab was in someone's queue — and that cancelling
+       * the record is not the same as catching it before it was acted on.
+       */
+      cancelledDispatch: cancelledDispatch ? {
+        ...cancelledDispatch,
+        summary: `A queued "${cancelledDispatch.kind}" request for this tab was cancelled.`,
+        detail: 'The request is no longer outstanding on this conversation. If it had '
+          + 'already been claimed and acted on, that has happened and this does not undo '
+          + 'it — check the task itself before assuming nothing was spawned.',
+        taskId: cancelledDispatch.taskId || null,
+      } : null,
+    });
   }
   send(res, 200, conv);
 }

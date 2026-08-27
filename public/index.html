@@ -4241,16 +4241,99 @@
     });
   }
 
+  /*
+   * ARCHIVE — and, when a coordinator is attached, a stop for it.
+   *
+   * Archiving used to be purely cosmetic: it hid the row and left whatever was
+   * running to carry on posting into a tab nobody could see. He hit that within
+   * minutes of this panel shipping — he cleared a tab, a fresh coordinator was
+   * spawned into it, he archived the tab two seconds later, and the new agent
+   * was only killed because somebody happened to be watching. "If I archive a
+   * tab it needs to stop a coordinator" is the correction, and it is right.
+   *
+   * The chain is the one Clear already uses, minus the respawn, and it is
+   * composed HERE rather than inside the server's archive route on purpose:
+   * server.js states plainly that archiving must say nothing about the agent,
+   * and that separation is worth keeping for every other caller. What changed
+   * is what this BUTTON does, not what the route means.
+   *
+   * Order matters. The name is captured first because step three removes it;
+   * archiving happens before detaching so the reply can still report the ghost;
+   * and the Router is asked last, once there is something true to tell it.
+   */
   function doArchive(want) {
+    var c = tabData;
+    var who = (c && c.agent) || null;
+    var steps = [];
     tabRun(function () {
-      return tabPost({ archived: want }).then(function (r) {
-        if (!r.ok) return tabErr(want ? 'archive this tab' : 'restore this tab', r);
-        if (!want) return tabSet('ok', 'Restored. It is back in the list.', []);
-        var g = r.b.ghost;
-        tabSet('ok', 'Archived. It is out of the list and can be restored.', g
-          ? [g.summary, g.detail, g.forceKill && g.forceKill.how]
-          : ['Nothing was left running here: no agent was assigned, or it had already confirmed it stopped.']);
-      });
+      if (!want) {
+        return tabPost({ archived: false }).then(function (r) {
+          if (!r.ok) return tabErr('restore this tab', r);
+          tabSet('ok', 'Restored. It is back in the list.', [
+            'Nothing was restarted. If its coordinator was stopped when this was archived, the tab is empty and needs one.',
+          ]);
+        });
+      }
+      var chain = who
+        ? tabPost({ stopRequested: true, stopRequestedBy: 'human (archive)' }).then(function (s) {
+          steps.push(s.ok
+            ? ((s.b.stopRequestEffect && s.b.stopRequestEffect.summary) || 'Asked the coordinator to stop.')
+            : 'The stop request FAILED: ' + ((s.b && s.b.error) || 'HTTP ' + s.status));
+        })
+        : Promise.resolve();
+
+      return chain
+        .then(function () { return tabPost({ archived: true }); })
+        .then(function (r) {
+          if (!r.ok) { tabErr('archive this tab', r); throw new Error('archive failed'); }
+          steps.push('Archived. It is out of the list and can be restored.');
+          /*
+           * The race, reported rather than assumed away. Cancelling the record
+           * is not proof nobody acted on it first, and saying so is the
+           * difference between this being trustworthy and being reassuring.
+           */
+          if (r.b.cancelledDispatch) {
+            steps.push(r.b.cancelledDispatch.summary + ' ' + r.b.cancelledDispatch.detail);
+          }
+          var g = r.b.ghost;
+          if (g) steps.push(g.summary);
+          if (!who) return null;
+          return tabPost({ agent: null }).then(function (d) {
+            steps.push(d.ok
+              ? 'Detached "' + who + '" from the tab, so an archived row cannot go on naming a coordinator.'
+              : 'Could not detach the agent: ' + ((d.b && d.b.error) || 'HTTP ' + d.status));
+          });
+        })
+        .then(function () {
+          if (!who) {
+            tabSet('ok', 'Archived. Nothing was running here.', steps.concat([
+              'No coordinator was assigned, so there was nothing to stop.',
+            ]));
+            return null;
+          }
+          var k = killPath(c || {});
+          var text = 'Tab "' + ((c && c.title) || tabId) + '" (' + tabId + ') has been ARCHIVED.\n\n'
+            + '1. Stop ' + who + ' if this session spawned it. Relay recorded spawnedBy='
+            + ((c && c.spawnedBy) || 'no record') + '.\n'
+            + '2. Do NOT spawn a replacement. The tab is closed.\n'
+            + '3. If a clear was queued for this tab, it is cancelled - do not act on it.\n\n'
+            + 'Relay has already asked the coordinator to stand down and detached it from the tab. '
+            + 'Neither of those stops a process; that is what this message is for.';
+          return postTask(text, 'web', DEFAULT_CONV).then(function () {
+            steps.push('Asked "' + DEFAULT_CONV + '" to stop it, as work a coordinator has to claim. ' + k.line);
+            tabSet(k.can ? 'ok' : '', 'Archived, and a stop was requested.', steps.concat([
+              'Archiving itself never stops a process. This asked the session that can.',
+              'A coordinator that had already aged out reports exactly the same as one stopped just now, so do not read silence either way.',
+            ]));
+          }, function (err) {
+            steps.push('The stop request FAILED to reach the queue: ' + ((err && err.message) || 'network error') + '.');
+            tabSet('bad', 'Archived, but nobody was asked to stop it.', steps);
+          });
+        })
+        .catch(function (err) {
+          if (err && err.message === 'archive failed') return null;  // already reported
+          throw err;
+        });
     });
   }
 
@@ -4310,9 +4393,21 @@
            * he pressed this button, and buzzing his phone about his own tap is
            * a documented mistake this file has made before.
            */
-          return postTask(text, 'web', DEFAULT_CONV).then(function () {
+          return postTask(text, 'web', DEFAULT_CONV).then(function (created) {
             var k = killPath(c || {});
             steps.push('Queued for "' + DEFAULT_CONV + '" as work a coordinator has to claim. ' + k.line);
+            /*
+             * Record the outstanding request ON THE TAB, so archiving can
+             * cancel it. Without this the queued clear is only prose in another
+             * conversation, and archiving cannot see it — which is exactly how
+             * a freshly spawned coordinator ended up inside a tab that had been
+             * closed two seconds earlier.
+             *
+             * Deliberately not awaited into the result text: the clear itself
+             * has already succeeded by this point, and failing to write a
+             * bookkeeping field must not be reported as the clear failing.
+             */
+            tabPost({ pendingDispatch: { kind: 'clear', taskId: (created && created.id) || null } });
             tabSet(k.can ? 'ok' : '', 'Requested. Relay cannot confirm a kill.', steps.concat([
               'Relay never stops a process, deliberately. This asked the session that can.',
               'A coordinator that had already aged out reports exactly the same as one stopped just now, so do not read silence either way.',
@@ -4356,6 +4451,15 @@
      */
     srow(info, 'Spawned by', c.spawnedBy || 'no record');
     srow(info, 'Context from', c.contextFrom ? rel(c.contextFrom) : 'never cleared');
+    /*
+     * An outstanding request naming this tab. Shown because archiving is about
+     * to cancel it, and because a request sitting in someone else's queue is
+     * otherwise invisible from here — which is how one got acted on after the
+     * tab it named had already been closed.
+     */
+    if (c.pendingDispatch && c.pendingDispatch.kind) {
+      srow(info, 'Queued request', c.pendingDispatch.kind + ' · ' + rel(c.pendingDispatch.at), 'bad');
+    }
     if (c.stopRequested) srow(info, 'Stop requested', ago(st.stop && st.stop.requestedAgoSec), 'bad');
     if (c.stopAck) srow(info, 'It answered', c.stopAck);
     if (c.archived) srow(info, 'Archived', rel(c.archivedAt));
@@ -4405,7 +4509,16 @@
         isMain ? 'Archive this tab' : (tabArmed === 'archive' ? 'Tap again to archive' : 'Archive this tab'),
         isMain
           ? 'The default tab cannot be archived: it is where every message with no tab of its own lands. The server refuses this one.'
-          : 'Reversible. Hides it from the list and does not stop anything running in it.',
+          : (c.agent
+            /*
+             * Says what the chain does AND where it stops short. Archiving
+             * still cannot kill anything itself — it asks, exactly as Clear
+             * does — and the button has to keep saying so even though it now
+             * does considerably more than it used to.
+             */
+            ? 'Reversible. Also asks "' + c.agent + '" to stop, detaches it, and asks Router to stop it for real. '
+              + 'Archiving itself cannot kill anything. ' + killPath(c).line
+            : 'Reversible. Hides it from the list. Nothing is running here to stop.'),
         {
           cls: 'danger' + (tabArmed === 'archive' ? ' armed' : ''),
           disabled: isMain || tabBusy,
