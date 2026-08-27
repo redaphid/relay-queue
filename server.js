@@ -5990,10 +5990,50 @@ function spendCredits(res, body) {
   return send(res, 200, creditsView());
 }
 
+/*
+ * WHO IS TAKING THIS TASK — and why one spelling was not enough.
+ *
+ * This read `body.by` alone, so `{"agent":"docker-coord2"}` parsed as ANONYMOUS
+ * and the route answered 200 `claimed` with `claimedBy: null`. A success shape
+ * over an answer to a different question: the caller named itself in plain text
+ * and has no way to see that the name was dropped.
+ *
+ * The cost is not a missing label, because `claimedBy` is what the rest of the
+ * queue keys off. An anonymous claim is a seat that reads occupied with nobody
+ * in it — the holder cannot renew (renewal is `by === claimedBy`, and
+ * `"X" === null` is false, so the agent actually doing the work is refused 409
+ * about its own task), a takeover records `takenOverFrom: null` so nothing
+ * remembers that anyone dropped it, and the task never returns to `pending`, so
+ * the nudge, the pending counts and every work poll stay blind to it.
+ *
+ * `by` stays canonical and still wins when several are sent — no existing
+ * caller changes meaning. The aliases match what this file already accepts
+ * elsewhere for the same fact (`body.who` and `body.agent` on the routes above,
+ * `agent`/`author`/`by` in createMessage), which is exactly why an agent
+ * reached for one of them here and lost its name doing it.
+ *
+ * Deliberately lenient rather than strict: a claim carrying NO identity is
+ * still accepted and still recorded as null. resultTask() warns that tightening
+ * this path risks breaking agents that work perfectly well without claiming,
+ * and breaking those is worse than the collision this prevents. Blank and
+ * non-string junk read as anonymous too — an agent named "  " would be worse
+ * than none, because it looks like a holder everywhere the field is printed.
+ */
+function claimantOf(body) {
+  for (const raw of [body.by, body.agent, body.author]) {
+    if (typeof raw !== 'string') continue;
+    // Trimmed so "X " and "X" are one holder rather than two that can never
+    // renew each other's lease; capped so a junk name cannot grow the record.
+    const v = raw.trim().slice(0, MAX_AUTHOR);
+    if (v) return v;
+  }
+  return null;
+}
+
 function claimTask(res, id, body) {
   const task = tasks.get(id);
   if (!task) return fail(res, 404, `no task with id "${id}"`);
-  const by = typeof body.by === 'string' && body.by ? body.by : null;
+  const by = claimantOf(body);
 
   if (task.status === 'claimed') {
     const lease = leaseOf(task);
