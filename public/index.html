@@ -232,6 +232,123 @@
   .convagent.silent { color: var(--rec); font-weight: 700; }
   .convagent.never, .convagent.unassigned { color: var(--muted); }
   @media (prefers-color-scheme: dark) { .convagent.watching, .convagent.working { color: #4ade80; } }
+
+  /* ---- per-tab controls ----
+   *
+   * The row itself is a <button> that switches conversation, and a button may
+   * not contain another button — so the gear is a SIBLING inside a positioned
+   * wrapper rather than a child. Nesting them would be invalid markup and, more
+   * to the point, every tap on the gear would also switch the conversation.
+   */
+  .convwrap { position: relative; display: block; }
+  .convgear {
+    position: absolute; right: 4px; bottom: 4px;
+    /* 40px: a thumb target on a phone, which is where this is actually used. */
+    width: 40px; height: 40px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); background: transparent;
+    border: 1px solid transparent; border-radius: 10px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .convgear:hover, .convgear:focus-visible { color: var(--fg); border-color: var(--line); background: var(--bg); }
+  .convgear svg { width: 20px; height: 20px; fill: currentColor; }
+  /* Keep the row's own text clear of the gear so a long title never sits under it. */
+  .convwrap .convmeta, .convwrap .convact { padding-right: 44px; }
+
+  #tabview {
+    position: fixed; inset: 0; z-index: 34;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #tabview[hidden] { display: none; }
+  #tabclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #tabtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /*
+   * EVERY CONTROL CARRIES ITS OWN LIMIT. The sub-line is not help text and is
+   * not optional decoration: it is the difference between "Stop" (a lie — this
+   * server cannot stop anything) and "Ask to stop — a request, not a kill". A
+   * button whose label overstates what it does is the failure this panel was
+   * built to end, so the label and the caveat are one component and cannot be
+   * rendered apart.
+   */
+  .tbtn {
+    display: block; width: 100%; margin-bottom: 8px; padding: 11px 13px;
+    font: inherit; text-align: left; color: var(--fg);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .tbtn .lab { display: block; font-size: 15px; font-weight: 650; }
+  .tbtn .sub { display: block; margin-top: 3px; font-size: 13px; line-height: 1.35; color: var(--muted); }
+  .tbtn:disabled { cursor: not-allowed; opacity: .72; }
+  /*
+   * A disabled control still has to say WHY, which is why it keeps full
+   * contrast on the reason line while the label dims. "Greyed out with no
+   * explanation" is indistinguishable from "broken".
+   */
+  .tbtn:disabled .lab { color: var(--muted); }
+  .tbtn:disabled .sub { opacity: 1; }
+  .tbtn.danger { border-color: #c0271d55; }
+  .tbtn.danger .lab { color: var(--rec); }
+  .tbtn.armed { border-color: var(--rec); background: #c0271d10; }
+  .tresult {
+    margin: 0 0 10px; padding: 11px 13px; font-size: 14px; line-height: 1.4;
+    border: 1px solid var(--line); border-left-width: 4px; border-radius: 12px; background: var(--panel);
+  }
+  .tresult.bad { border-left-color: var(--rec); color: var(--rec); }
+  .tresult.ok { border-left-color: #1a7f4b; }
+  .tresult b { display: block; margin-bottom: 3px; }
+  .tresult .step { display: block; margin-top: 4px; color: var(--muted); }
+  .tnote { margin: 6px 2px 12px; font-size: 13px; line-height: 1.4; color: var(--muted); }
+
+  /* ---- session dividers in the thread ----
+   *
+   * The watermark has two readers and they want opposite things. An agent wants
+   * a number to filter by; HE wants to see where one coordinator's session
+   * ended and the next began — a question he asked three times in one night, in
+   * three different wordings, because nothing on screen answered it.
+   *
+   * So it is drawn as a RULE ACROSS THE WHOLE THREAD rather than as a subtle
+   * change of tint or a timestamp in a corner. It has to survive being scrolled
+   * past at speed on a phone. Nothing above it is hidden, ever, unless he taps
+   * the expander himself: the boundary moves what a NEW AGENT reads, and must
+   * never be confused with something that removes his own history.
+   */
+  .sessdiv {
+    display: flex; align-items: center; gap: 10px;
+    margin: 22px 2px 14px;
+  }
+  .sessdiv::before, .sessdiv::after {
+    content: ''; flex: 1 1 0; height: 2px; border-radius: 2px;
+    background: var(--line);
+  }
+  .sessdiv .sessbox {
+    flex: 0 1 auto; min-width: 0; text-align: center;
+    padding: 5px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel);
+  }
+  .sessdiv .sesslab {
+    display: block; font-size: 12px; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+  }
+  .sessdiv .sesswhen { display: block; margin-top: 1px; font-size: 12px; color: var(--muted); }
+  /* The boundary that is actually in force. Loud on purpose: it is the answer
+     to "is this coordinator fresh, and what can it see?". */
+  .sessdiv.current::before, .sessdiv.current::after { background: var(--accent); opacity: .55; }
+  .sessdiv.current .sessbox { border-color: var(--accent); background: var(--accent-soft); }
+  .sessdiv.current .sesslab { color: var(--accent); }
+  .sesstoggle {
+    display: block; margin: 3px auto 0; padding: 2px 8px;
+    font: inherit; font-size: 12px; color: var(--muted);
+    background: transparent; border: 1px solid var(--line); border-radius: 999px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .sesstoggle:hover, .sesstoggle:focus-visible { color: var(--fg); }
+  .sessblock[hidden] { display: none; }
   #statusopen {
     margin-top: 12px; width: 100%; min-height: 48px;
     font: inherit; font-size: 15px; color: var(--fg);
@@ -1213,6 +1330,21 @@
       <button id="agopen" type="button">Agents &mdash; who is working, and on what</button>
     </nav>
   </div>
+
+  <!--
+    Per-tab lifecycle controls: archive, detach, ask-to-stop, clear session.
+    Opened from the gear on a conversation ROW, so it always acts on the tab
+    that was pointed at rather than on whichever one happens to be active — in
+    the drawer those two differ constantly, and "it archived the wrong tab" is
+    not a mistake this is allowed to make.
+  -->
+  <section id="tabview" hidden aria-label="Manage this tab">
+    <div class="prow">
+      <b id="tabtitle">Manage tab</b>
+      <button id="tabclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="tabbody"></div>
+  </section>
 
   <section id="statusview" hidden aria-label="Status">
     <div class="prow">
@@ -2283,6 +2415,72 @@
     return wrap;
   }
 
+  /*
+   * Which sessions this tab has had. Read from the conversation list the page
+   * already polls, so drawing boundaries costs no extra request.
+   *
+   * `contextMarks` is the real source; `contextFrom` is the fallback so a tab
+   * cleared by an older build — or by a plain curl that set only the scalar —
+   * still shows its one boundary instead of none. Anything with an unparseable
+   * timestamp is dropped rather than coerced: a divider in the wrong place is
+   * worse than a missing one, because he would trust it.
+   */
+  function sessionMarks() {
+    var c = convById(activeConv);
+    if (!c) return [];
+    var raw = (c.contextMarks && c.contextMarks.length)
+      ? c.contextMarks
+      : (c.contextFrom ? [{ at: c.contextFrom, agent: null }] : []);
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      // ms() answers 0 for anything it cannot parse, never NaN — so this is the
+      // check that actually rejects a bad mark. `isFinite` would pass them all
+      // and plant a divider at the epoch, above the entire thread.
+      if (raw[i] && raw[i].at && ms(raw[i].at) > 0) out.push(raw[i]);
+    }
+    out.sort(function (a, b) { return ms(a.at) - ms(b.at); });
+    return out;
+  }
+
+  /*
+   * Collapse state, keyed by the boundary's own timestamp so it survives the
+   * re-render that happens on every poll. Empty by default and it stays that
+   * way until he taps: nothing here hides his history on its own.
+   */
+  var sessHidden = {};
+
+  function sessionDivider(mark, block, count, isCurrent) {
+    var wrap = el('div', 'sessdiv' + (isCurrent ? ' current' : ''));
+    var boxWrap = el('div', 'sessbox');
+    boxWrap.appendChild(el('span', 'sesslab', isCurrent ? 'Current session starts here' : 'New session'));
+    /*
+     * Name the session ABOVE, not below. At the moment a tab is cleared the
+     * outgoing agent is the only one anyone knows — the replacement has not
+     * been spawned yet — so claiming a name for what follows would be a guess.
+     */
+    boxWrap.appendChild(el('span', 'sesswhen',
+      rel(mark.at) + (mark.agent ? ' · ended ' + mark.agent + "'s session" : '')));
+    if (count > 0) {
+      var t = el('button', 'sesstoggle');
+      t.type = 'button';
+      var hidden = !!sessHidden[mark.at];
+      var word = count === 1 ? '1 message' : count + ' messages';
+      t.textContent = (hidden ? 'Show the ' : 'Hide the ') + word + ' above';
+      t.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+      if (block) block.hidden = hidden;
+      t.addEventListener('click', function () {
+        sessHidden[mark.at] = !sessHidden[mark.at];
+        var now = !!sessHidden[mark.at];
+        if (block) block.hidden = now;
+        t.textContent = (now ? 'Show the ' : 'Hide the ') + word + ' above';
+        t.setAttribute('aria-expanded', now ? 'false' : 'true');
+      });
+      boxWrap.appendChild(t);
+    }
+    wrap.appendChild(boxWrap);
+    return wrap;
+  }
+
   function render() {
     var all = Array.from(entries.values());
     all.sort(function (a, b) {
@@ -2292,7 +2490,52 @@
 
     var frag = document.createDocumentFragment();
     taskRows = [];   // every row is about to be rebuilt; the old ones are detached
-    for (var i = 0; i < all.length; i++) frag.appendChild(nodeFor(all[i]));
+    var marks = sessionMarks();
+    if (!marks.length) {
+      // The overwhelmingly common case, and it must cost nothing: no wrappers,
+      // no grouping, byte-for-byte the thread as it rendered before this existed.
+      for (var i = 0; i < all.length; i++) frag.appendChild(nodeFor(all[i]));
+    } else {
+      /*
+       * Messages are grouped into a block per session so ONE toggle can collapse
+       * a whole stretch. The block is appended BEFORE the divider that owns it,
+       * because a boundary describes the history above it: the rule sits under
+       * the last message of the old session and above the first of the new.
+       */
+      var mi = 0;
+      var block = el('div', 'sessblock');
+      var count = 0;
+      /*
+       * A boundary with nothing above it is dropped, unless it is the newest.
+       *
+       * Two cases produce one, and a rule across an empty stretch is noise in
+       * both: a tab cleared twice with nothing said in between, and — far more
+       * common — a mark older than the window of messages the page has loaded.
+       * Before this, opening a long-lived tab drew every historical boundary
+       * stacked against the top of the thread, delimiting nothing.
+       *
+       * The newest is always drawn, even with nothing above it, because it is
+       * the one that answers "what can the coordinator here see?". Nothing is
+       * concealed by this: a skipped divider had no messages to hide.
+       */
+      var flush = function (mark) {
+        var last = mi === marks.length - 1;
+        if (!count && !last) return;
+        if (count) frag.appendChild(block);
+        frag.appendChild(sessionDivider(mark, count ? block : null, count, last));
+        block = el('div', 'sessblock');
+        count = 0;
+      };
+      for (var j = 0; j < all.length; j++) {
+        while (mi < marks.length && ms(all[j].ts) >= ms(marks[mi].at)) { flush(marks[mi]); mi++; }
+        block.appendChild(nodeFor(all[j]));
+        count++;
+      }
+      // A tab cleared a second ago has no messages after the mark yet. The line
+      // still renders, or the clear would look like it did nothing at all.
+      while (mi < marks.length) { flush(marks[mi]); mi++; }
+      if (count) frag.appendChild(block);
+    }
     list.textContent = '';
     list.appendChild(frag);
 
@@ -3065,7 +3308,28 @@
     }
 
     row.addEventListener('click', function () { switchConv(c.id); });
-    return row;
+
+    /*
+     * The manage control is a SIBLING of the row, not a child. The row is a
+     * <button>; a button inside a button is invalid markup that browsers
+     * silently un-nest, and every tap meant for the gear would also switch
+     * conversation — so "manage tab B" would first move him to tab B, which is
+     * precisely the kind of thing that gets the wrong tab archived.
+     */
+    var wrap = el('div', 'convwrap');
+    wrap.appendChild(row);
+    var gear = el('button', 'convgear');
+    gear.type = 'button';
+    gear.title = 'Manage this tab';
+    gear.setAttribute('aria-label', 'Manage ' + (c.title || c.id));
+    gear.appendChild(dotsIcon());
+    gear.addEventListener('click', function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      showTab(c.id);
+    });
+    wrap.appendChild(gear);
+    return wrap;
   }
 
   /*
@@ -3795,6 +4059,436 @@
     if (actOpenBtn) actOpenBtn.addEventListener('click', showActivity);
     if (actCloseBtn) actCloseBtn.addEventListener('click', hideActivity);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideActivity(); });
+  }
+
+  /*
+   * ---------------------------------------------------------------- per-tab controls
+   *
+   * The backend for all of this has existed for weeks and the page called NONE
+   * of it: archive, unassign and stop-request were reachable only with curl. So
+   * the only way to retire a tab or free a stuck coordinator was to ask an agent
+   * to do it, which is the exact dependency a control panel is supposed to
+   * remove — and it failed hardest precisely when the agent was the problem.
+   *
+   * THE RULE THIS PANEL IS BUILT AROUND: every control states what it cannot do,
+   * in the same breath as what it can. This server cannot kill a process and
+   * says so in its own responses (FORCE_KILL_NOTE); a page that renders "Stop"
+   * as though it stopped something turns a truthful API into a lie at the last
+   * inch. So the caveats here are not help text — they are part of the label,
+   * they render even when the control is disabled, and the result panel reports
+   * what was REQUESTED rather than what was achieved, because requesting is
+   * genuinely all that happened.
+   */
+  var tabView = document.getElementById('tabview');
+  var tabBody = document.getElementById('tabbody');
+  var tabTitle = document.getElementById('tabtitle');
+  var tabCloseBtn = document.getElementById('tabclose');
+  var tabOn = false;
+  var tabId = null;
+  /*
+   * Its own copy, fetched from /conversations/<id>, rather than a lookup in the
+   * drawer's list. The list hides archived conversations, so reading from it
+   * would make the Restore control unreachable for the only rows that need it —
+   * an "archiving is reversible" promise that the UI could not actually keep.
+   */
+  var tabData = null;
+  var tabBusy = false;
+  var tabArmed = null;   // which destructive control is one more tap from firing
+  var tabResult = null;
+  var tabTimer = null;
+  var TAB_MS = 5000;
+
+  /* Three dots: the conventional "options for this row", and a shape with no
+     path data to get wrong at 20px. */
+  function dotsIcon() {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    var ys = [5, 12, 19];
+    for (var i = 0; i < 3; i++) {
+      var c = document.createElementNS(ns, 'circle');
+      c.setAttribute('cx', '12'); c.setAttribute('cy', String(ys[i])); c.setAttribute('r', '2');
+      svg.appendChild(c);
+    }
+    return svg;
+  }
+
+  function tbtn(label, sub, opts) {
+    var o = opts || {};
+    var b = el('button', 'tbtn' + (o.cls ? ' ' + o.cls : ''));
+    b.type = 'button';
+    b.appendChild(el('span', 'lab', label));
+    b.appendChild(el('span', 'sub', sub));
+    if (o.disabled) b.disabled = true;
+    else if (o.onClick) b.addEventListener('click', o.onClick);
+    return b;
+  }
+
+  /*
+   * States in which a coordinator would actually READ something posted to it.
+   * `stuck` is included on purpose and is not an oversight: stuck means it is
+   * checking in but not acting, so it is a live process that may yet pick the
+   * message up. Treating it as absent would understate the chance the request
+   * lands; treating it as healthy would overstate it, so it gets its own line.
+   */
+  var ROUTER_PRESENT = { watching: 1, working: 1, idle: 1, stuck: 1 };
+
+  function routerInfo() {
+    var m = convById(DEFAULT_CONV);
+    var st = (m && m.agentState && m.agentState.state) || 'unassigned';
+    return {
+      name: (m && m.agent) || null,
+      state: st,
+      present: !!(m && m.agent) && !!ROUTER_PRESENT[st],
+    };
+  }
+
+  /*
+   * WHO, IF ANYONE, COULD ACTUALLY KILL THIS AGENT — the question the whole
+   * feature turns on. Nothing here is inferred: `spawnedBy` is null until a
+   * session declares it, and null resolves to "no record", never to "probably
+   * fine". Every branch returns `can: false` except the one where relay has a
+   * recorded spawner, that spawner is the Router currently holding the default
+   * conversation, and that Router is in a state where it reads its queue. Even
+   * then the wording stops short of promising a kill happened, because relay
+   * cannot observe the outcome and an agent that already aged out is reported
+   * by the harness exactly like one that was stopped this second.
+   */
+  function killPath(c) {
+    var r = routerInfo();
+    if (!c.agent) {
+      return { can: false, line: 'Nobody is assigned to this tab, so there is nothing to stop.' };
+    }
+    if (!r.name) {
+      return { can: false, line: 'No Router holds "' + DEFAULT_CONV + '" right now, so the request will sit in the queue unread until one does.' };
+    }
+    if (!r.present) {
+      return { can: false, line: '"' + r.name + '" holds ' + DEFAULT_CONV + ' but is ' + (AGENT_STATE[r.state] || r.state)
+        + ', so this will queue rather than fire.' };
+    }
+    if (!c.spawnedBy) {
+      return { can: false, line: 'Relay has no record of who spawned "' + c.agent + '". "' + r.name
+        + '" is listening and will receive the request, but nothing here can promise it is able to stop this one.' };
+    }
+    if (c.spawnedBy !== r.name) {
+      return { can: false, line: '"' + c.agent + '" was spawned by "' + c.spawnedBy + '", not by "' + r.name
+        + '". Only the session that started an agent can stop it, so this is a request, not a kill.' };
+    }
+    return { can: true, line: '"' + r.name + '" spawned "' + c.agent + '" and is listening, so it can genuinely stop it. '
+      + 'Relay still cannot see whether it worked.' };
+  }
+
+  function tabSet(tone, title, steps) {
+    tabResult = { tone: tone, title: title, steps: (steps || []).filter(Boolean) };
+    renderTab();
+  }
+
+  function tabPost(body) {
+    return fetch('/conversations/' + encodeURIComponent(tabId), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { ok: r.ok, status: r.status, b: b || {} }; },
+        function () { return { ok: r.ok, status: r.status, b: {} }; });
+    });
+  }
+
+  function tabErr(what, r) {
+    tabSet('bad', 'Could not ' + what + '.', [(r.b && r.b.error) || ('HTTP ' + r.status)]);
+  }
+
+  /* One in flight at a time. A double-tap that fires two archives is harmless;
+     one that fires two clear-sessions spawns two coordinators on one tab. */
+  function tabRun(fn) {
+    if (tabBusy) return;
+    tabBusy = true;
+    tabArmed = null;
+    renderTab();
+    Promise.resolve().then(fn)
+      .catch(function (err) { tabSet('bad', 'That did not go through.', [(err && err.message) || 'network error']); })
+      .then(function () { tabBusy = false; return refreshTab(); })
+      .then(function () { loadConvs(); });
+  }
+
+  function doStopRequest(want) {
+    tabRun(function () {
+      return tabPost({ stopRequested: want, stopRequestedBy: 'human' }).then(function (r) {
+        if (!r.ok) return tabErr(want ? 'ask it to stop' : 'withdraw the request', r);
+        if (!want) {
+          return tabSet('ok', 'Stop request withdrawn.',
+            ['It may already have acted on the request. There is no recall.']);
+        }
+        var e = r.b.stopRequestEffect || {};
+        tabSet('ok', e.summary || 'Asked to stop.',
+          [e.detail, e.forceKill && e.forceKill.how]);
+      });
+    });
+  }
+
+  function doDetach() {
+    var was = tabData && tabData.agent;
+    tabRun(function () {
+      return tabPost({ agent: null }).then(function (r) {
+        if (!r.ok) return tabErr('detach the coordinator', r);
+        tabSet('ok', 'Detached. The tab has no coordinator now.', [
+          was ? '"' + was + '" was NOT stopped. It may still be running, still holding git worktrees, and still able to post here.'
+            : null,
+          'Relay has also dropped its record of who spawned it, because that record described the agent that just left.',
+        ]);
+      });
+    });
+  }
+
+  function doArchive(want) {
+    tabRun(function () {
+      return tabPost({ archived: want }).then(function (r) {
+        if (!r.ok) return tabErr(want ? 'archive this tab' : 'restore this tab', r);
+        if (!want) return tabSet('ok', 'Restored. It is back in the list.', []);
+        var g = r.b.ghost;
+        tabSet('ok', 'Archived. It is out of the list and can be restored.', g
+          ? [g.summary, g.detail, g.forceKill && g.forceKill.how]
+          : ['Nothing was left running here: no agent was assigned, or it had already confirmed it stopped.']);
+      });
+    });
+  }
+
+  /*
+   * CLEAR SESSION — three writes, reported one by one.
+   *
+   * Reported separately because they can fail separately, and a summary that
+   * said "cleared" while the watermark landed and the Router request did not
+   * would be the worst possible outcome: the human believes a fresh agent is
+   * coming, and the old one is still sitting there with the whole backlog.
+   *
+   * THE WATERMARK IS THE POINT, not the agent swap. Replacing a coordinator
+   * without one buys almost nothing — the replacement reads the entire tab on
+   * startup and arrives just as loaded as the agent it replaced. The watermark
+   * is what makes "fresh" mean anything.
+   */
+  function doClear() {
+    var c = tabData;
+    var steps = [];
+    tabRun(function () {
+      return tabPost({ contextFrom: true })
+        .then(function (r) {
+          if (!r.ok) throw new Error('the watermark could not be set: ' + ((r.b && r.b.error) || 'HTTP ' + r.status));
+          var mark = r.b.contextFrom;
+          steps.push('Watermark set ' + rel(mark) + '. A new coordinator here is told to read only from that point.');
+          return tabPost({ stopRequested: true, stopRequestedBy: 'human (clear session)' }).then(function (s) {
+            if (!s.ok) steps.push('The stop request FAILED: ' + ((s.b && s.b.error) || 'HTTP ' + s.status));
+            else steps.push((s.b.stopRequestEffect && s.b.stopRequestEffect.summary) || 'Asked the coordinator to stop.');
+            return mark;
+          });
+        })
+        .then(function (mark) {
+          var title = (c && c.title) || tabId;
+          var who = (c && c.agent) || 'the coordinator';
+          var text = 'Clear session for tab "' + title + '" (' + tabId + ').\n\n'
+            + '1. Stop ' + who + ' if this session spawned it. Relay recorded spawnedBy='
+            + ((c && c.spawnedBy) || 'no record') + '.\n'
+            + '2. Spawn a fresh coordinator on the SAME tab.\n'
+            + '3. The fresh coordinator reads ONLY from the watermark forward:\n'
+            + '   GET /thread?conversationId=' + tabId + '&since=' + mark + '\n'
+            + '   Put that in its brief explicitly, or it will read the whole tab anyway.\n\n'
+            + 'Everything before the watermark stays visible to the human. Do not delete or hide any of it.';
+          /*
+           * POSTED AS A TASK, NOT AS A MESSAGE — and the difference is the
+           * whole control working or silently doing nothing.
+           *
+           * `POST /messages` sets `role: 'agent'` server-side regardless of what
+           * the client sends, and an agent message lands already `done`. The
+           * first build of this used it, and the request arrived in `main` as
+           * closed history with `pending: 0`: perfectly readable to a human
+           * scrolling by, and invisible to the Router that was supposed to act
+           * on it. `POST /tasks` is what the composer itself uses, and it is
+           * what puts a row in the queue that a coordinator will claim.
+           *
+           * `from: 'web'` on purpose. That origin is in the server's
+           * PAGE_ORIGINS allowlist, which suppresses the push notification —
+           * he pressed this button, and buzzing his phone about his own tap is
+           * a documented mistake this file has made before.
+           */
+          return postTask(text, 'web', DEFAULT_CONV).then(function () {
+            var k = killPath(c || {});
+            steps.push('Queued for "' + DEFAULT_CONV + '" as work a coordinator has to claim. ' + k.line);
+            tabSet(k.can ? 'ok' : '', 'Requested. Relay cannot confirm a kill.', steps.concat([
+              'Relay never stops a process, deliberately. This asked the session that can.',
+              'A coordinator that had already aged out reports exactly the same as one stopped just now, so do not read silence either way.',
+            ]));
+          }, function (err) {
+            steps.push('The request FAILED to post: ' + ((err && err.message) || 'network error') + '. Nothing will pick this up.');
+            tabSet('bad', 'Partly done — no one was asked.', steps);
+          });
+        });
+    });
+  }
+
+  function renderTab() {
+    if (!tabBody) return;
+    tabBody.textContent = '';
+    var c = tabData;
+    if (!c) {
+      tabBody.appendChild(el('div', 'sempty', 'Loading…'));
+      return;
+    }
+    if (tabTitle) tabTitle.textContent = 'Manage — ' + (c.title || c.id);
+
+    if (tabResult) {
+      var box = el('div', 'tresult' + (tabResult.tone ? ' ' + tabResult.tone : ''));
+      box.appendChild(el('b', null, tabResult.title));
+      for (var i = 0; i < tabResult.steps.length; i++) {
+        box.appendChild(el('span', 'step', tabResult.steps[i]));
+      }
+      tabBody.appendChild(box);
+    }
+
+    var st = c.agentState || {};
+    var info = scard('This tab');
+    srow(info, 'Coordinator', c.agent || 'nobody assigned', c.agent ? '' : 'bad');
+    srow(info, 'State', AGENT_STATE[st.state] || st.state || 'unknown');
+    if (st.actedAgoSec !== null && st.actedAgoSec !== undefined) srow(info, 'Last acted', ago(st.actedAgoSec));
+    /*
+     * Said in words, not left as a blank. "No record" is a real and common
+     * answer here — nothing wrote this field before tonight — and it is the
+     * answer that decides whether the clear control can promise anything.
+     */
+    srow(info, 'Spawned by', c.spawnedBy || 'no record');
+    srow(info, 'Context from', c.contextFrom ? rel(c.contextFrom) : 'never cleared');
+    if (c.stopRequested) srow(info, 'Stop requested', ago(st.stop && st.stop.requestedAgoSec), 'bad');
+    if (c.stopAck) srow(info, 'It answered', c.stopAck);
+    if (c.archived) srow(info, 'Archived', rel(c.archivedAt));
+    tabBody.appendChild(info);
+
+    var k = killPath(c);
+    var acts = scard('Controls');
+
+    acts.appendChild(tbtn(
+      c.stopRequested ? 'Withdraw the stop request' : 'Ask ' + (c.agent || 'it') + ' to stop',
+      c.stopRequested
+        ? 'It may already have acted on it. Withdrawing clears the ask, never the answer.'
+        : (c.agent
+          ? 'A request, not a kill. It leaves a note the agent reads next time it wakes on its own.'
+          : 'Nobody is assigned, so nothing would ever read the note.'),
+      { disabled: !c.agent && !c.stopRequested, onClick: function () { doStopRequest(!c.stopRequested); } }
+    ));
+
+    acts.appendChild(tbtn(
+      'Detach the coordinator',
+      c.agent
+        ? 'Frees the tab so someone else can take it. Does NOT stop "' + c.agent + '", which keeps running and can still post here.'
+        : 'Nobody is assigned to this tab.',
+      { disabled: !c.agent, onClick: doDetach }
+    ));
+
+    acts.appendChild(tbtn(
+      tabArmed === 'clear' ? 'Tap again to clear this session' : 'Clear the session',
+      'Sets a read watermark, asks the coordinator to stand down, and asks Router for a fresh one on this tab. '
+        + k.line + ' Your history stays; only a new agent\'s starting point moves.',
+      {
+        cls: 'danger' + (tabArmed === 'clear' ? ' armed' : ''),
+        disabled: tabBusy,
+        onClick: function () {
+          if (tabArmed !== 'clear') { tabArmed = 'clear'; renderTab(); return; }
+          doClear();
+        },
+      }
+    ));
+
+    var isMain = c.id === DEFAULT_CONV;
+    if (c.archived) {
+      acts.appendChild(tbtn('Restore this tab', 'Puts it back in the list exactly as it was.',
+        { disabled: tabBusy, onClick: function () { doArchive(false); } }));
+    } else {
+      acts.appendChild(tbtn(
+        isMain ? 'Archive this tab' : (tabArmed === 'archive' ? 'Tap again to archive' : 'Archive this tab'),
+        isMain
+          ? 'The default tab cannot be archived: it is where every message with no tab of its own lands. The server refuses this one.'
+          : 'Reversible. Hides it from the list and does not stop anything running in it.',
+        {
+          cls: 'danger' + (tabArmed === 'archive' ? ' armed' : ''),
+          disabled: isMain || tabBusy,
+          onClick: function () {
+            if (tabArmed !== 'archive') { tabArmed = 'archive'; renderTab(); return; }
+            doArchive(true);
+          },
+        }
+      ));
+    }
+    tabBody.appendChild(acts);
+
+    /*
+     * Stated rather than left as an absence. Someone WILL ask where delete is,
+     * and the answer is a decision, not an omission — the server returns 405 on
+     * purpose. Writing it here is what stops it being "fixed" later.
+     */
+    tabBody.appendChild(el('p', 'tnote',
+      'There is no delete, on purpose — the server refuses it. A thread is the record of what happened, '
+      + 'and archiving gets it out of the way without destroying that. Archived tabs are still readable by URL.'));
+  }
+
+  function refreshTab() {
+    if (!tabOn || !tabId) return Promise.resolve(false);
+    var want = tabId;
+    return fetch('/conversations/' + encodeURIComponent(want), { headers: { accept: 'application/json' } })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (!tabOn || want !== tabId) return false;  // switched while in flight
+        tabData = j;
+        renderTab();
+        return true;
+      })
+      .catch(function () {
+        if (!tabOn || want !== tabId) return false;
+        if (!tabData) {
+          tabBody.textContent = '';
+          tabBody.appendChild(el('div', 'sempty', 'Could not read this tab. It may have been removed.'));
+        }
+        return false;
+      });
+  }
+
+  function showTab(id) {
+    if (!tabView) return;
+    tabId = id;
+    tabData = convById(id) || null;   // paint instantly from the list, then confirm
+    tabResult = null;
+    tabArmed = null;
+    tabBusy = false;
+    tabOn = true;
+    tabView.hidden = false;
+    if (tabTitle) tabTitle.textContent = 'Manage — ' + ((tabData && tabData.title) || id);
+    closeDrawer();
+    renderTab();
+    refreshTab();
+    clearInterval(tabTimer);
+    /*
+     * Only while nothing is in flight: a refresh landing mid-action would
+     * repaint the panel under the tap and wipe the result that just arrived.
+     */
+    tabTimer = setInterval(function () {
+      if (tabOn && !tabBusy && !document.hidden) refreshTab();
+    }, TAB_MS);
+    uiSync();
+  }
+
+  function hideTab() {
+    if (!tabView || !tabOn) return;
+    tabOn = false;
+    tabView.hidden = true;
+    tabArmed = null;
+    clearInterval(tabTimer);
+    tabTimer = null;
+    uiSync();
+  }
+
+  function initTabControls() {
+    if (tabCloseBtn) tabCloseBtn.addEventListener('click', hideTab);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideTab(); });
   }
 
   /*
@@ -6952,7 +7646,7 @@
      * while the one underneath is still open, so back keeps consuming layers
      * one at a time and only leaves the app when the last is gone.
      */
-    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!agOn || !!lightOn || !!shareOn;
+    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!agOn || !!lightOn || !!shareOn || !!tabOn;
     if (open === uiMarked) return; // includes drawer -> status, which re-uses it
     if (open) {
       // Same URL on purpose: a marker must not look like a conversation change,
@@ -6980,6 +7674,9 @@
     // is still open.
     if (lightOn) hideLightbox();
     else if (shareOn) hideShare();
+    // Above the agents roster in the stack: it opens from the drawer on top of
+    // everything else, so back must close it first.
+    else if (tabOn) hideTab();
     else if (agOn) hideAgents();
     else if (galOn) hideGallery();
     else if (actOn) hideActivity();
@@ -7034,6 +7731,13 @@
     initAgents();
   } catch (err) {
     logClient('agents-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Same guard once more. Managing a tab is a bonus; reading and sending
+  // messages in it is not, and must not break if this fails to wire up.
+  try {
+    initTabControls();
+  } catch (err) {
+    logClient('tabcontrols-init-failed', { message: (err && err.message) || String(err) });
   }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is
