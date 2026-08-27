@@ -6327,6 +6327,39 @@ function updateConversation(res, id, body) {
       patch.stopRequested = false;
       patch.stopRequestedAt = null;
       patch.stopRequestedBy = null;
+      /*
+       * ...AND THE VACANCY NOTICE, for the same reason and by the same rule.
+       *
+       * sweepVacantChairs() records the departed occupant in `agentLeft` /
+       * `agentLeftAt` / `agentLeftReason` on purpose — an empty chair reading
+       * "PushCoord, presumed gone" is worth more than one with no history. But
+       * nothing ever took the notice down again, so a refilled chair asserted
+       * both things at once:
+       *
+       *     "agent":           "coordinator"      <- seated, working right now
+       *     "agentLeft":       "coordinator"
+       *     "agentLeftReason": "presumed-gone"    <- and also gone, hours ago
+       *
+       * That is the live record from `main` on 2026-08-27, where a second agent
+       * reused the name and so occupied both fields at once. Nothing reading it
+       * can tell whether the agent in the chair is the one presumed gone, and
+       * it is not cosmetic: that stale notice was read as evidence the sweep had
+       * FAILED to release the seat and sent an investigation after a bug that
+       * was not there — the event log shows the sweep worked and the chair had
+       * simply been refilled since.
+       *
+       * Nothing is lost. Every seat change is an event in events.jsonl, which is
+       * where this history is actually reconstructable, and where it was
+       * reconstructed to work the above out.
+       *
+       * Same narrow rule as the stop state above, deliberately: only a genuine
+       * change of occupant clears it. An explicit `agent: null` KEEPS it, which
+       * is the one state the notice exists to describe, and re-asserting the
+       * same name is a no-op.
+       */
+      patch.agentLeft = null;
+      patch.agentLeftAt = null;
+      patch.agentLeftReason = null;
     }
   }
 
