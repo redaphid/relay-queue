@@ -629,6 +629,68 @@
   .tlmsg { padding: 0 12px 8px; font-size: 13px; color: var(--muted); }
   .tlmsg.bad { color: var(--rec); }
 
+  /* ---- archived tabs ----
+   *
+   * Archiving was reversible in the API and a one-way door in the page: the row
+   * vanished from the list, and the list was the only way to reach the control
+   * that brings it back. 39 tabs went in with no way out, and opening one by
+   * URL bounced to the main thread with an error. This is the way out.
+   */
+  #arcopen {
+    margin-top: 8px; width: 100%; min-height: 48px; padding: 0 12px;
+    font: inherit; font-size: 15px; text-align: left; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+    border-left: 4px solid transparent;
+    border-image: linear-gradient(180deg, #64748b, #94a3b8) 1 / 0 0 0 4px;
+  }
+  #arcview {
+    position: fixed; inset: 0; z-index: 35;
+    display: flex; flex-direction: column;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--bg); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #arcview[hidden] { display: none; }
+  #arcclose {
+    margin-left: auto; width: 44px; height: 44px; font-size: 26px; line-height: 1;
+    color: var(--muted); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #arcfind {
+    width: 100%; min-height: 44px; margin-bottom: 10px; padding: 8px 12px;
+    font: inherit; font-size: 16px; color: var(--fg);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .arcrow {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 11px 13px; margin-bottom: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  }
+  .arcmain { flex: 1 1 auto; min-width: 0; }
+  .arcname { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+  .arcwhen { margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .arcsnip {
+    margin-top: 3px; font-size: 13px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* An archived tab that still names a coordinator is the ghost the server
+     warns about. Loud, because restoring it is not what fixes that. */
+  .arcghost { margin-top: 4px; font-size: 12px; color: var(--rec); font-weight: 650; }
+  .arcbtn {
+    flex: 0 0 auto; min-height: 40px; padding: 0 14px;
+    font: inherit; font-size: 14px; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .arcbtn:disabled { opacity: .55; cursor: not-allowed; }
+  .arcmore {
+    width: 100%; min-height: 44px; margin-bottom: 10px;
+    font: inherit; font-size: 14px; color: var(--fg);
+    background: var(--bg); border: 1px dashed var(--line); border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .arcnote { margin: 0 2px 10px; font-size: 13px; line-height: 1.4; color: var(--muted); }
+
   .msg { max-width: 86%; margin: 0 0 12px; padding: 10px 13px; border-radius: 17px; }
   /* Blocks bring their own spacing now that the body is rendered Markdown, so
      `pre-wrap` would double every gap. Single newlines inside a paragraph are
@@ -1400,6 +1462,7 @@
       <button id="galopen" type="button">Gallery &mdash; every picture in this conversation</button>
       <button id="shareopen" type="button">Share &mdash; publish a public snapshot</button>
       <button id="agopen" type="button">Agents &mdash; who is working, and on what</button>
+      <button id="arcopen" type="button">Archived &mdash; tabs you filed away</button>
     </nav>
   </div>
 
@@ -1416,6 +1479,22 @@
       <button id="tabclose" type="button" aria-label="Close">&times;</button>
     </div>
     <div id="tabbody"></div>
+  </section>
+
+  <!--
+    Archived tabs, and the way back. Restore is the only action here: an
+    archived conversation cannot be opened without being restored first, so a
+    row that looked tappable would just bounce to the main thread - which is
+    the exact failure this panel exists to end.
+  -->
+  <section id="arcview" hidden aria-label="Archived tabs">
+    <div class="prow">
+      <b id="arctitle">Archived</b>
+      <button id="arcclose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <input id="arcfind" type="search" placeholder="Find an archived tab&hellip;"
+      autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="search">
+    <div id="arcbody"></div>
   </section>
 
   <section id="statusview" hidden aria-label="Status">
@@ -3169,8 +3248,16 @@
           var missing = activeConv;
           return switchConv(DEFAULT_CONV, true, 'replace').then(function (ok) {
             var c = convById(DEFAULT_CONV);
-            showErr('That conversation is not here any more — showing ' +
-              ((c && c.title) || 'the main thread') + ' instead.');
+            /*
+             * Say where it went, not just that it is gone. There is no delete
+             * route, so a conversation missing from the list is almost always
+             * archived - and this exact bounce was firing repeatedly on his
+             * phone with no hint that the tab still existed or how to get it
+             * back. "May be" rather than "is": the page cannot see the
+             * archived list from here and must not assert what it has not read.
+             */
+            showErr('That tab is not in your list — it may be archived. Open Archived in the menu to bring it back. '
+              + 'Showing ' + ((c && c.title) || 'the main thread') + ' for now.');
             logClient('conv-missing', { wanted: missing });
             return ok;
           });
@@ -4908,6 +4995,215 @@
     tlTimer = setInterval(function () {
       if (!document.hidden) tlLoad();
     }, TL_MS);
+  }
+
+  /*
+   * ---------------------------------------------------------------- archived tabs
+   *
+   * Archiving is reversible in the API and was a one-way door in the page. The
+   * control that restores a tab lives in that tab's own panel, and that panel is
+   * reached from its row in the drawer - which archiving removes. So the way
+   * back existed and could not be walked. 39 tabs went in, and his phone kept
+   * logging conv-missing as he opened archived ones by URL and got bounced to
+   * the main thread.
+   *
+   * RESTORE IS THE ONLY ACTION HERE, on purpose. An archived conversation
+   * cannot be opened without being restored first, so a tappable row would just
+   * reproduce that bounce. The snippet is there so a tab can be recognised
+   * without opening it.
+   *
+   * Nothing is ever restored automatically. 39 rows reappearing in his list
+   * because a panel decided to be helpful is the same failure as losing them.
+   */
+  var arcView = document.getElementById('arcview');
+  var arcBody = document.getElementById('arcbody');
+  var arcTitle = document.getElementById('arctitle');
+  var arcCloseBtn = document.getElementById('arcclose');
+  var arcOpenBtn = document.getElementById('arcopen');
+  var arcFind = document.getElementById('arcfind');
+  var arcOn = false;
+  var arcRows = [];
+  var arcAll = false;      // he asked to see past the first page
+  var arcBusy = {};
+  var arcMsg = '';
+  var arcErr = false;
+  // Enough to cover a night's archiving without becoming a wall: 39 rows of
+  // three lines each is several screens of scrolling to find one tab.
+  var ARC_PAGE = 10;
+
+  function arcMatch(c, q) {
+    if (!q) return true;
+    var hay = ((c.title || '') + ' ' + (c.lastText || '') + ' ' + c.id).toLowerCase();
+    return hay.indexOf(q) !== -1;
+  }
+
+  function arcRender() {
+    if (!arcBody) return;
+    arcBody.textContent = '';
+    var q = String((arcFind && arcFind.value) || '').trim().toLowerCase();
+    /*
+     * The default conversation can never be archived - the server refuses it -
+     * so it cannot appear here. Filtered anyway rather than trusted: a Restore
+     * control on a tab that was never archived would be a button with nothing
+     * to do, and this panel exists to be the place where the way back is real.
+     */
+    var all = arcRows.filter(function (c) { return c.id !== DEFAULT_CONV; });
+    var shown = all.filter(function (c) { return arcMatch(c, q); });
+
+    if (arcTitle) arcTitle.textContent = 'Archived \u2014 ' + all.length;
+    if (arcMsg) arcBody.appendChild(el('p', 'arcnote', arcMsg));
+
+    if (!all.length) {
+      arcBody.appendChild(el('p', 'arcnote', 'Nothing is archived. Tabs you file away land here, and can be brought back.'));
+      return;
+    }
+    if (!shown.length) {
+      arcBody.appendChild(el('p', 'arcnote', 'No archived tab matches "' + q + '".'));
+      return;
+    }
+
+    var page = (q || arcAll) ? shown : shown.slice(0, ARC_PAGE);
+    for (var i = 0; i < page.length; i++) arcBody.appendChild(arcRowNode(page[i]));
+
+    if (!q && !arcAll && shown.length > ARC_PAGE) {
+      var more = el('button', 'arcmore', 'Show the other ' + (shown.length - ARC_PAGE) + ' \u2014 or search above');
+      more.type = 'button';
+      more.addEventListener('click', function () { arcAll = true; arcRender(); });
+      arcBody.appendChild(more);
+    }
+    arcBody.appendChild(el('p', 'arcnote',
+      'Restoring puts a tab back in the list exactly as it was. It does not start a coordinator, '
+      + 'and nothing here is restored on its own.'));
+  }
+
+  function arcRowNode(c) {
+    var row = el('div', 'arcrow');
+    var main = el('div', 'arcmain');
+    main.appendChild(el('div', 'arcname', c.title || c.id));
+    var when = 'archived ' + (c.archivedAt ? rel(c.archivedAt) : 'at an unknown time');
+    if (c.messages) when += ' \u00b7 ' + c.messages + (c.messages === 1 ? ' message' : ' messages');
+    main.appendChild(el('div', 'arcwhen', when));
+    if (c.lastText) main.appendChild(el('div', 'arcsnip', c.lastText));
+    /*
+     * Named rather than left for him to discover. Archiving does not stop an
+     * agent, so a tab filed away while one was still attached is the ghost the
+     * server warns about - and restoring does not resolve that either way.
+     */
+    if (c.agent) main.appendChild(el('div', 'arcghost', '"' + c.agent + '" is still attached to this tab'));
+    row.appendChild(main);
+
+    var btn = el('button', 'arcbtn', arcBusy[c.id] ? 'Restoring\u2026' : 'Restore');
+    btn.type = 'button';
+    btn.disabled = !!arcBusy[c.id];
+    btn.setAttribute('aria-label', 'Restore ' + (c.title || c.id));
+    btn.addEventListener('click', function () { arcRestore(c); });
+    row.appendChild(btn);
+    return row;
+  }
+
+  function arcRestore(c) {
+    if (arcBusy[c.id]) return;
+    arcBusy[c.id] = true;
+    arcMsg = '';
+    arcErr = false;
+    arcRender();
+    fetch('/conversations/' + encodeURIComponent(c.id), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ archived: false }),
+    })
+      .then(function (r) {
+        return r.json().then(function (b) { return { ok: r.ok, status: r.status, b: b || {} }; },
+          function () { return { ok: r.ok, status: r.status, b: {} }; });
+      })
+      .then(function (r) {
+        delete arcBusy[c.id];
+        if (!r.ok) {
+          arcMsg = 'Could not restore "' + (c.title || c.id) + '": ' + ((r.b && r.b.error) || 'HTTP ' + r.status);
+          arcErr = true;
+          return arcRender();
+        }
+        /*
+         * Restored, so go there. A tab is nearly always rescued because it was
+         * archived by mistake, and leaving him in a panel listing tabs he does
+         * not want would make him hunt for the one he just brought back.
+         */
+        return loadConvs().then(function () {
+          arcRows = arcRows.filter(function (x) { return x.id !== c.id; });
+          /*
+           * Close the panel WITHOUT uiSync, then switch. hideArchived() spends
+           * the overlay's history entry with history.back(), and that popstate
+           * arrives AFTER switchConv has pushed the restored tab's URL - so it
+           * walked straight back off it. Measured, not guessed: the tab came
+           * back correctly and the page sat on #/c/main looking like a no-op.
+           * switchConv's setUrl already knows how to spend an open overlay's
+           * marker, by replacing instead of pushing, so letting it do that is
+           * both correct and one less thing racing.
+           */
+          arcOn = false;
+          if (arcView) arcView.hidden = true;
+          return switchConv(c.id);
+        });
+      })
+      .catch(function (err) {
+        delete arcBusy[c.id];
+        arcMsg = 'Could not restore that: ' + ((err && err.message) || 'network error');
+        arcErr = true;
+        arcRender();
+      });
+  }
+
+  function arcLoad() {
+    return fetch('/conversations?archived=only', { headers: { accept: 'application/json' } })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (j) {
+        var list = (j && Array.isArray(j.conversations)) ? j.conversations : [];
+        /*
+         * Most recently archived first. The server does not sort by this, and
+         * the tab he wants back is nearly always the one he just closed - which
+         * arrived fourth in the raw payload.
+         */
+        list.sort(function (a, b) { return ms(b.archivedAt) - ms(a.archivedAt); });
+        arcRows = list;
+        arcRender();
+        return true;
+      })
+      .catch(function (err) {
+        arcMsg = 'Could not read the archived tabs: ' + ((err && err.message) || 'network error');
+        arcErr = true;
+        arcRender();
+        return false;
+      });
+  }
+
+  function showArchived() {
+    if (!arcView) return;
+    arcOn = true;
+    arcAll = false;
+    arcMsg = '';
+    arcErr = false;
+    arcBusy = {};
+    if (arcFind) arcFind.value = '';
+    arcView.hidden = false;
+    closeDrawer();
+    arcBody.textContent = '';
+    arcBody.appendChild(el('p', 'arcnote', 'Reading\u2026'));
+    arcLoad();
+    uiSync();
+  }
+
+  function hideArchived() {
+    if (!arcView || !arcOn) return;
+    arcOn = false;
+    arcView.hidden = true;
+    uiSync();
+  }
+
+  function initArchived() {
+    if (arcOpenBtn) arcOpenBtn.addEventListener('click', showArchived);
+    if (arcCloseBtn) arcCloseBtn.addEventListener('click', hideArchived);
+    if (arcFind) arcFind.addEventListener('input', function () { arcAll = false; arcRender(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideArchived(); });
   }
 
   function initTabControls() {
@@ -8070,7 +8366,7 @@
      * while the one underneath is still open, so back keeps consuming layers
      * one at a time and only leaves the app when the last is gone.
      */
-    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!agOn || !!lightOn || !!shareOn || !!tabOn;
+    var open = !!statusOn || !!actOn || !!drawerOpen || !!galOn || !!agOn || !!lightOn || !!shareOn || !!tabOn || !!arcOn;
     if (open === uiMarked) return; // includes drawer -> status, which re-uses it
     if (open) {
       // Same URL on purpose: a marker must not look like a conversation change,
@@ -8100,6 +8396,7 @@
     else if (shareOn) hideShare();
     // Above the agents roster in the stack: it opens from the drawer on top of
     // everything else, so back must close it first.
+    else if (arcOn) hideArchived();
     else if (tabOn) hideTab();
     else if (agOn) hideAgents();
     else if (galOn) hideGallery();
@@ -8169,6 +8466,13 @@
     initTabList();
   } catch (err) {
     logClient('tablist-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Same guard once more: finding an archived tab is a bonus, and reading and
+  // sending messages must not break if this fails to wire up.
+  try {
+    initArchived();
+  } catch (err) {
+    logClient('archived-init-failed', { message: (err && err.message) || String(err) });
   }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is
