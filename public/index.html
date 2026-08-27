@@ -563,6 +563,72 @@
   }
   #empty { color: var(--muted); text-align: center; margin: 32px 12px; font-size: 15px; }
 
+  /* ---- the tab's sticky list ----
+   *
+   * Pinned to the top of the scroller rather than placed in the thread, because
+   * a list that scrolls away with the messages is a list nobody ticks. The
+   * negative `top` cancels #thread's own padding so it sits flush against the
+   * header instead of leaving a strip of thread visible above it.
+   *
+   * Its height is CAPPED. An imported list can be twenty items long, and a
+   * "sticky" panel that eats the whole screen would take the conversation away
+   * to show the list — so past a few items it scrolls within itself and the
+   * thread stays readable behind it.
+   */
+  #tlist {
+    position: sticky; top: -14px; z-index: 5;
+    margin: -14px -12px 12px; padding: 8px 12px 0;
+    background: var(--bg);
+  }
+  #tlist[hidden] { display: none; }
+  .tlbox { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; }
+  .tlhead {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 9px 12px; min-height: 44px;
+    font: inherit; text-align: left; color: var(--fg);
+    background: transparent; border: 0; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .tlname { flex: 1 1 auto; min-width: 0; font-weight: 650; font-size: 15px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tlprog { flex: 0 0 auto; font-size: 13px; color: var(--muted); }
+  .tlchev { flex: 0 0 auto; font-size: 12px; color: var(--muted); }
+  /* All done reads as a state, not as an empty box. */
+  .tlbox.alldone .tlprog { color: #1a7f4b; }
+  @media (prefers-color-scheme: dark) { .tlbox.alldone .tlprog { color: #4ade80; } }
+  .tlitems { max-height: 40vh; overflow-y: auto; overscroll-behavior: contain; padding: 0 6px 6px; }
+  .tlitem { display: flex; align-items: flex-start; gap: 10px; padding: 7px 6px; border-radius: 10px; }
+  .tlitem + .tlitem { border-top: 1px solid var(--line); }
+  .tlitem input { flex: 0 0 auto; width: 22px; height: 22px; margin: 1px 0 0; accent-color: var(--accent); }
+  .tlitem .tltext { flex: 1 1 auto; min-width: 0; font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+  /* The strike goes on the words only. text-decoration propagates into
+     descendants and a child CANNOT cancel it, so putting it on .tltext struck
+     through the "ticked when it said" note too - which is the one line that
+     must stay readable. */
+  .tlitem.done .tlmain { color: var(--muted); text-decoration: line-through; }
+  .tlitem.done .tltext { color: var(--muted); }
+  /*
+   * The tick survived an edit, so the words it was earned against are named
+   * rather than quietly replaced. Small, but never hidden: this is the one
+   * place the list could otherwise mislead.
+   */
+  .tlwas { display: block; margin-top: 2px; font-size: 12px; color: var(--off); text-decoration: none; }
+  .tlfoot { display: flex; gap: 6px; align-items: center; padding: 6px 8px 8px; border-top: 1px solid var(--line); }
+  .tlfoot input[type=text] {
+    flex: 1 1 auto; min-width: 0; min-height: 38px; padding: 6px 10px;
+    font: inherit; font-size: 15px; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  }
+  .tlfoot button {
+    flex: 0 0 auto; min-height: 38px; padding: 0 12px;
+    font: inherit; font-size: 14px; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .tlfoot button:disabled { opacity: .5; cursor: not-allowed; }
+  .tlmsg { padding: 0 12px 8px; font-size: 13px; color: var(--muted); }
+  .tlmsg.bad { color: var(--rec); }
+
   .msg { max-width: 86%; margin: 0 0 12px; padding: 10px 13px; border-radius: 17px; }
   /* Blocks bring their own spacing now that the body is rendered Markdown, so
      `pre-wrap` would double every gap. Single newlines inside a paragraph are
@@ -1265,6 +1331,12 @@
   </header>
 
   <main id="thread">
+    <!--
+      The tab's own list. Inside the scroller and stuck to its top, so it stays
+      on screen while the thread moves under it — a list you have to scroll back
+      up to find is not a list you use.
+    -->
+    <section id="tlist" hidden aria-label="This tab's list"></section>
     <div id="list"></div>
     <p id="empty">No messages yet. Type below to send one.</p>
   </main>
@@ -3354,6 +3426,9 @@
     render();
     setTitle();
     renderConvs();
+    // The list belongs to the tab, so it changes with it. Guarded like the
+    // share badge below: switching conversation must not depend on it.
+    try { tlSwitch(id); } catch (e) { /* the thread still works without a list */ }
     try { refreshShareBadge(); } catch (e) { /* hoisting order; the panel still works */ }
     closeDrawer();
     clearTimeout(timer);
@@ -4597,6 +4672,225 @@
     clearInterval(tabTimer);
     tabTimer = null;
     uiSync();
+  }
+
+  /*
+   * ---------------------------------------------------------------- the tab's list
+   *
+   * A checklist that belongs to the TAB rather than to a message, so it can be
+   * edited in place. The message version cannot be: its ticks are keyed to the
+   * ordinal of a line in immutable text, so inserting one chore slides every
+   * tick below it onto the wrong task. The visible cost of that is in Chores —
+   * 16 lists with open items, 44 open items, nine of them one-item lists, and
+   * the same laundry list posted twice at different lengths. Coordinators were
+   * not being untidy; adding an item and keeping the ticks was impossible, so
+   * they posted another list.
+   *
+   * Ticks here address an item by ID. Everything else follows from that.
+   */
+  var tlBox = document.getElementById('tlist');
+  var tlConv = null;
+  var tlData = null;
+  var tlTimer = null;
+  var tlBusy = {};
+  var tlMsg = '';
+  var tlMsgBad = false;
+  var TL_MS = 10000;
+
+  /*
+   * Collapsed state per conversation, kept across reloads. Deliberately
+   * remembered rather than reset: an eighteen-item list he folded away should
+   * stay folded, or the app argues with him every time he opens the tab.
+   */
+  function tlCollapsed(id) {
+    try { return localStorage.getItem('relay.tlist.' + id) === '1'; } catch (e) { return false; }
+  }
+  function tlSetCollapsed(id, on) {
+    try { localStorage.setItem('relay.tlist.' + id, on ? '1' : '0'); } catch (e) { /* private mode */ }
+  }
+
+  function tlRender() {
+    if (!tlBox) return;
+    tlBox.textContent = '';
+    var l = tlData;
+    // No list on this tab is the normal case, and it must take up no room at
+    // all — not an empty card inviting a tap.
+    if (!l || !l.items || !l.items.length) { tlBox.hidden = true; return; }
+    tlBox.hidden = false;
+
+    var collapsed = tlCollapsed(tlConv);
+    var box = el('div', 'tlbox' + (l.remaining === 0 ? ' alldone' : ''));
+
+    var head = el('button', 'tlhead');
+    head.type = 'button';
+    head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    head.appendChild(el('span', 'tlname', l.title || 'This tab'));
+    head.appendChild(el('span', 'tlprog', l.done + ' of ' + l.total));
+    head.appendChild(el('span', 'tlchev', collapsed ? '▸' : '▾'));
+    head.addEventListener('click', function () {
+      tlSetCollapsed(tlConv, !collapsed);
+      tlRender();
+    });
+    box.appendChild(head);
+
+    if (!collapsed) {
+      var items = el('div', 'tlitems');
+      for (var i = 0; i < l.items.length; i++) items.appendChild(tlItemNode(l.items[i]));
+      box.appendChild(items);
+
+      var foot = el('div', 'tlfoot');
+      var input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = 'Add to this list…';
+      input.maxLength = 500;
+      var addBtn = el('button', null, 'Add');
+      addBtn.type = 'button';
+      var submit = function () {
+        var text = String(input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        tlAdd(text);
+      };
+      addBtn.addEventListener('click', submit);
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      });
+      foot.appendChild(input);
+      foot.appendChild(addBtn);
+      box.appendChild(foot);
+    }
+
+    if (tlMsg) box.appendChild(el('div', 'tlmsg' + (tlMsgBad ? ' bad' : ''), tlMsg));
+    tlBox.appendChild(box);
+  }
+
+  function tlItemNode(it) {
+    var row = el('div', 'tlitem' + (it.done ? ' done' : ''));
+    var lab = document.createElement('label');
+    lab.className = 'tlitem';
+    lab.style.padding = '0';
+    lab.style.borderTop = '0';
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = !!it.done;
+    box.disabled = !!tlBusy[it.id];
+    var text = el('span', 'tltext');
+    text.appendChild(el('span', 'tlmain', it.text));
+    /*
+     * Named, not hidden. The tick is real and it stays, but it was earned
+     * against different words and the list says so rather than letting the
+     * new wording quietly inherit the credit.
+     */
+    if (it.editedSinceTicked && it.tickedText) {
+      text.appendChild(el('span', 'tlwas', 'ticked when it said: ' + it.tickedText));
+    }
+    box.addEventListener('change', function () { tlTick(it.id, box.checked); });
+    lab.appendChild(box);
+    lab.appendChild(text);
+    row.appendChild(lab);
+    return row;
+  }
+
+  function tlPost(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { ok: r.ok, status: r.status, b: b || {} }; },
+        function () { return { ok: r.ok, status: r.status, b: {} }; });
+    });
+  }
+
+  function tlTick(id, on) {
+    var conv = tlConv;
+    tlBusy[id] = true;
+    tlMsg = '';
+    /*
+     * Optimistic, because a checkbox that waits for a round trip before moving
+     * feels broken on a phone. The authoritative list comes back in the reply
+     * and overwrites this either way, so a failure cannot leave a tick showing
+     * that the server does not have.
+     */
+    var local = tlData && tlData.items.filter(function (x) { return x.id === id; })[0];
+    if (local) { local.done = on; }
+    tlRender();
+    tlPost('/checklist/tick', { conversationId: conv, id: id, on: on, by: 'web' })
+      .then(function (r) {
+        delete tlBusy[id];
+        if (conv !== tlConv) return;
+        if (!r.ok) {
+          tlMsg = 'Could not save that tick: ' + ((r.b && r.b.error) || 'HTTP ' + r.status);
+          tlMsgBad = true;
+          return tlLoad();     // put the truth back on screen
+        }
+        tlData = r.b.list;
+        tlRender();
+      })
+      .catch(function () {
+        delete tlBusy[id];
+        if (conv !== tlConv) return;
+        tlMsg = 'That tick did not save - no network.';
+        tlMsgBad = true;
+        tlLoad();
+      });
+  }
+
+  function tlAdd(text) {
+    var conv = tlConv;
+    tlMsg = '';
+    tlPost('/checklist', { conversationId: conv, add: [text], by: 'web' })
+      .then(function (r) {
+        if (conv !== tlConv) return;
+        if (!r.ok) { tlMsg = 'Could not add that: ' + ((r.b && r.b.error) || 'HTTP ' + r.status); tlMsgBad = true; return tlRender(); }
+        tlData = r.b.list;
+        tlMsgBad = false;
+        tlRender();
+      })
+      .catch(function () {
+        if (conv !== tlConv) return;
+        tlMsg = 'Could not add that - no network.';
+        tlMsgBad = true;
+        tlRender();
+      });
+  }
+
+  function tlLoad() {
+    var conv = tlConv;
+    if (!conv) return Promise.resolve(false);
+    return fetch('/checklist?conversation=' + encodeURIComponent(conv), { headers: { accept: 'application/json' } })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (j) {
+        if (conv !== tlConv) return false;   // switched tabs while in flight
+        tlData = j.list;
+        tlRender();
+        return true;
+      })
+      .catch(function () { return false; });
+  }
+
+  /*
+   * Called on boot and on every conversation switch. The old tab's list is
+   * dropped immediately rather than left on screen until the new one arrives:
+   * showing tab A's chores above tab B's thread for half a second is the kind
+   * of thing that gets an item ticked in the wrong place.
+   */
+  function tlSwitch(id) {
+    tlConv = id;
+    tlData = null;
+    tlMsg = '';
+    tlMsgBad = false;
+    tlBusy = {};
+    tlRender();
+    tlLoad();
+  }
+
+  function initTabList() {
+    tlSwitch(activeConv);
+    clearInterval(tlTimer);
+    tlTimer = setInterval(function () {
+      if (!document.hidden) tlLoad();
+    }, TL_MS);
   }
 
   function initTabControls() {
@@ -7851,6 +8145,13 @@
     initTabControls();
   } catch (err) {
     logClient('tabcontrols-init-failed', { message: (err && err.message) || String(err) });
+  }
+  // Same guard again: the tab's list is a bonus, and reading and sending
+  // messages must not break if it fails to wire up.
+  try {
+    initTabList();
+  } catch (err) {
+    logClient('tablist-init-failed', { message: (err && err.message) || String(err) });
   }
   // Zoom lock, keyboard-aware composer, back-closes-the-overlay. After the
   // views exist, because it drives them; guarded, because none of it is

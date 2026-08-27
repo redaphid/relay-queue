@@ -598,6 +598,30 @@ function applyEvent(ev) {
     let row = checks.get(ev.entryId);
     if (!row) { row = {}; checks.set(ev.entryId, row); }
     row[String(ev.index)] = { on: !!ev.on, by: ev.by || null, at: ev.at };
+  } else if (ev.t === 'list') {
+    /*
+     * The whole list, every structural change. These are tens of items, not
+     * thousands, and a full snapshot replays correctly no matter what order
+     * adds, edits and removes were written in — whereas a stream of deltas has
+     * to be replayed perfectly to land on the right answer, and a list that
+     * silently rebuilds wrong is worse than one that is slightly larger on disk.
+     */
+    lists.set(ev.conversationId, ev.list);
+  } else if (ev.t === 'listtick') {
+    // Ticks stay their own tiny event: it is the frequent one, and it must not
+    // rewrite the item text as a side effect of someone tapping a box.
+    const l = lists.get(ev.conversationId);
+    if (l) {
+      const it = l.items.find((i) => i.id === ev.itemId);
+      if (it) {
+        it.done = !!ev.on;
+        it.doneAt = ev.on ? ev.at : null;
+        it.doneBy = ev.on ? (ev.by || null) : null;
+        // Un-ticking discards the "these were the words you ticked" note: there
+        // is no longer a tick for it to qualify.
+        if (!ev.on) it.tickedText = null;
+      }
+    }
   } else if (ev.t === 'pick') {
     /*
      * One choice. `exclusive` is how single-select stays consistent no matter
@@ -639,6 +663,13 @@ function appendEvent(ev) {
   else if (ev.t === 'share' || ev.t === 'unshare') { /* publication state, not thread content; the panel reads it on open */ }
   else if (ev.t === 'creditsAward' || ev.t === 'creditsSpend') { /* not thread state; polled via GET /credits, nothing to stream */ }
   else if (ev.t === 'check') broadcast(taskIdOfEntry(ev.entryId));
+  /*
+   * The tab list belongs to a conversation, not to a task. Without this it
+   * would fall through to the task broadcast below and be published under
+   * `undefined` — a stream event naming nothing, which every client would
+   * either ignore or, worse, treat as a task it should go and re-read.
+   */
+  else if (ev.t === 'list' || ev.t === 'listtick') broadcastConv(ev.conversationId);
   else broadcast(ev.t === 'create' ? ev.task.id : ev.id);
   // An agent acting is what clears the deadman banner, and it must clear at once
   // rather than up to a tick later — recovery has to feel immediate to be trusted.
@@ -1153,7 +1184,117 @@ function checklistOf(entryId) {
     done,
     remaining: out.length - done,
     items: out,
+    /*
+     * The tab list, if any, that absorbed this one's open items. There are 16
+     * of these in Chores alone and not one of them can be deleted, so the only
+     * way they stop competing with their replacement is to SAY they have one.
+     * Null on the overwhelming majority, which have never been imported.
+     */
+    supersededBy: supersederOf(entryId),
   };
+}
+
+// ---------------------------------------------------------------- the tab list
+/*
+ * THE STICKY LIST: one editable checklist per conversation, and the deliberate
+ * opposite of the one above it.
+ *
+ * The message checklist stores no items on purpose — they are parsed from an
+ * append-only message, so "what is on the list" and "what is ticked" cannot
+ * drift, and editing is impossible BY CONSTRUCTION. That is the right rule for
+ * a message. It is the wrong rule for a list you live with, and the Chores tab
+ * is the receipt: 16 checklists with open items, 44 open items between them,
+ * NINE of them one-item lists, and the same laundry list posted twice at
+ * different lengths. Nobody was being sloppy. A coordinator asked to add one
+ * chore had exactly one move available — post another list — because the words
+ * it needed to change were already immutable.
+ *
+ * So this is a different OBJECT, not a change to that one. Both survive.
+ *
+ * THE DECISION THAT MAKES IT WORK: a tick is keyed to an item's IDENTITY, not
+ * to its position in a body of text. The message version keys ticks by the
+ * ordinal of the line, which is precisely why it cannot be edited — insert a
+ * chore at the top and every tick below it slides onto the wrong task. Here the
+ * id is minted once, when the item is created, and nothing else is ever allowed
+ * to address an item. Reordering, rewording and inserting are all safe, and the
+ * feature the fragmentation was working around simply exists.
+ *
+ * A TICK SURVIVES AN EDIT, and that is a judgement, not an oversight. Dropping
+ * it on every edit would restore the original problem with extra steps: a
+ * coordinator fixing a typo would silently un-tick finished work, so it would
+ * go back to posting a new list instead. But a tick earned against different
+ * words is not quite the same fact, so the words that were ticked are kept in
+ * `tickedText` and shown. Nothing is silently reinterpreted.
+ */
+const MAX_LIST_ITEMS = 200;
+const MAX_LIST_TEXT = 500;
+
+/** @type {Map<string, object>} conversationId -> the one list for that tab */
+const lists = new Map();
+
+function newListItem(text, by) {
+  return {
+    id: newId(),
+    text,
+    done: false,
+    doneAt: null,
+    doneBy: null,
+    // The wording that was actually ticked, filled in only when an item is
+    // edited while done. Null on everything else, so "edited since ticked" is
+    // a fact the payload states rather than something a client infers.
+    tickedText: null,
+    addedAt: nowIso(),
+    addedBy: by || null,
+    editedAt: null,
+  };
+}
+
+function newList(conversationId, title, by) {
+  return {
+    conversationId,
+    title: title || null,
+    items: [],
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    updatedBy: by || null,
+    /*
+     * The message checklists whose open items were pulled in here. Kept so the
+     * OLD list can say where its items went: 16 of them exist and none can be
+     * deleted, so the only honest outcome is that they point at their successor
+     * instead of quietly disagreeing with it.
+     */
+    importedFrom: [],
+  };
+}
+
+/** Which conversation's list, if any, absorbed this message checklist. */
+function supersederOf(entryId) {
+  const id = String(entryId || '');
+  for (const l of lists.values()) {
+    if (l.importedFrom && l.importedFrom.indexOf(id) !== -1) return l.conversationId;
+  }
+  return null;
+}
+
+function listView(conversationId) {
+  const l = lists.get(conversationId);
+  if (!l) return null;
+  const done = l.items.filter((i) => i.done).length;
+  return {
+    ...l,
+    items: l.items.map((i) => ({ ...i, editedSinceTicked: !!(i.done && i.tickedText) })),
+    total: l.items.length,
+    done,
+    remaining: l.items.length - done,
+  };
+}
+
+function readListText(v, what) {
+  if (typeof v !== 'string') return new Error(`${what} must be a string`);
+  const t = v.trim();
+  if (!t) return new Error(`${what} must not be empty`);
+  if (t.length > MAX_LIST_TEXT) return new Error(`${what} too long: ${t.length} chars, max ${MAX_LIST_TEXT}`);
+  return t;
 }
 
 // ---------------------------------------------------------------- picking
@@ -4963,6 +5104,176 @@ function setCheckRoute(res, entryId, body) {
 }
 
 /*
+ * GET /checklist?conversation=<id> — the one list for a tab.
+ *
+ * `null` rather than an empty list when there is none, because "no list here"
+ * and "a list with nothing left on it" are different answers and a coordinator
+ * acts differently on each.
+ */
+function listGetRoute(res, conversationId) {
+  if (!conversationId) return fail(res, 400, 'conversation is required');
+  if (!conversations.has(conversationId)) {
+    return fail(res, 404, `no conversation with id "${conversationId}"`);
+  }
+  return send(res, 200, { conversationId, list: listView(conversationId) });
+}
+
+/*
+ * POST /checklist/tick — one item, addressed BY ID.
+ *
+ * Idempotent by value, exactly as the message-checklist route is and for the
+ * same reason: the page retries after being offline, and a retry must never
+ * double-toggle a box he touched once.
+ */
+function listTickRoute(res, body) {
+  const conversationId = readString(body.conversationId || body.conversation, 'conversationId', MAX_TITLE);
+  if (conversationId instanceof Error) return fail(res, 400, conversationId.message);
+  const l = lists.get(conversationId);
+  if (!l) return fail(res, 404, `no list on conversation "${conversationId}"`, { hint: 'POST /checklist to create one' });
+
+  const id = readString(body.id || body.itemId, 'id', 100);
+  if (id instanceof Error) return fail(res, 400, id.message);
+  const it = l.items.find((i) => i.id === id);
+  /*
+   * Named explicitly rather than answered with a bare 404. An id that is not
+   * here is nearly always an item somebody removed, and a client that only
+   * learns "404" tends to retry it forever.
+   */
+  if (!it) {
+    return fail(res, 404, `no item "${id}" on this list`, {
+      hint: 'it may have been removed; re-read GET /checklist',
+      ids: l.items.map((i) => i.id).slice(0, 50),
+    });
+  }
+  if (typeof body.on !== 'boolean') return fail(res, 400, 'on is required and must be true or false');
+  const by = readString(body.by !== undefined ? body.by : body.who, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  if (it.done === body.on) return send(res, 200, { changed: false, list: listView(conversationId) });
+
+  appendEvent({
+    t: 'listtick', conversationId, itemId: id, on: body.on, by: by || 'web', at: nowIso(),
+  });
+  return send(res, 200, { changed: true, list: listView(conversationId) });
+}
+
+/*
+ * POST /checklist — the coordinator's write path, and the whole point.
+ *
+ * He asked for a list "the coordinator can decide to make or update", so this
+ * is an ordinary HTTP route an agent can call, not a control that only exists
+ * inside the page. Every operation is explicit and named: nothing here replaces
+ * the list wholesale by accident, because a coordinator that meant to add one
+ * chore and instead cleared fifteen ticks would be worse than the fragmentation
+ * this is fixing.
+ */
+function listWriteRoute(res, body) {
+  const conversationId = readString(body.conversationId || body.conversation, 'conversationId', MAX_TITLE);
+  if (conversationId instanceof Error) return fail(res, 400, conversationId.message);
+  if (!conversationId) return fail(res, 400, 'conversationId is required');
+  if (!conversations.has(conversationId)) {
+    return fail(res, 404, `no conversation with id "${conversationId}"`);
+  }
+  const by = readString(body.by !== undefined ? body.by : body.agent, 'by', MAX_AUTHOR);
+  if (by instanceof Error) return fail(res, 400, by.message);
+
+  const existing = lists.get(conversationId);
+  const l = existing
+    ? { ...existing, items: existing.items.map((i) => ({ ...i })), importedFrom: (existing.importedFrom || []).slice() }
+    : newList(conversationId, null, by);
+
+  if (body.title !== undefined) {
+    if (body.title === null || body.title === '') l.title = null;
+    else {
+      const t = readListText(body.title, 'title');
+      if (t instanceof Error) return fail(res, 400, t.message);
+      l.title = t;
+    }
+  }
+
+  // Removals first, so an id can be removed and re-added in one call without
+  // the add being deleted by its own request.
+  if (body.remove !== undefined) {
+    const rm = Array.isArray(body.remove) ? body.remove : [body.remove];
+    const gone = new Set(rm.map(String));
+    l.items = l.items.filter((i) => !gone.has(i.id));
+  }
+
+  if (body.edit !== undefined) {
+    const edits = Array.isArray(body.edit) ? body.edit : [body.edit];
+    for (const e of edits) {
+      if (!e || typeof e !== 'object') return fail(res, 400, 'each edit must be an object { id, text }');
+      const t = readListText(e.text, 'edit text');
+      if (t instanceof Error) return fail(res, 400, t.message);
+      const it = l.items.find((i) => i.id === String(e.id));
+      if (!it) return fail(res, 404, `no item "${e.id}" to edit`, { ids: l.items.map((i) => i.id).slice(0, 50) });
+      if (it.text === t) continue; // a no-op edit must not stamp an edit time
+      /*
+       * THE TICK SURVIVES. What does not survive is the pretence that it was
+       * earned against these words: the old wording is recorded here, and the
+       * payload reports `editedSinceTicked` so the page can show it. Only set
+       * on the FIRST edit after a tick, so the text kept is the one that was
+       * actually ticked rather than whatever it was last called.
+       */
+      if (it.done && !it.tickedText) it.tickedText = it.text;
+      it.text = t;
+      it.editedAt = nowIso();
+    }
+  }
+
+  if (body.add !== undefined) {
+    const adds = Array.isArray(body.add) ? body.add : [body.add];
+    for (const a of adds) {
+      const t = readListText(typeof a === 'string' ? a : (a && a.text), 'item text');
+      if (t instanceof Error) return fail(res, 400, t.message);
+      l.items.push(newListItem(t, by));
+    }
+  }
+
+  /*
+   * IMPORT — the answer to "what happens to the 16 lists that already exist".
+   *
+   * They cannot be deleted and must not become a seventeenth place to look, so
+   * their OPEN items are copied here on request and the source is recorded.
+   * Ticked items are deliberately left behind: they are finished, and copying
+   * them would put completed work back on the list he is looking at. The source
+   * message is untouched — it is append-only history — but it now knows where
+   * its live items went, which is what stops the two disagreeing.
+   */
+  if (body.importFrom !== undefined) {
+    const froms = Array.isArray(body.importFrom) ? body.importFrom : [body.importFrom];
+    for (const f of froms) {
+      const entryId = String(f);
+      const cl = checklistOf(entryId);
+      if (!cl) return fail(res, 404, `no checklist on entry "${entryId}"`);
+      if (l.importedFrom.indexOf(entryId) === -1) l.importedFrom.push(entryId);
+      for (const it of cl.items) {
+        if (it.checked) continue;
+        // Same words already sitting here means this was imported before, or he
+        // typed it himself. Importing twice must not double the list.
+        if (l.items.some((x) => x.text === it.label)) continue;
+        l.items.push(newListItem(it.label, by));
+      }
+    }
+  }
+
+  if (body.clearDone === true) {
+    l.items = l.items.filter((i) => !i.done);
+  }
+
+  if (l.items.length > MAX_LIST_ITEMS) {
+    return fail(res, 400, `too many items: ${l.items.length}, max ${MAX_LIST_ITEMS}`, {
+      hint: 'clearDone:true drops the finished ones',
+    });
+  }
+
+  l.updatedAt = nowIso();
+  l.updatedBy = by || null;
+  appendEvent({ t: 'list', conversationId, list: l });
+  return send(res, 200, { list: listView(conversationId) });
+}
+
+/*
  * POST /tasks/:entryId/picks — one picture chosen or unchosen.
  *
  * Idempotent by value, exactly as the checkbox route is: the page retries this
@@ -6710,6 +7021,29 @@ async function route(req, res) {
       list = n === 0 ? [] : list.slice(-n); // most recent N — a thread is read from the end
     }
     return send(res, 200, { count: list.length, now: nowIso(), entries: list });
+  }
+
+  /*
+   * /checklist — THE ONE STICKY LIST FOR A TAB. Singular on purpose, and one
+   * letter away from /checklists, which is the plural read-only view of every
+   * list parsed out of messages. They are genuinely different objects and the
+   * names have to make that survivable: this one is editable and has ids,
+   * that one is derived from immutable text and has ordinals.
+   */
+  if (seg.length === 1 && seg[0] === 'checklist') {
+    if (m === 'GET') {
+      const conv = q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId');
+      return listGetRoute(res, conv || '');
+    }
+    if (m === 'POST') return listWriteRoute(res, await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
+  }
+
+  // /checklist/tick — one item, by id. Its own route because it is the call
+  // that happens constantly, and it must never be able to rewrite item text.
+  if (seg.length === 2 && seg[0] === 'checklist' && seg[1] === 'tick') {
+    if (!need('POST')) return;
+    return listTickRoute(res, await readBody(req));
   }
 
   // /checklists — every task list in the queue, or in one conversation.
