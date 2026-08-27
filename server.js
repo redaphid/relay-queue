@@ -393,11 +393,30 @@ function pushActivity(entry) {
  * of being assumed, and they are only ever written by the agent itself.
  */
 function newConversation(id, title, agent) {
+  const at = nowIso();
   return {
     id,
     title,
     agent: agent || null, // who is meant to answer here; set and read by the agent side
-    createdAt: nowIso(),
+    /*
+     * WHEN THE CURRENT OCCUPANT SAT DOWN. Null whenever the chair is empty.
+     *
+     * sweepVacantChairs() asks "has whoever is sitting here gone quiet", and
+     * every other clock it has answers a different question: `lastActedAt`,
+     * `lastProgressAt` and the heartbeat all describe the TAB, and a tab that
+     * has been quiet for an hour is quiet no matter who just sat down in it.
+     * Without this field, seating a new agent in a long-quiet tab hands them a
+     * clock that was already expired before they arrived, and the next sweep
+     * vacates them on sight — see the sweep, and the honesty check at the end
+     * of updateConversation() that caught this shape returning HTTP 200.
+     *
+     * It is deliberately NOT evidence of life, and nothing but the sweep should
+     * read it that way. It says only "the chair was filled at this time", which
+     * is exactly enough to give a new occupant the same full CHAIR_VACANT_MS of
+     * silence everyone else gets before being presumed gone.
+     */
+    agentSince: agent ? at : null,
+    createdAt: at,
     archived: false,
     archivedAt: null,
     stopRequested: false,
@@ -3087,9 +3106,27 @@ function sweepVacantChairs() {
      */
     const beat = HEARTBEATS.get(c.agent);
     const seenAt = beat ? msOf(beat.at) : 0;
-    const lastLife = Math.max(msOf(c.lastActedAt), msOf(c.lastProgressAt), seenAt)
+    /*
+     * `agentSince` belongs in here even though it is not evidence of life, and
+     * it is the difference between measuring the OCCUPANT's silence and the
+     * TAB's. Every other term describes the tab, so on a tab that has been
+     * quiet for an hour they are all already expired at the instant a new agent
+     * is seated — and since appendEvent() ends in pushWatch(), which calls this
+     * sweep, the eviction happened inside the very request that did the seating.
+     * The attach returned HTTP 200 with `agent: null` in the body, which is how
+     * it went unexplained for a while: every observation said it had worked.
+     *
+     * With it, a new occupant starts a fresh CHAIR_VACANT_MS clock, which is
+     * what the constant already promises. It does not weaken the sweep: the
+     * clock still only ever runs from a real event, and an agent that is seated
+     * and then never shows up is still vacated on schedule — just measured from
+     * when they arrived rather than from something the last occupant did.
+     */
+    const lastLife = Math.max(msOf(c.lastActedAt), msOf(c.lastProgressAt), seenAt, msOf(c.agentSince))
       // Never acted at all? Then the clock runs from when it was given the tab,
       // so an agent that was assigned and never showed up is still swept.
+      // (Conversations recorded before `agentSince` existed have none, and fall
+      // back to this exactly as they always did.)
       || msOf(c.createdAt);
     if (!lastLife || now - lastLife < CHAIR_VACANT_MS) continue;
 
@@ -6059,6 +6096,15 @@ function updateConversation(res, id, body) {
   if (agent !== undefined) {
     patch.agent = agent;
     /*
+     * The occupancy clock, restarted for a genuine change of occupant and
+     * cleared when the chair is emptied. Re-asserting the SAME name deliberately
+     * does not touch it: that is a no-op everywhere else in this block, and
+     * letting it slide the clock forward would turn a repeated PATCH into a way
+     * to keep a chair reserved for an agent that has not been heard from since.
+     */
+    if (agent === null) patch.agentSince = null;
+    else if (agent !== conv.agent) patch.agentSince = nowIso();
+    /*
      * A NEW occupant does not inherit the last one's stop state.
      *
      * The reasoning is already written down below, against `stopRequested`: an
@@ -6244,6 +6290,56 @@ function updateConversation(res, id, body) {
    */
   const cancelledDispatch = patch.pendingDispatch === null ? conv.pendingDispatch || null : null;
   appendEvent({ t: 'convpatch', id, patch });
+  /*
+   * DID THE WRITE SURVIVE THE WRITE?
+   *
+   * This is not paranoia about the store. appendEvent() ends in pushWatch(),
+   * which runs sweepVacantChairs() and the nudge, and those can themselves
+   * appendEvent() against this very conversation — synchronously, inside this
+   * request, between the line above and the reply below. `conv` is the live
+   * stored object, so anything they change is already in the body we are about
+   * to send. The request therefore has a genuine way to be undone by the time
+   * it answers, and no amount of care in the branches above can rule it out.
+   *
+   * It has happened. Seating a coordinator in a tab that had been quiet for an
+   * hour was reverted by the sweep in the same call stack, and the route replied
+   * HTTP 200 with the whole conversation object and `agent: null` inside it.
+   * Two attach attempts, a stack of confirming GETs and a wrong conclusion came
+   * out of that, because a 200 carrying a complete-looking record is what every
+   * client and every human reads as "done". The sweep's half of this is fixed
+   * (see `agentSince`), but the fix that matters is this one: the route must be
+   * structurally unable to report a success it did not perform.
+   *
+   * So refuse rather than report. 409 — the state moved under the request — and
+   * name the fields, what was asked, and what is actually stored, so the caller
+   * can tell "relay declined this" from "relay lost this". Retrying is often
+   * right, which is exactly why the caller has to be told there is something to
+   * retry. Note the log already records the patch that was applied and then
+   * overwritten; that is the honest history and it stays.
+   */
+  const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+  const clobbered = Object.keys(patch).filter((k) => !same(conv[k], patch[k]));
+  if (clobbered.length) {
+    return fail(res, 409, `the update was applied and then immediately overwritten: ${clobbered.join(', ')}`, {
+      conversationId: id,
+      fields: clobbered,
+      asked: Object.fromEntries(clobbered.map((k) => [k, patch[k] === undefined ? null : patch[k]])),
+      stored: Object.fromEntries(clobbered.map((k) => [k, conv[k] === undefined ? null : conv[k]])),
+      /*
+       * The one cause seen in the wild, named explicitly because the generic
+       * message sends people looking at their own client instead.
+       */
+      likelyCause: clobbered.includes('agent') && conv.agentLeftReason === 'presumed-gone'
+        ? `The vacant-chair sweep unassigned "${conv.agentLeft}" during this request, because this `
+          + 'conversation has had no activity for longer than CHAIR_VACANT_MS. Post a message or a '
+          + 'progress note to the conversation first, then attach again.'
+        : 'Something else wrote to this conversation during the request — most likely a periodic '
+          + 'sweep. Re-read the conversation before deciding what to do.',
+      detail: 'Nothing you asked for is in effect. This is deliberately not a 200: a success status '
+        + 'over a record that does not match the request is indistinguishable from the request having '
+        + 'worked, and that ambiguity has already produced wrong conclusions.',
+    });
+  }
   /*
    * Answer with the honest truth about what just happened, so no client can
    * render this as a kill by accident. Asking is not stopping, and the reply
