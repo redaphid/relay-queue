@@ -273,9 +273,21 @@ async function tick(cfg, runtime) {
     if (!considered.length) log('nothing pending to consider');
   }
   if (!chosen.length) {
-    if (!cfg.explain) log(`nothing to seat (${considered.length} pending message(s) considered)`);
+    /*
+     * Say "nothing to seat" only when that is NEWS.
+     *
+     * This runs every few seconds forever, so an unconditional line here is
+     * ~8600 entries a day saying nothing happened, and the one line that
+     * mattered is buried in them. That is the same failure this whole file is
+     * built to avoid, just aimed at a log file instead of his phone: volume
+     * that makes a real signal unfindable. Repeating only on CHANGE keeps the
+     * log a record of events rather than of time passing.
+     */
+    const quiet = `nothing to seat (${considered.length} pending message(s) considered)`;
+    if (!cfg.explain && quiet !== runtime.lastQuiet) { log(quiet); runtime.lastQuiet = quiet; }
     return;
   }
+  runtime.lastQuiet = null;
 
   for (const pick of chosen) {
     /*
@@ -416,9 +428,16 @@ async function main() {
     + `cap ${cfg.maxConcurrent}, ${Object.keys(runtime.state.dispatched).length} message(s) already dispatched`
     + (cfg.dry ? ' [DRY-RUN]' : ''));
 
-  await tick(cfg, runtime);
+  /*
+   * Nothing a single tick can throw is worth taking the watcher down for. An
+   * unhandled rejection here would end the process, and a dispatcher that
+   * exits on one bad poll is a dispatcher that is not running the next time it
+   * is needed - the exact failure mode of the router it replaces.
+   */
+  const safeTick = () => tick(cfg, runtime).catch((e) => log(`tick failed: ${e.message}`));
+  await safeTick();
   if (cfg.once) return; /* a spawned child keeps running; we just stop deciding */
-  setInterval(() => { tick(cfg, runtime).catch((e) => log(`tick failed: ${e.message}`)); }, cfg.intervalMs);
+  setInterval(safeTick, cfg.intervalMs);
 }
 
 module.exports = { selectSeats, coveredBy, agentName, brief, HUMAN_FROM };
