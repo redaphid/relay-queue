@@ -71,6 +71,10 @@ const DEFAULT_CONV = 'main';
 const DEFAULT_CONV_TITLE = 'Main';
 const MAX_TITLE = 200;
 const MAX_AGENT = 200;
+// A departure reason is a LABEL, not a report - "done", "handed off", "crashed".
+// Capped well below MAX_NOTE so nobody is tempted to file a handover in it;
+// the handover goes in a message or a task result, where it can be read.
+const MAX_LEFT_REASON = 120;
 /*
  * Session boundaries kept per conversation. This rides along on every
  * /conversations read, which the page polls, so it is capped rather than
@@ -2500,6 +2504,22 @@ const NUDGE_RENUDGE_MS = Number(process.env.NUDGE_RENUDGE_MS || 5 * 60 * 1000);
  */
 const CHAIR_VACANT_MS = Number(process.env.CHAIR_VACANT_MS || 45 * 60 * 1000);
 /*
+ * THE ONE WORD THAT MEANS "THE SWEEP TOOK THIS CHAIR", and a constant rather
+ * than a literal precisely so that stays true. It is written in exactly one
+ * place (the sweep), and refused everywhere a caller could supply it, so
+ * `agentLeftReason === SWEPT_REASON` is a sound test for "evicted, nobody said
+ * they were going" — which is what the 409 explanation in updateConversation()
+ * already reads it as, and what a coordinator deciding whether to reseat a tab
+ * needs it to mean. An agent that quits cleanly writes its own word here; if it
+ * could also write this one, the two states would collapse back into one.
+ */
+const SWEPT_REASON = 'presumed-gone';
+// What a bare `{"agent":null}` records when the caller names no reason. An
+// agent that simply stands down still has to leave a trace, because the whole
+// point is that an empty chair is never again indistinguishable from a chair
+// nobody ever sat in.
+const DEFAULT_LEFT_REASON = 'released';
+/*
  * HOW LONG THE ROUTER GETS BEFORE A LIVENESS PROBLEM BECOMES HIS PROBLEM.
  * See routeLiveness(). Liveness is an agent-operations concern and he asked, in
  * as many words, not to be paged about it — but "not paged" must never become
@@ -3144,7 +3164,11 @@ function sweepVacantChairs() {
           // no history, and it is what makes this reversible by hand.
           agentLeft: who,
           agentLeftAt: nowIso(),
-          agentLeftReason: 'presumed-gone',
+          // The sweep's word, and only the sweep's - see SWEPT_REASON. A
+          // voluntary release records its own reason through the same three
+          // fields, so an empty chair always says who left; this one says
+          // nobody told us they were going.
+          agentLeftReason: SWEPT_REASON,
         },
       });
     } finally { notifyDepth--; }
@@ -6263,6 +6287,36 @@ function readAgent(body) {
   return raw;
 }
 
+/**
+ * Why the agent is standing down, as supplied by the agent standing down.
+ *
+ * Returns undefined (none given), a string, or an Error the caller turns into a
+ * 400. Never throws and never guesses: a reason it cannot honour is refused
+ * rather than quietly replaced, because a silently-substituted reason is worse
+ * than none - it reads as the agent's own account of why it left.
+ */
+function readLeftReason(body) {
+  const raw = body.agentLeftReason;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') return new Error('agentLeftReason must be a string');
+  const clean = raw.trim().replace(/\s+/g, ' ').slice(0, MAX_LEFT_REASON);
+  if (!clean) return undefined; // an empty string is "I did not say", not a reason
+  /*
+   * The forgery guard. See SWEPT_REASON: the whole value of that word is that
+   * exactly one thing writes it. A caller allowed to send it could make a
+   * deliberate exit indistinguishable from an eviction - the precise confusion
+   * this field exists to remove - and worse, could do it by accident, since
+   * "presumed-gone" is the reason string every reader of this API has seen.
+   * Refused rather than rewritten, so the caller learns which word to use.
+   */
+  if (clean.toLowerCase() === SWEPT_REASON) {
+    return new Error(`agentLeftReason "${SWEPT_REASON}" is reserved for the vacant-chair sweep, `
+      + 'which is what it means: nobody said they were leaving. An agent standing down on purpose '
+      + 'should say so in its own words (e.g. "done", "handed off", "stopping").');
+  }
+  return clean;
+}
+
 function updateConversation(res, id, body) {
   const conv = conversations.get(id);
   if (!conv) return fail(res, 404, `no conversation with id "${id}"`);
@@ -6280,6 +6334,23 @@ function updateConversation(res, id, body) {
 
   const agent = readAgent(body);
   if (agent instanceof Error) return fail(res, 400, agent.message);
+  const leftReason = readLeftReason(body);
+  if (leftReason instanceof Error) return fail(res, 400, leftReason.message);
+  /*
+   * A reason with no departure attached is refused rather than ignored. The
+   * field only ever describes an agent leaving, so on any other request it is
+   * either a typo or a caller that believes it has stood down and has not - and
+   * that second one is precisely the state this whole feature exists to stop
+   * anybody being in. Accepting and dropping it would answer 200 to a request
+   * that did nothing, which is the shape of every bug in this file's history.
+   */
+  if (leftReason !== undefined && agent !== null) {
+    return fail(res, 400, 'agentLeftReason only describes an agent leaving, so it needs '
+      + '"agent": null in the same request'
+      + (agent === undefined ? '' : ` (this request seats "${agent}")`));
+  }
+  /** What the release actually recorded, so the reply need not be inferred from. */
+  let seatRelease = null;
   if (agent !== undefined) {
     patch.agent = agent;
     /*
@@ -6291,6 +6362,64 @@ function updateConversation(res, id, body) {
      */
     if (agent === null) patch.agentSince = null;
     else if (agent !== conv.agent) patch.agentSince = nowIso();
+    /*
+     * A VOLUNTARY RELEASE LEAVES THE SAME TRACE AN EVICTION DOES.
+     *
+     * sweepVacantChairs() used to be the only thing that ever wrote `agentLeft`
+     * / `agentLeftAt` / `agentLeftReason`, so an agent that finished its work
+     * and stood down cleanly emptied the chair and recorded nothing at all. A
+     * reason passed on the unassign was read by no code path and came straight
+     * back null. The record of a tab whose coordinator quit was therefore byte
+     * for byte the record of a tab that never had one.
+     *
+     * On 2026-08-27 that cost 45 minutes: a coordinator read an empty seat with
+     * no history as "finished, tab idle" and reported the tab as blocked on the
+     * human. An agent had in fact DIED there holding two of his messages as
+     * claimed tasks, one of them the answer unblocking a major piece of work.
+     * "Should I reseat this tab" has exactly three answers - finished cleanly,
+     * died, never staffed - and only one of them was observable.
+     *
+     * ONLY WHEN SOMEBODY WAS ACTUALLY SITTING HERE. Releasing an already-empty
+     * chair changes nothing, so it must record nothing: writing a fresh notice
+     * on every unassign would overwrite a real eviction record ("GhostCoord,
+     * presumed-gone") with one naming nobody, on a request that did not move
+     * the seat. That is also the rule the neighbouring blocks follow - only a
+     * genuine change of occupant touches anything.
+     */
+    if (agent === null && conv.agent) {
+      const at = nowIso();
+      patch.agentLeft = conv.agent;
+      patch.agentLeftAt = at;
+      // Named or not, it leaves a trace. A bare `{"agent":null}` is still an
+      // agent saying it is going, and must not read as one that vanished.
+      patch.agentLeftReason = leftReason === undefined ? DEFAULT_LEFT_REASON : leftReason;
+      seatRelease = {
+        recorded: true,
+        agent: conv.agent,
+        at,
+        reason: patch.agentLeftReason,
+        reasonWasSupplied: leftReason !== undefined,
+      };
+    } else if (agent === null) {
+      /*
+       * Nothing happened, and the reply says so in words. This is the case that
+       * looks identical to a successful release from the outside - same 200,
+       * same empty `agent` - and the existing notice it is preserving is very
+       * often "presumed-gone", i.e. the sweep got there first and the agent
+       * politely standing down is already recorded as having vanished.
+       */
+      seatRelease = {
+        recorded: false,
+        agent: null,
+        at: null,
+        reason: leftReason === undefined ? null : leftReason,
+        reasonWasSupplied: leftReason !== undefined,
+        why: 'the chair was already empty, so nothing was recorded; the existing vacancy '
+          + 'notice was left alone',
+        agentLeft: conv.agentLeft || null,
+        agentLeftReason: conv.agentLeftReason || null,
+      };
+    }
     /*
      * A NEW occupant does not inherit the last one's stop state.
      *
@@ -6549,7 +6678,7 @@ function updateConversation(res, id, body) {
        * The one cause seen in the wild, named explicitly because the generic
        * message sends people looking at their own client instead.
        */
-      likelyCause: clobbered.includes('agent') && conv.agentLeftReason === 'presumed-gone'
+      likelyCause: clobbered.includes('agent') && conv.agentLeftReason === SWEPT_REASON
         ? `The vacant-chair sweep unassigned "${conv.agentLeft}" during this request, because this `
           + 'conversation has had no activity for longer than CHAIR_VACANT_MS. Post a message or a '
           + 'progress note to the conversation first, then attach again.'
@@ -6561,12 +6690,22 @@ function updateConversation(res, id, body) {
     });
   }
   /*
+   * What the release recorded, on every reply that could carry one, rather than
+   * left to be inferred from the fields. The agent whose report started this
+   * work passed a reason on its unassign, read `agentLeftReason: null` back out
+   * of the returned object, and could not tell "relay ignored my reason" from
+   * "relay has no such field" from "somebody cleared it again". One sentence in
+   * the reply settles all three - and says plainly when nothing was recorded,
+   * which is the answer that otherwise looks exactly like success.
+   */
+  const withRelease = (o) => (seatRelease ? { ...o, seatRelease } : o);
+  /*
    * Answer with the honest truth about what just happened, so no client can
    * render this as a kill by accident. Asking is not stopping, and the reply
    * says so in words a UI can put straight on the screen.
    */
   if (patch.stopRequested === true) {
-    return send(res, 200, { ...conv, stopRequestEffect: stopRequestEffect(conv) });
+    return send(res, 200, withRelease({ ...conv, stopRequestEffect: stopRequestEffect(conv) }));
   }
   /*
    * Filing away a conversation whose agent never stood down leaves a process
@@ -6576,7 +6715,7 @@ function updateConversation(res, id, body) {
    * made by accident.
    */
   if (patch.archived === true) {
-    return send(res, 200, {
+    return send(res, 200, withRelease({
       ...conv,
       ghost: ghostWarning(conv),
       /*
@@ -6593,9 +6732,9 @@ function updateConversation(res, id, body) {
           + 'it — check the task itself before assuming nothing was spawned.',
         taskId: cancelledDispatch.taskId || null,
       } : null,
-    });
+    }));
   }
-  send(res, 200, conv);
+  send(res, 200, withRelease(conv));
 }
 
 /** null when there is genuinely nothing left running; otherwise, the bad news. */
@@ -6694,6 +6833,21 @@ function stopAckRoute(res, id, body) {
     // Its last act: stand down from the conversation. Recorded first so that
     // even if this is the final thing the agent ever does, the row is honest.
     patch.agent = null;
+    /*
+     * ...and the same trace any other voluntary departure leaves. This is the
+     * cleanest exit the system has, and it was also emptying the chair without
+     * writing the vacancy notice - so `agentLeft` read null on the one tab
+     * where the agent had most explicitly announced it was going. The invariant
+     * is worth more than the special case: an `agent` that goes from a name to
+     * null ALWAYS records who left, when, and why, whichever door it went
+     * through. Guarded on there having been an occupant, as everywhere else.
+     */
+    if (conv.agent) {
+      patch.agentSince = null;
+      patch.agentLeft = conv.agent;
+      patch.agentLeftAt = at;
+      patch.agentLeftReason = 'stopped';
+    }
   }
   appendEvent({ t: 'convpatch', id, patch });
 
