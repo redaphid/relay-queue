@@ -3,7 +3,7 @@
 **This manual is now a Claude Code skill. Read it before you do anything else.**
 
 ```
-D:\projects\.claude\skills\relay-coordinator\SKILL.md
+D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md
 ```
 
 Open that file with your `Read` tool right now. `Read`, `Grep` and `Glob` are
@@ -28,15 +28,33 @@ their new files.
 
 ## Why this stub must keep existing
 
-`D:\projects\CLAUDE.md` tells every coordinator to read `COORDINATOR.md`, and
-this repository has **no `CLAUDE.md` and no `.claude/` of its own** — nothing
-auto-injects the manual. Deleting or emptying this file means a coordinator
-boots with no protocol at all, silently. Leave the pointer here.
+`D:\projects\CLAUDE.md` tells every coordinator to read `COORDINATOR.md`.
+Deleting or emptying this file means a coordinator boots with no protocol at
+all, silently. Leave the pointer here — it is the route that does **not**
+depend on skill discovery working.
+
+## Where the protocol and the guard now live
+
+As of **2026-08-29** both live in this repository, under `.claude/`:
+
+- `.claude/skills/relay-coordinator/` — the manual (a Claude Code skill).
+- `.claude/hooks/coordinator-guard.js` — the default-deny PreToolUse guard.
+- `.claude/settings.json` — registers that guard.
+
+They were moved here from `D:\projects\.claude` so they are versioned with the
+server they describe.
+
+**This is coupled to `tools/autoseat.js`.** Autoseat spawns every coordinator
+with `cwd: D:\projects\relay-queue`, and Claude Code discovers `.claude/skills/`
+and loads `.claude/settings.json` only for the directory a session is rooted in.
+Change that cwd and the coordinator boots with **no protocol and no guard** —
+nothing errors, and the guard's default-deny silently becomes default-allow.
+The cwd, the skill and the guard registration move together or not at all.
 
 ## Verifying the split is intact
 
 ```sh
-node D:/projects/.claude/skills/relay-coordinator/validate-routing.js
+node D:/projects/relay-queue/.claude/skills/relay-coordinator/validate-routing.js
 ```
 
 Fails if a routing-table row points at a file that does not exist, if a

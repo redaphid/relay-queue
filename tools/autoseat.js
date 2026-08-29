@@ -533,7 +533,15 @@ function parseArgs(argv) {
     heartbeatFile: DEFAULT_HEARTBEAT,
     logDir: path.join(path.dirname(DEFAULT_STATE), 'logs'),
     claude: process.env.AUTOSEAT_CLAUDE || path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
-    cwd: 'D:\\projects',
+    // SECURITY-COUPLED, do not "tidy" this to D:\projects.
+    // Claude Code discovers .claude/skills/ and loads .claude/settings.json
+    // ONLY for the directory the session is rooted in. The coordinator
+    // protocol (skills/relay-coordinator) and the default-deny PreToolUse
+    // guard (hooks/coordinator-guard.js) both live in
+    // D:\projects\relay-queue\.claude. Point this anywhere else and the
+    // coordinator boots with no protocol AND no guard, silently: nothing
+    // errors, and default-deny quietly becomes default-allow.
+    cwd: 'D:\\projects\\relay-queue',
     model: '',
     ignore: new Set(),
     once: false,
@@ -575,7 +583,8 @@ const USAGE = `autoseat - dispatch a coordinator into a tab that has a human mes
   --heartbeat FILE     proof-of-life for the supervisor (default ${DEFAULT_HEARTBEAT})
   --log-dir DIR        per-dispatch child logs
   --claude PATH        the claude executable
-  --cwd DIR            working directory for the coordinator (default D:\\projects)
+  --cwd DIR            working directory for the coordinator (default D:\\projects\\relay-queue;
+                       this is where the coordinator skill and the guard are found - see the note in parseArgs)
   --model NAME         model for the coordinator (default: whatever claude is configured with)
   --ignore A,B         conversation ids never to seat
   --once               run a single pass and exit
