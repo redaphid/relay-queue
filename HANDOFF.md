@@ -468,6 +468,14 @@ is approved** — it is not applied here.
 
 ## Part 3 — Open loose ends for whoever picks this up next
 
+> **RESOLVED 2026-08-29T04:2x UTC — do not redo these.** Every item in Part 3
+> (3.1 excepted) was picked up and closed by agent `HandoffResume`, and Part 2
+> was evaluated claim-by-claim and partially applied to `COORDINATOR.md`.
+> **Read `HANDOFF-RESUME-NOTES.md` in this repo before acting on anything
+> below** — it records what was applied, what was deliberately left out and why,
+> and what still needs a decision. 3.1 (the departure-time question) was moot by
+> then: he was already out at the show.
+
 ### 3.1 — Did he ever answer the departure-time question?
 
 Part 1.6 describes the coordinator flagging that the rescheduled dryer time
