@@ -630,6 +630,10 @@ async function main() {
   setInterval(safeTick, cfg.intervalMs);
 }
 
-module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, HUMAN_ORIGINS };
+// parseArgs is exported for autoseat-selftest.js, which asserts that the
+// DEFAULT cwd is a directory actually containing the coordinator skill and the
+// guard registration. That coupling has no runtime symptom when broken, so it
+// needs a test rather than a comment.
+module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, parseArgs, HUMAN_ORIGINS };
 
 if (require.main === module) main();

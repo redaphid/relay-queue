@@ -378,5 +378,43 @@ if (!b.includes('cid-1') || !b.includes('"by"') || /[^\x00-\x7F]/.test(b)) {
   console.log('ok    the brief names its tab, uses the `by` claim field, and is pure ASCII');
 }
 
+/*
+ * The coordinator is spawned with cfg.cwd, and Claude Code discovers
+ * .claude/skills/ and loads .claude/settings.json ONLY for the directory a
+ * session is rooted in. So the default cwd is not a convenience - it is what
+ * makes the coordinator protocol visible and what registers the default-deny
+ * guard.
+ *
+ * Break it and NOTHING reports an error: the coordinator boots with no manual,
+ * the PreToolUse hook never fires, and default-deny silently becomes
+ * default-allow. There is no log line and no failed request to notice. That is
+ * exactly the class of fault that needs a test instead of a comment.
+ *
+ * Assert against the files themselves, not against a hardcoded path string, so
+ * the directory can legitimately move as long as the protocol moves with it.
+ */
+const defaults = real.parseArgs([]);
+const seatCwd = defaults.cwd;
+const needed = [
+  path.join(seatCwd, '.claude', 'skills', 'relay-coordinator', 'SKILL.md'),
+  path.join(seatCwd, '.claude', 'settings.json'),
+];
+const missing = needed.filter((p) => !fs.existsSync(p));
+if (missing.length) {
+  console.log(`FAIL  coordinators would start in ${seatCwd}, which is missing:`);
+  for (const m of missing) console.log(`        ${m}`);
+  console.log('      A coordinator started there gets NO protocol and NO guard, silently.');
+  bad++;
+} else {
+  const reg = fs.readFileSync(path.join(seatCwd, '.claude', 'settings.json'), 'utf8');
+  if (!/coordinator-guard\.js/.test(reg)) {
+    console.log(`FAIL  ${seatCwd}\\.claude\\settings.json does not register coordinator-guard.js.`);
+    console.log('      Default-deny would silently become default-allow.');
+    bad++;
+  } else {
+    console.log('ok    the spawn cwd contains the coordinator skill AND registers the guard');
+  }
+}
+
 console.log(bad ? `\n${bad} FAILURE(S)` : '\nall good');
 process.exit(bad ? 1 : 0);
