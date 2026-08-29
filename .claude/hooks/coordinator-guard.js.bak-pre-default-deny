@@ -1,0 +1,260 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * coordinator-guard.js — PreToolUse guard for the coordinator session (project D:\projects).
+ *
+ * Purpose: the coordinator routes and delegates. It must not perform ACTIONS on
+ * the machine itself. This enforces that mechanically instead of relying on the
+ * model's judgement ("too small to delegate" is exactly the failure mode).
+ *
+ * Wired from D:\projects\.claude\settings.json, PreToolUse, matcher: Bash|PowerShell
+ * Every other tool (Agent, SendMessage, Monitor, ScheduleWakeup, task tools,
+ * Read, Grep, Glob, Edit, Write) never reaches this script and is untouched.
+ * Editing and reading files is explicitly NOT restricted.
+ *
+ * Decisions:
+ *   deny   -> git / docker / package+build runners / service+process control /
+ *             shell escape hatches
+ *   allow  -> verified relay-queue traffic to 127.0.0.1:3901 (so it never prompts)
+ *   silent -> everything else: exit 0, no output, normal permission flow
+ *
+ * Never returns "ask": an unanswered prompt parks the session.
+ *
+ * SUBAGENT EXEMPTION: hook input carries `agent_id`, which is set for subagent
+ * tool calls and absent on the session main thread. Subagents are the hands;
+ * they are allowed through immediately, before any other logic runs, so a bug
+ * below can only ever over-restrict the coordinator, never the agents it spawns.
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const LOG_FILE = 'D:\\projects\\.claude\\coordinator-violations.log';
+const RELAY = 'http://127.0.0.1:3901';
+
+/* ---------- output helpers ---------------------------------------------- */
+
+function silent() {
+  process.exit(0); // no output => normal permission flow
+}
+
+function emit(decision, reason) {
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: decision,
+        permissionDecisionReason: reason,
+      },
+    })
+  );
+  process.exit(0);
+}
+
+/** Append one audit line. Best effort: a logging failure must never rescue a blocked command. */
+function logViolation(rule, tool, subject) {
+  try {
+    const line =
+      new Date().toISOString() +
+      ' | rule=' + rule +
+      ' | tool=' + tool +
+      ' | ' + String(subject).replace(/[\r\n]+/g, ' \\n ') +
+      '\n';
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.appendFileSync(LOG_FILE, line, 'utf8');
+  } catch (_) { /* swallowed on purpose */ }
+}
+
+function deny(rule, tool, subject, what) {
+  // The decision is already made at this point. Log first, then emit.
+  logViolation(rule, tool, subject);
+
+  const short = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 200);
+  const safe = short.replace(/["\\']/g, '');
+  const reason = [
+    'COORDINATOR GUARD BLOCKED THIS (rule: ' + rule + ').',
+    '',
+    'You are the coordinator. You route work; you do not perform it. ' + what,
+    'This was refused mechanically, not as a judgement call — "it is only a small one" is precisely the reasoning this guard exists to override.',
+    '',
+    'Do this instead, in order:',
+    '1. DELEGATE IT. Spawn a subagent with the Agent tool and give it this exact command. Subagents are exempt from this guard and can run it.',
+    '2. If it truly cannot be delegated, hand the command to the user and let him run it.',
+    '3. REPORT THIS VIOLATION NOW, in this same turn, into relay conversation "main". Run exactly:',
+    "   curl -s -X POST " + RELAY + "/messages -H 'content-type: application/json' -d '{\"conversationId\":\"main\",\"agent\":\"coordinator\",\"text\":\"GUARD BLOCKED: " + safe + " — rule " + rule + ". I tried to act instead of delegating.\"}'",
+    '   That curl is permitted (it targets 127.0.0.1:3901). Reporting is mandatory, not optional.',
+    '',
+    'Do not retry this command, do not reword it, and do not reach for a different tool that does the same thing.',
+  ].join('\n');
+
+  emit('deny', reason);
+}
+
+/* ---------- command analysis --------------------------------------------- */
+/*
+ * Deliberately narrow. File mutation (rm/mv/cp/sed -i/Set-Content/New-Item) and
+ * output redirection are NOT blocked: the coordinator may edit its own and most
+ * other files. Only machine ACTIONS are blocked.
+ */
+
+const BLOCKED = new Set([
+  // version control
+  'git', 'gh', 'hub', 'svn', 'hg',
+  // containers / orchestration — read-only ps/logs/inspect included, deliberately
+  'docker', 'docker-compose', 'podman', 'kubectl', 'helm', 'nerdctl',
+  // package managers / build + script runners
+  'npm', 'pnpm', 'yarn', 'npx', 'bun', 'bunx', 'node', 'deno', 'ts-node',
+  'make', 'cargo', 'gradle', 'mvn', 'dotnet', 'go',
+  'pip', 'pip3', 'pipx', 'uv', 'gem', 'composer',
+  'winget', 'choco', 'scoop', 'msiexec', 'apt', 'apt-get', 'brew',
+  // services / processes / scheduled tasks
+  'systemctl', 'service', 'pm2', 'supervisorctl', 'nssm',
+  'start-service', 'stop-service', 'restart-service', 'set-service',
+  'new-service', 'remove-service', 'restart-computer', 'stop-computer', 'shutdown',
+  'start-process', 'stop-process', 'kill', 'pkill', 'killall', 'taskkill',
+  'sc', 'net', 'schtasks',
+  'register-scheduledtask', 'unregister-scheduledtask', 'start-scheduledtask',
+  'stop-scheduledtask', 'set-scheduledtask', 'enable-scheduledtask', 'disable-scheduledtask',
+  // system configuration
+  'reg', 'netsh', 'bcdedit', 'diskpart', 'powercfg', 'setx', 'wsl',
+  // remote execution
+  'ssh', 'scp', 'sftp',
+  // config mutation + shell escape hatches (would bypass everything above)
+  'claude', 'eval', 'iex', 'invoke-expression',
+  'bash', 'sh', 'zsh', 'cmd', 'pwsh', 'powershell',
+]);
+
+const NET = new Set([
+  'curl', 'wget', 'invoke-webrequest', 'iwr', 'invoke-restmethod', 'irm',
+]);
+
+const WRAPPERS = /^(sudo|env|command|nohup|time|exec|start|do|then|else|&)$/i;
+
+function baseName(w) {
+  let x = String(w).replace(/^["'`(]+/, '').replace(/["'`)]+$/, '');
+  x = x.split(/[\\/]/).pop();
+  x = x.replace(/\.(exe|cmd|bat|ps1|com)$/i, '');
+  return x.toLowerCase();
+}
+
+/** Split into command segments, exposing anything hidden behind chaining. */
+function segmentsOf(cmd) {
+  const exposed = String(cmd)
+    .replace(/\$\(/g, ' ; ')
+    .replace(/`/g, ' ; ')
+    .replace(/[(){}]/g, ' ; ');
+  return exposed.split(/\|\||&&|;|\||\r?\n/);
+}
+
+/** Head command word of a segment, with wrappers and env assignments stripped. */
+function headOf(seg) {
+  const words = seg.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < words.length) {
+    const w = words[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=[^\s]*$/.test(w)) { i++; continue; } // FOO=bar cmd
+    if (WRAPPERS.test(w)) { i++; continue; }
+    break;
+  }
+  return words[i] ? baseName(words[i]) : '';
+}
+
+const RELAY_URL = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):3901(?:[\/?#]|$)/i;
+
+/*
+ * Secondary catch: a blocked tool invoked by full path, e.g.
+ * "C:\Program Files\Git\bin\git.exe status" or /usr/bin/docker ps.
+ * The head-word scan alone can miss these when the path contains spaces.
+ */
+const PATHED = new RegExp(
+  '[\\\\/](' +
+    ['git', 'gh', 'docker', 'docker-compose', 'podman', 'kubectl',
+     'npm', 'pnpm', 'yarn', 'npx', 'node', 'bun', 'deno', 'make', 'cargo',
+     'systemctl', 'pm2', 'taskkill', 'schtasks', 'ssh'].join('|') +
+    ')(?:\\.(?:exe|cmd|bat))?(?=\\s|$|["\'`])',
+  'i'
+);
+
+function analyze(cmd) {
+  let sawRelay = false;
+
+  const pathed = PATHED.exec(cmd);
+  if (pathed) {
+    return {
+      rule: pathed[1].toLowerCase(),
+      what: 'Running `' + pathed[1].toLowerCase() + '` (invoked by full path) is an action on this machine, not coordination.',
+    };
+  }
+
+  for (const seg of segmentsOf(cmd)) {
+    if (!seg.trim()) continue;
+    const head = headOf(seg);
+    if (!head) continue;
+
+    if (BLOCKED.has(head)) {
+      return { rule: head, what: 'Running `' + head + '` is an action on this machine, not coordination.' };
+    }
+
+    if (NET.has(head)) {
+      const urls = String(seg).match(/\bhttps?:\/\/[^\s'"`,;)\]]+/gi) || [];
+      for (const u of urls) if (RELAY_URL.test(u)) sawRelay = true;
+    }
+  }
+
+  return sawRelay ? { relay: true } : null;
+}
+
+/* ---------- main ---------------------------------------------------------- */
+
+let input = null;
+try {
+  input = JSON.parse(fs.readFileSync(0, 'utf8'));
+} catch (_) {
+  input = null;
+}
+
+if (!input || typeof input !== 'object') {
+  deny('unparseable-hook-input', 'unknown', '(no readable hook input)',
+    'The guard could not read the tool call, so it cannot confirm this is coordination.');
+}
+
+// Subagents are the hands. Let them through first, unconditionally.
+if (typeof input.agent_id === 'string' && input.agent_id.trim() !== '') silent();
+
+/*
+ * One-time proof marker. The guard's whole correctness rests on `agent_id` being
+ * absent on the session main thread. If that assumption were wrong the guard
+ * would silently never fire — the one failure mode that yields false confidence.
+ * The first time a main-thread call is seen, record it once. Bounded: one line, ever.
+ */
+try {
+  const MARK = 'D:\\projects\\.claude\\.guard-mainthread-seen';
+  if (!fs.existsSync(MARK)) {
+    fs.writeFileSync(MARK,
+      'Coordinator main thread first observed by the guard (agent_id absent => restrictions apply).\n' +
+      new Date().toISOString() +
+      ' | agent_id=' + JSON.stringify(input.agent_id) +
+      ' | agent_type=' + JSON.stringify(input.agent_type) +
+      ' | tool=' + String(input.tool_name) +
+      ' | cmd=' + String((input.tool_input || {}).command || '').slice(0, 200) + '\n', 'utf8');
+  }
+} catch (_) {}
+
+try {
+  const tool = String(input.tool_name || '');
+  if (!/^(Bash|PowerShell)$/.test(tool)) silent();
+
+  const cmd = String((input.tool_input || {}).command || '');
+  if (!cmd.trim()) silent();
+
+  const verdict = analyze(cmd);
+  if (verdict && verdict.rule) deny(verdict.rule, tool, cmd, verdict.what);
+  if (verdict && verdict.relay) {
+    emit('allow', 'Relay-queue traffic to ' + RELAY + ' — the coordinator\'s own channel. Permitted.');
+  }
+  silent();
+} catch (err) {
+  deny('guard-internal-error', String(input.tool_name || 'unknown'),
+    String((input.tool_input && input.tool_input.command) || ''),
+    'The guard hit an internal error (' + String(err && err.message) + ') and fails closed.');
+}

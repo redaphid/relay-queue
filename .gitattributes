@@ -1,3 +1,10 @@
 # Shell scripts run inside Linux containers — CRLF would make them unrunnable
 # ("bad interpreter"), so pin them to LF regardless of the checkout platform.
 *.sh text eol=lf
+
+# The coordinator protocol and the guard arrived here on 2026-08-29 from a repo
+# that pinned core.autocrlf=false so they restored byte-identical. This box's
+# global setting is autocrlf=true, which would rewrite every one of these LF
+# files to CRLF on the next checkout. Pin them instead of relying on a repo-local
+# git config that a fresh clone would not inherit.
+.claude/** text eol=lf

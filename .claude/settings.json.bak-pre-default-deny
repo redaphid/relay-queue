@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:\\tools\\node\\node.exe",
+            "args": [
+              "D:\\projects\\relay-queue\\.claude\\hooks\\coordinator-guard.js"
+            ],
+            "timeout": 15,
+            "statusMessage": "Coordinator guard"
+          }
+        ]
+      }
+    ]
+  }
+}

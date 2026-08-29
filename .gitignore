@@ -24,8 +24,26 @@ Thumbs.db
 .env.*
 docker-compose.override.yml
 
-# Local agent-harness config (hooks, settings, violation logs) — machine-local, never published.
-.claude/
+# Agent-harness config. As of 2026-08-29 this repo is the HOME of the
+# coordinator protocol (.claude/skills/relay-coordinator/) and the default-deny
+# security guard (.claude/hooks/coordinator-guard.js), so those two must be
+# VERSIONED — this used to be a blanket `.claude/` exclusion, which would have
+# silently left the whole protocol untracked after the move.
+#
+# Everything else under .claude/ is still machine-local and never published:
+# permission allowlists accrete literal command lines from real sessions, and
+# coordinator-violations.log records whatever an agent was sending when it was
+# blocked, including personal messages.
+.claude/*
+!.claude/hooks/
+!.claude/skills/
+!.claude/settings.json
+!.claude/settings.json.bak-pre-default-deny
+
+# ...but re-exclude local state inside the directories re-included above.
+.claude/**/*.log
+.claude/**/*.local.json
+.claude/.guard-mainthread-seen
 
 # Scratch mutant copies of server.js, written next to it (not in the OS temp
 # dir) so its relative requires (./icons.js, ./push.js, ./share.js) resolve.
