@@ -323,3 +323,116 @@ exact failure the move was meant to end. Now a targeted allowlist, verified with
 `git check-ignore` in both directions. Also pinned `.claude/** text eol=lf` in
 `.gitattributes`; this repo does not pin `core.autocrlf=false` the way the old
 one did, so the files would have been rewritten to CRLF on next checkout.
+
+## Task 7 - demote Windows-only content out of the coordinator core - DONE
+
+His call: *"we'll run it in Linux in the future. so we can remove stuff re:
+ascii, powershell, redirecting, etc."*
+
+**Deviation, stated up front and overridable: DEMOTED, did not delete.** The box
+runs Windows today - `autoseat-start.ps1` executes every 5 minutes right now,
+and its pure-ASCII requirement is a live guard against a real boot failure.
+Deleting the rule while the script still runs deletes the documentation of a
+live constraint. Everything Windows now lives in ONE file, so the eventual
+deletion is a single `rm` plus one routing row.
+
+**New `references/windows-legacy.md`** (8229 b) absorbs: the CP-1252 shell
+mangling mechanism, the PowerShell/`ConvertTo-Json` serializer recipe and the
+`C:\tmp` vs `%TEMP%` divergence, the `.ps1` pure-ASCII/CP-1252 parse rule, the
+whole `relay-autoseat` Scheduled Task briefing, `Get-ScheduledTask` /
+`Get-CimInstance` recipes, session-0 vs Interactive-logon, the NTFS junction
+delete hazard, the CRLF no-op mutation trap, and the surviving absolute paths.
+`references/briefing-autoseat-task.md` was folded into it and deleted (content
+preservation checked phrase-by-phrase against `HEAD`, 12/12 present).
+
+### The judgement calls - split, not bulk-moved
+
+- **ASCII rule: SPLIT.** KEPT in core - the server refuses a non-UTF-8 body
+  outright and stores nothing, and you must read the reply. Those are server
+  behaviour, true on any OS. DEMOTED - *why* the bytes get mangled here (the
+  shell re-encoding an em-dash to a lone CP-1252 `0x97`).
+- **JSON-escaping: SPLIT.** KEPT - serialize, never hand-roll a heredoc;
+  malformed JSON reads back as `"result is required"` and leaves the claim held
+  with no result, indistinguishable from closed. DEMOTED - the PowerShell
+  recipe, `node -e` Git-Bash path translation, `C:\tmp` vs `%TEMP%`.
+- **Borderline, flagged for his override:** the "never pass a body between two
+  tools via `/tmp`" bullet stays in core. Its *cause* is Windows path
+  translation, but the harm is severe and silent (an agent published a stale
+  unrelated message under its own name, no delete route). Delete it with the OS
+  move, not before.
+- Everything that is a relay protocol rule stayed put regardless of surrounding
+  OS phrasing.
+
+**Frontmatter fixed.** The `description` is the always-loaded tier present in
+every session, so a hardcoded `D:\projects\relay-queue\COORDINATOR.md` there was
+the most expensive possible place for a stale path. Now path-agnostic, trigger
+wording preserved. SKILL.md now contains **zero** Windows absolute paths.
+
+Also normalized the `Back to the core manual:` boilerplate in all 14 references
+from an absolute path to `SKILL.md`.
+
+### Measured
+
+| tier | before | after | delta |
+|---|---|---|---|
+| always-loaded core (`SKILL.md`) | 27797 | 27692 | **-105** |
+| on-demand `references/` | 38405 | 42739 | +4334 |
+
+The core shrank only modestly because the earlier split had already pushed
+nearly all Windows content out of it - the win here is structural, not bytes.
+References grew because `windows-legacy.md` consolidates live constraints that
+previously existed only in `README.md`, this log, and agent memory.
+
+### Validator - proven red twice, on two different check classes
+
+- **ORPHAN:** file on disk with its routing row removed -> exit 1, named it.
+- **DANGLING + BROKEN:** moved `windows-legacy.md` aside -> exit 1 with 3
+  failures, including both new cross-references from `autoseat.md` and
+  `briefing-deploy-hazards.md`. Restored -> exit 0.
+
+### A trap that bit, and was caught
+
+The Bash tool (Git Bash/MSYS) **ate the backslashes** out of a `node -e`
+argument: `D:\projects\...` arrived at node as `D:projects...`, so a
+14-file replacement reported **0 replacements and exit 0** while `grep` still
+found all 14. This is the manual's own "`node -e` hits Git-Bash path
+translation" note, live. Only the asserted match count caught it. Fixed by
+building the string from `String.fromCharCode(92)` - no literal backslash in the
+shell argument at all. **Assert the count; a mutation that reports success is
+not evidence it applied.**
+
+### Task 2 (investigation only, nothing changed): settings are NOT inherited
+
+**Question:** if a guard registration were re-added at
+`D:\projects\.claude\settings.json`, would a session rooted at
+`relay-queue` load both and fire the guard twice?
+
+**Answer: no - project settings are root-only, never merged up the tree.**
+Evidence from the shipped CLI (v2.1.251, `~/.local/share/claude/versions/`):
+`projectSettings` resolves as a single `join(resolve(cwd), ".claude",
+"settings.json")` - no loop, no `dirname` ascent - and the settings source list
+is a fixed 5-element enum, not a variable-length ancestor chain. Corroborated by
+the docs: *"reads the shared `.claude/settings.json` from the session's primary
+working directory"*. Only `settings.local.json` ascends, and only to the git
+root, with an explicit **Windows exception** - so on this box even that is
+cwd-only. `D:\projects` is not a git repo anyway.
+
+**So the SKILL.md claim is accurate** and was left standing. Added one clause to
+it, because a conflation risk sits two lines away: **CLAUDE.md walks up the
+tree, `settings.json` does not.** Without that, a reader can infer the guard is
+inherited into `D:\projects` and feel protected while unguarded.
+
+**Recommendation (his call, NOT implemented):** re-adding the registration at
+`D:\projects\.claude\settings.json` pointing at the new guard path is **safe
+from a double-fire standpoint** - it would not even be loaded by a relay-queue
+session, so it cannot double-fire; it would only arm hand-started sessions in
+`D:\projects`, which is exactly the residual gap. Note that file does not
+currently exist (only `settings.local.json`, permissions-only, no hooks block).
+Secondary finding: hooks *are* unioned across user/project/local tiers, but
+identical command hooks dedupe on `command`+`args`+`shell`+`if` (matcher and
+source excluded), so even a duplicate in `~/.claude/settings.json` would collapse
+to one execution - `timeout` differences do not defeat the dedupe, `args`
+differences do.
+
+Not implemented: re-arming a security control is his call, and a previous
+attempt to modify this guard was correctly blocked by the permission classifier.
