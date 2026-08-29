@@ -61,11 +61,22 @@ if ($live.Count -gt 0) {
 
 if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir | Out-Null }
 
-# Start-Process truncates its redirect target, so roll the previous run's log
-# aside first. That keeps exactly one generation of history, which is what a
-# post-mortem on "when did it stop, and was there anything in stderr" needs.
-if (Test-Path $logFile) { Move-Item $logFile "$logFile.1" -Force }
-if (Test-Path $errFile) { Move-Item $errFile "$errFile.1" -Force }
+# Start-Process's -RedirectStandardOutput/-Error ALWAYS truncate the target -
+# there is no append option. The task tick restarts autoseat on every crash
+# (up to every 5 minutes), so truncate-on-start silently erases the run
+# history a post-mortem needs, right when a post-mortem is most likely to be
+# needed. So: run through cmd.exe and use shell >> append redirection
+# instead of PowerShell's redirect parameters.
+#
+# Size-capped rotation: an appended log grows forever otherwise. Roll it
+# aside once it crosses ~10 MB, keeping exactly one prior generation - big
+# enough to hold weeks of normal ticks, small enough to never matter.
+$maxBytes = 10MB
+foreach ($f in @($logFile, $errFile)) {
+    if ((Test-Path $f) -and (Get-Item $f).Length -gt $maxBytes) {
+        Move-Item $f "$f.1" -Force
+    }
+}
 
 $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
 if (-not $node) { $node = 'D:\tools\node\node.exe' }
@@ -73,11 +84,18 @@ if (-not (Test-Path $node)) { throw "node.exe not found (looked for $node)" }
 
 # Run from the repo root so autoseat.js resolves its own relative paths the way
 # it does when a human runs `node tools/autoseat.js` from the checkout.
-Start-Process -FilePath $node `
-    -ArgumentList 'tools/autoseat.js' `
+#
+# The whole "/c ..." command must be passed to Start-Process as ONE string
+# with the entire command wrapped in an extra pair of quotes. Passing it as
+# an array (e.g. -ArgumentList @('/c', $cmdLine)) makes PowerShell re-quote
+# the already-quoted inner string, which cmd.exe's argument parser then
+# mis-splits - it looks like it started (a PID comes back) but node never
+# actually runs and nothing is ever written, silently.
+$cmdLine = '"' + $node + '" tools\autoseat.js >> "' + $logFile + '" 2>> "' + $errFile + '"'
+$argStr = '/c "' + $cmdLine + '"'
+Start-Process -FilePath 'cmd.exe' `
+    -ArgumentList $argStr `
     -WorkingDirectory $root `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $logFile `
-    -RedirectStandardError $errFile
+    -WindowStyle Hidden
 
 Write-Output "started autoseat from $root"
