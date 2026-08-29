@@ -42,6 +42,8 @@ const ago = (sec) => new Date(NOW - sec * 1000).toISOString();
  */
 const conversations = [
   { id: 'c-seat', title: 'Seat me', agent: null, archived: false, stopAck: null },
+  { id: 'c-voice', title: 'Dictated', agent: null, archived: false, stopAck: null },
+  { id: 'c-voiceconv', title: 'Spoken', agent: null, archived: false, stopAck: null },
   { id: 'c-staffed', title: 'Staffed', agent: 'live-coord', archived: false, stopAck: null },
   /*
    * Occupied by a name, but the server itself says nobody is listening
@@ -66,6 +68,17 @@ const conversations = [
 
 const tasks = [
   { id: 't-seat', conversationId: 'c-seat', role: 'user', from: 'web', ts: ago(120) },
+  /*
+   * The same message as t-seat in every way that should matter - a thing he
+   * said, in a tab with nobody in it - except that he said it out loud.
+   * `voice` is dictation sent through the ordinary send path; from the
+   * two-way voice mode it arrives as `voice-conversation`. While the trigger
+   * tested `from === 'web'` these were a silent black hole: refusing on `from`
+   * is not an error, so nothing alarmed and nobody could tell from outside
+   * that a spoken message had been dropped. One of his sat 23 minutes.
+   */
+  { id: 't-voice', conversationId: 'c-voice', role: 'user', from: 'voice', ts: ago(120) },
+  { id: 't-voiceconv', conversationId: 'c-voiceconv', role: 'user', from: 'voice-conversation', ts: ago(120) },
   { id: 't-staffed', conversationId: 'c-staffed', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-unwatched', conversationId: 'c-unwatched', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-archived', conversationId: 'c-archived', role: 'user', from: 'web', ts: ago(120) },
@@ -83,6 +96,16 @@ const tasks = [
   { id: 't-two-b', conversationId: 'c-two', role: 'user', from: 'web', ts: ago(60) },
 ];
 
+/*
+ * The default cap here is deliberately ROOMY - larger than the number of tabs
+ * these fixtures can possibly seat. The cap has its own tests further down with
+ * an explicit `maxConcurrent`; letting it also bite in the general run would
+ * mean "refused because of its `from`" and "refused because of the cap" produce
+ * the same not-seated result, and a regression in the human-origin allowlist
+ * could hide behind the cap. That is not hypothetical - see the `roomy` run in
+ * check(), which exists because the one-agent-per-tab guard was already once
+ * passing on the cap's work.
+ */
 function run(mod, over) {
   return mod.selectSeats({
     tasks,
@@ -92,7 +115,7 @@ function run(mod, over) {
     ignore: new Set(['c-ignored']),
     now: NOW,
     graceMs: GRACE_MS,
-    maxConcurrent: 3,
+    maxConcurrent: 9,
     ...over,
   });
 }
@@ -117,23 +140,16 @@ function check(mod) {
   // everything and the suite would still be green.
   ok(seated.includes('t-seat'), 'an empty seat with a human message waiting was NOT seated');
 
-  // Exactly one coordinator for the tab holding two messages, and it is the
-  // older one - the oldest message is what the human is waiting on.
-  ok(chosen.filter((c) => c.conversationId === 'c-two').length === 1,
-    'a tab with two waiting messages was seated more than once');
-  ok(seated.includes('t-two-a'), 'the OLDER of two waiting messages was not the one that seated');
-
-  ok(seated.length === 2, `expected exactly 2 dispatches, got ${seated.length}: ${seated.join(',')}`);
-
   /*
-   * t-unwatched is a REAL, otherwise-eligible candidate at the same age as
-   * t-seat, so under the default cap (3, with one slot already held by
-   * c-inflight) it is legitimately cap-refused here — proof it is competing
-   * on equal footing with every other candidate, not silently exempted from
-   * the cap. Its actual rescue is asserted below under a raised cap, the same
-   * way `roomy` isolates the one-per-tab guard from the cap guard.
+   * He speaks to relay at least as often as he types at it, so these are
+   * positive controls of exactly the same weight as the one above - not
+   * variants of it. The allowlist is what makes them pass, and the two
+   * allowlist mutations at the bottom of this file are what prove that.
    */
-  ok(refused('t-unwatched'), 'an occupied-but-unwatched seat should still be subject to the concurrency cap like any other candidate');
+  ok(seated.includes('t-voice'),
+    'a DICTATED message (from:"voice") in an empty seat was NOT seated');
+  ok(seated.includes('t-voiceconv'),
+    'a message from two-way voice mode (from:"voice-conversation") in an empty seat was NOT seated');
 
   /*
    * THE FLUXPREP CASE. A seat with a name on it, but the server itself says
@@ -142,18 +158,25 @@ function check(mod) {
    * seatWatchInfo() in server.js). `conv.agent` being non-null must no longer
    * be an unconditional refusal, or this exact incident recurs: a coordinator
    * exits, its name never leaves the seat, and nothing ever answers the human
-   * again. Cap raised out of the way, same isolation `roomy` uses above.
+   * again.
    */
-  const unwatchedRun = run(mod, { maxConcurrent: 99, inFlight: new Set() });
-  const unwatchedWhy = Object.fromEntries(unwatchedRun.considered.map((r) => [r.taskId, r.why]));
-  ok(unwatchedRun.chosen.some((c) => c.taskId === 't-unwatched'),
+  ok(seated.includes('t-unwatched'),
     'a seat occupied by a name but flagged agentState.seatUnwatched was NOT rescued - this is the FluxPrep gap');
-  ok(/DeadCoord/.test(unwatchedWhy['t-unwatched'] || '') && /unwatched/.test(unwatchedWhy['t-unwatched'] || ''),
-    `the reason for seating t-unwatched should name the stale coordinator and say why it was rescued: ${unwatchedWhy['t-unwatched']}`);
-  // The negative control in the SAME run: a genuinely staffed seat (no
-  // agentState.seatUnwatched at all) must still be refused, cap or no cap.
-  ok(!unwatchedRun.chosen.some((c) => c.taskId === 't-staffed'),
-    'a genuinely staffed seat was seated once the cap was raised - it must be refused on its own merits, not just by the cap');
+  ok(/DeadCoord/.test(why['t-unwatched'] || '') && /unwatched/.test(why['t-unwatched'] || ''),
+    `the reason for seating t-unwatched should name the stale coordinator and say why it was rescued: ${why['t-unwatched']}`);
+  // The negative control alongside it in the SAME run: a genuinely staffed
+  // seat (no agentState.seatUnwatched at all) must still be refused.
+  ok(refused('t-staffed'), 'a genuinely staffed seat was seated - it must be refused on its own merits');
+
+  // Exactly one coordinator for the tab holding two messages, and it is the
+  // older one - the oldest message is what the human is waiting on.
+  ok(chosen.filter((c) => c.conversationId === 'c-two').length === 1,
+    'a tab with two waiting messages was seated more than once');
+  ok(seated.includes('t-two-a'), 'the OLDER of two waiting messages was not the one that seated');
+
+  // t-seat, t-voice, t-voiceconv, t-unwatched, and the older of the pair in
+  // c-two. Anything else getting through is a guard that stopped guarding.
+  ok(seated.length === 5, `expected exactly 5 dispatches, got ${seated.length}: ${seated.join(',')}`);
 
   /*
    * The same one-per-tab rule again, but with the cap raised out of the way.
@@ -181,9 +204,15 @@ function check(mod) {
     'an ignored tab was seated, or refused for the wrong reason');
   ok(refused('t-agentmsg') && /not the human speaking/.test(why['t-agentmsg']),
     'an AGENT post triggered a dispatch - this is the infinite loop');
-  ok(refused('t-watchdog') && /not the human web client/.test(why['t-watchdog']),
+  /*
+   * The two machine origins that wear `role: "user"`. Widening the human
+   * allowlist to be "helpful" is the one edit that would let these through, so
+   * the reason is asserted too: they must be refused BY THE ALLOWLIST, not
+   * incidentally by some other guard that a later change could remove.
+   */
+  ok(refused('t-watchdog') && /not a human client/.test(why['t-watchdog']),
     'a watchdog poke triggered a dispatch - this is the nag amplifier');
-  ok(refused('t-checklist') && /not the human web client/.test(why['t-checklist']),
+  ok(refused('t-checklist') && /not a human client/.test(why['t-checklist']),
     'a checklist settle triggered a dispatch');
   ok(refused('t-fresh') && /grace/.test(why['t-fresh']),
     'a message inside the grace window was seated');
@@ -220,6 +249,20 @@ function check(mod) {
   ok(!mod.coveredBy(tasks, 'c-agentmsg').length,
     'coveredBy counted an agent post as a human message');
 
+  /*
+   * coveredBy has to agree with the selector about what "human" means, and it
+   * is a separate expression, so it can drift. If it counted only `web` while
+   * the selector seated `voice`, the spoken message would never be recorded as
+   * dispatched and the next restart would send a SECOND coordinator into that
+   * tab - the exact backlog shape this file exists to make impossible.
+   */
+  ok(mod.coveredBy(tasks, 'c-voice').join() === 't-voice',
+    'coveredBy did not count a dictated message as the human speaking, so a restart would re-dispatch it');
+  ok(mod.coveredBy(tasks, 'c-voiceconv').join() === 't-voiceconv',
+    'coveredBy did not count a two-way-voice message as the human speaking');
+  ok(!mod.coveredBy(tasks, 'c-watchdog').length && !mod.coveredBy(tasks, 'c-checklist').length,
+    'coveredBy counted a watchdog poke or a checklist settle as a human message');
+
   return fail;
 }
 
@@ -243,7 +286,7 @@ function loadMutant(find, replace) {
 
 const MUTATIONS = [
   ['the human-vs-agent test', "if (t.role !== 'user')", 'if (false)'],
-  ['the human-client test', 'if (t.from !== HUMAN_FROM)', 'if (false)'],
+  ['the human-client test', 'if (!HUMAN_ORIGINS.has(t.from))', 'if (false)'],
   ['the occupied-seat test', 'if (conv.agent && !unwatched)', 'if (false)'],
   /*
    * THE FLUXPREP REGRESSION, REPRODUCED ON PURPOSE. Reverting to the OLD,
@@ -260,7 +303,28 @@ const MUTATIONS = [
   ['the in-flight guard', 'if (inFlight.has(cid))', 'if (false)'],
   ['the one-per-tab guard', 'if (takenThisPass.has(cid))', 'if (false)'],
   ['the concurrency cap', 'if (inFlight.size + chosen.length >= maxConcurrent)', 'if (false)'],
-  ['human messages counted for coverage', "t.role === 'user' && t.from === HUMAN_FROM", 'true'],
+  ['human messages counted for coverage', "t.role === 'user' && HUMAN_ORIGINS.has(t.from)", 'true'],
+  /*
+   * The allowlist itself, mutated in BOTH directions, because it is a list and
+   * a list can be wrong two ways.
+   *
+   * Narrowing it back to `web` alone replays the bug this was extended for. It
+   * must go red, or the voice fixtures above are decoration that would keep
+   * passing while he was being ignored again.
+   *
+   * Widening it to swallow the machine origins must go red too. That is the
+   * load-bearing one: it proves the watchdog and checklist refusals are the
+   * ALLOWLIST's doing and not some other guard's, which is what licenses the
+   * claim that a dispatch loop is structurally impossible here rather than
+   * merely unobserved. If this mutant survived, the allowlist could be swapped
+   * for a blocklist tomorrow and nothing would notice.
+   */
+  ['voice dropped back out of the human allowlist',
+    "const HUMAN_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);",
+    "const HUMAN_ORIGINS = new Set(['web']);"],
+  ['machine origins let into the human allowlist',
+    "new Set(['web', 'voice', 'voice-conversation'])",
+    "new Set(['web', 'voice', 'voice-conversation', 'relay-watchdog', 'checklist'])"],
 ];
 
 // ------------------------------------------------------------------ main

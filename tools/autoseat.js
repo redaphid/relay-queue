@@ -47,11 +47,12 @@
  *     things.
  *
  *   - It never dispatches on anything but a human message. The test is
- *     `role === 'user' && from === 'web'`, which is structural rather than a
- *     heuristic: agent posts carry `role: 'agent'`, the watchdog's own pokes
- *     carry `from: 'relay-watchdog'`, and checklist settles carry
- *     `from: 'checklist'`. This is what stops the obvious infinite loop, where
- *     a dispatched agent's own writes look like new work and dispatch another.
+ *     `role === 'user' && HUMAN_ORIGINS.has(from)`, which is structural rather
+ *     than a heuristic: agent posts carry `role: 'agent'`, the watchdog's own
+ *     pokes carry `from: 'relay-watchdog'`, and checklist settles carry
+ *     `from: 'checklist'`. None of those are in the allowlist, so none of them
+ *     can dispatch. This is what stops the obvious infinite loop, where a
+ *     dispatched agent's own writes look like new work and dispatch another.
  *
  *   - It never dispatches into a thread that was closed on purpose - archived,
  *     or `stopAck === 'stopped'`. Those are finished, not forgotten, and there
@@ -69,10 +70,36 @@ const { spawn } = require('node:child_process');
 const DEFAULT_QUEUE = 'http://127.0.0.1:3901';
 const DEFAULT_STATE = path.join(os.homedir(), '.relay-autoseat', 'state.json');
 
-/* The human's own client. Everything else that can create a `role: "user"`
- * task - `checklist` settles, and anything a machine posts - is deliberately
- * NOT this value, which is why the trigger can be one equality test. */
-const HUMAN_FROM = 'web';
+/*
+ * The human's own clients - the surfaces HE posts from, and nothing else.
+ *
+ * THIS IS AN ALLOWLIST ON PURPOSE. KEEP IT ONE. The loop-safety property of
+ * this whole file rests on it: a dispatched coordinator, the watchdog, and a
+ * checklist settle cannot name themselves onto a list they are not on, so a
+ * dispatch feeding on agent writes is impossible rather than merely unlikely.
+ * A blocklist ("anything that is not a known agent") or a heuristic would
+ * invert that - the default would become "dispatch", and every posting surface
+ * nobody remembered to exclude would become a loop. server.js makes exactly
+ * this argument about PAGE_ORIGINS, and records a surface slipping through it
+ * once already.
+ *
+ * It was a single string, `'web'`, and that was a bug with teeth: he talks to
+ * relay by VOICE at least as often as by keyboard, and those posts arrive as
+ * `voice` (dictation through the ordinary send path) and `voice-conversation`
+ * (the two-way voice mode). Neither matched, so an empty tab holding a spoken
+ * message was a silent black hole - no coordinator, no error, and nothing to
+ * alarm on, because refusing on `from` is not a failure. One of his messages
+ * sat unanswered for 23 minutes that way.
+ *
+ * Adding them costs nothing structurally, because they are human-origin: no
+ * agent emits them. `checklist` is deliberately absent even though it is a page
+ * origin too - a ticked box is not an instruction, and the server's own
+ * PAGE_ORIGINS set is therefore NOT the right list to borrow here.
+ *
+ * ADDING A UI SURFACE HE CAN SPEAK OR TYPE FROM? ADD IT HERE, IN THE SAME
+ * COMMIT. The failure is silent in the safe direction: he gets ignored.
+ */
+const HUMAN_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
 
 /* How long a dispatch record is kept. Long enough that a message from last week
  * cannot be re-dispatched by a restart; short enough that the file stays small. */
@@ -117,7 +144,7 @@ function selectSeats(opts) {
 
     if (dispatched.has(t.id)) { no('a coordinator was already dispatched for this message'); continue; }
     if (t.role !== 'user') { no(`role is ${JSON.stringify(t.role)}, so this is not the human speaking`); continue; }
-    if (t.from !== HUMAN_FROM) { no(`from is ${JSON.stringify(t.from)}, not the human web client`); continue; }
+    if (!HUMAN_ORIGINS.has(t.from)) { no(`from is ${JSON.stringify(t.from)}, not a human client; he posts from ${[...HUMAN_ORIGINS].join(', ')}`); continue; }
     if (ignore.has(cid)) { no('conversation is on the ignore list'); continue; }
     if (!conv) { no('conversation is not in the conversation list'); continue; }
     if (conv.archived) { no('conversation is archived, which IS the answer'); continue; }
@@ -176,7 +203,7 @@ function selectSeats(opts) {
 function coveredBy(tasks, conversationId) {
   return tasks
     .filter((t) => (t.conversationId || 'main') === conversationId
-      && t.role === 'user' && t.from === HUMAN_FROM)
+      && t.role === 'user' && HUMAN_ORIGINS.has(t.from))
     .map((t) => t.id);
 }
 
@@ -481,6 +508,6 @@ async function main() {
   setInterval(safeTick, cfg.intervalMs);
 }
 
-module.exports = { selectSeats, coveredBy, agentName, brief, HUMAN_FROM };
+module.exports = { selectSeats, coveredBy, agentName, brief, HUMAN_ORIGINS };
 
 if (require.main === module) main();
