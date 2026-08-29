@@ -183,3 +183,78 @@ either way.
 which is **not a git repository**. Git history still holds the old
 `COORDINATOR.md`, but the current authoritative copy is unversioned on a box
 that crashes. Candidate for the standing private-remote order.
+
+---
+
+## 2026-08-29: autoseat supervision - a wedged process is now detectable
+
+**The reported fault was not real, and that is the finding.** autoseat PID
+43952 was escalated as "alive but wedged for 16.7 hours", on the evidence that
+its log had not been written since 04:59:20 UTC. It had not hung. It was
+polling correctly the entire time.
+
+What the silence actually was: `autoseat.js` prints `nothing to seat` only when
+the text CHANGES (a deliberate anti-spam guard - an unconditional line would be
+~8600 entries a day). The pending count sat at 11 from 04:59 until 21:44, so
+there was genuinely nothing new to say. Proof it was alive, in order of
+strength: its TCP sockets to :3901 churned (a fresh connection pair opened, used
+and closed every ~10s - keep-alive is shorter than the poll, so a live poller
+MUST reconnect); and when the count finally moved 11 -> 9 -> 7, it logged both
+transitions within seconds.
+
+**Do not read log silence as death here.** Settling this took socket forensics
+precisely because no artifact on disk could distinguish "idle and fine" from
+"wedged" - which is the real defect, and is what got fixed.
+
+### What actually stranded his messages
+
+Four human messages (including one `voice-conversation`) were dispatched-for at
+04:13:24 and then never answered. `state.json` records a dispatch BEFORE the
+spawn and never retracts it, and the selector refuses any task already in that
+map. The three coordinators spawned at 04:13:24 wrote **0 bytes** and their
+parent autoseat was killed ~04:30 (`PRE-RESTART-MARKER` at 04:30:47), which
+took the children with it. So those messages became permanently un-seatable by
+design, and sat until agents closed them by hand around 21:44 today.
+
+**This is still open and is NOT what I fixed.** A dispatch whose coordinator
+dies without answering should be retryable. The "never dispatch twice" guard is
+load-bearing and deliberately argued in the source (it is what stops a
+backlog storm), so widening it is his call, not a silent patch. The remaining 7
+pending tasks are all correct refusals - archived conversations, or
+`checklist`/`relay-watchdog` origins that are not human.
+
+### What was fixed
+
+`626ca4b` - autoseat writes `heartbeat.json` when a poll RUNS TO COMPLETION;
+the supervisor treats a stale one as death, kills the pid and starts a fresh
+one. Threshold 120s. The beat is NOT stamped on tick entry: `setInterval` keeps
+firing behind a hung fetch, so an on-entry stamp would stay fresh through the
+exact fault it exists to catch.
+
+`043b09c` - both polls now carry an 8s `AbortSignal.timeout`. `fetch` has no
+default overall timeout, so a relay that accepts a connection then goes quiet
+parked a tick for 300s.
+
+### Proven red before green, on the real process
+
+    no heartbeat file      -> killed 43952, started 8900
+    healthy, 3 runs        -> "healthy (heartbeat 1-2s old)", pid stable
+    suspended, 107s stale  -> correctly NOT killed (under the 120s limit)
+    suspended, 151s stale  -> killed 8900, started 40872
+    fresh beat, foreign pid-> killed 40872, started 39380
+    8s timeout             -> gave up at 8.1s; control without it hung past 25s
+
+The wedge was simulated by SUSPENDING the process (NtSuspendProcess), not by
+backdating the file - backdating only proves the supervisor can read a clock,
+whereas suspending proves the property everything rests on: a process that is
+alive but not working stops producing heartbeats.
+
+### A trap that bit during this work
+
+The restart note was appended to `autoseat.log` BEFORE the kill. The dying
+process holds that log open through cmd's `>>` redirection, so `Add-Content`
+threw - and under `$ErrorActionPreference = 'Stop'` that aborted the supervisor
+mid-recovery: it identified the wedged process and then did nothing about it.
+A worse bug than the one being fixed, found only by running it. Logging is now
+best-effort and happens after the kill, and the supervisor refuses to start a
+second dispatcher if the kill did not take.
