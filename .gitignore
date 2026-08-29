@@ -26,3 +26,9 @@ docker-compose.override.yml
 
 # Local agent-harness config (hooks, settings, violation logs) — machine-local, never published.
 .claude/
+
+# Scratch mutant copies of server.js, written next to it (not in the OS temp
+# dir) so its relative requires (./icons.js, ./push.js, ./share.js) resolve.
+# tools/seat-unwatched-selftest.js cleans these up itself; ignored here too in
+# case a killed test run leaves one behind.
+*.mutant.js

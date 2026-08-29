@@ -21,9 +21,18 @@
  *
  * WHAT IT WILL NOT DO, AND WHY EACH GUARD EXISTS.
  *
- *   - It never seats a tab that has an agent. `conv.agent` must be null, and it
- *     is re-read in the instant before the spawn, because the interesting race
- *     is a human or a router seating the tab while this process was deciding.
+ *   - It never seats a tab that has an agent WHO IS ACTUALLY THERE. `conv.agent`
+ *     must be null, OR the server's own `agentState.seatUnwatched` must be true
+ *     - re-read in the instant before the spawn either way, because the
+ *     interesting race is a human or a router seating the tab while this
+ *     process was deciding. `seatUnwatched` is the server noticing nobody is
+ *     subscribed to that conversation's SSE stream, combined with a grace
+ *     window and every other signal of life (heartbeat, lastActedAt,
+ *     lastProgressAt) - see seatWatchInfo() in server.js. It exists because
+ *     `conv.agent` alone cannot tell a live coordinator from one whose PROCESS
+ *     exited while its name stayed on the seat ("FluxPrep": answered a few
+ *     messages, finished, exited - and 12 messages queued for 9 minutes behind
+ *     a seat that still read as staffed, because nothing ever unseated it).
  *
  *   - It never dispatches twice for the same human message. State is keyed on
  *     TASK ID and written BEFORE the spawn, so a crash mid-dispatch loses the
@@ -140,7 +149,24 @@ function selectSeats(opts) {
     if (!conv) { no('conversation is not in the conversation list'); continue; }
     if (conv.archived) { no('conversation is archived, which IS the answer'); continue; }
     if (conv.stopAck === 'stopped') { no('conversation was deliberately stopped'); continue; }
-    if (conv.agent) { no(`the seat is filled by ${conv.agent}`); continue; }
+    /*
+     * SEAT-UNWATCHED: the server's own answer to "is anyone actually reading
+     * this conversation's SSE stream right now", combined server-side with a
+     * grace window and every other signal of life (see seatWatchInfo() /
+     * evidenceOfLifeMs() in server.js). `conv.agent` being non-null no longer
+     * refuses on its own — that was exactly the "FluxPrep" gap: a coordinator's
+     * process exited, its name stayed on the seat, and this exact check kept
+     * refusing forever because it only ever looked at the name.
+     *
+     * Deliberately trusting the server's verdict rather than recomputing it
+     * from raw fields here: it already folds in heartbeat/lastActedAt/
+     * lastProgressAt/listener-count with the right grace window, and duplicating
+     * that logic client-side is how the two drift apart. This also costs
+     * nothing extra to check — `agentState` already rides on the same
+     * GET /conversations poll this file was already making.
+     */
+    const unwatched = !!(conv.agentState && conv.agentState.seatUnwatched);
+    if (conv.agent && !unwatched) { no(`the seat is filled by ${conv.agent}`); continue; }
 
     const ageMs = now - Date.parse(t.ts);
     if (!(ageMs >= graceMs)) {
@@ -153,7 +179,11 @@ function selectSeats(opts) {
 
     takenThisPass.add(cid);
     row.seat = true;
-    row.why = `human message waiting ${Math.round(ageMs / 1000)}s in an empty seat`;
+    row.staleSeat = unwatched ? conv.agent : null;
+    row.why = unwatched
+      ? `${conv.agent} is seated but unwatched ${conv.agentState.unwatchedForSec}s (no live SSE subscriber) `
+        + `while a message waited ${Math.round(ageMs / 1000)}s`
+      : `human message waiting ${Math.round(ageMs / 1000)}s in an empty seat`;
     row.ageSec = Math.round(ageMs / 1000);
     considered.push(row);
     chosen.push(row);
@@ -330,7 +360,18 @@ async function tick(cfg, runtime) {
       log(`SKIP ${pick.conversationId}: could not re-read the seat (${e.message})`);
       continue;
     }
-    if (live.agent) { log(`SKIP ${pick.conversationId}: ${live.agent} took the seat while we were deciding`); continue; }
+    /*
+     * The re-read must ask the SAME question selectSeats() did, not just
+     * "is agent non-null" — otherwise every seat-unwatched pick would be
+     * skipped here unconditionally, since live.agent is expected to be
+     * non-null on exactly that path. Recomputed fresh from this GET rather
+     * than trusted from `pick`, because a NEW occupant sitting down in the
+     * gap (even one seated to genuinely watch it) immediately resets the
+     * server's own clock via agentSince, so seatUnwatched already reads false
+     * for them without any special-casing here.
+     */
+    const liveUnwatched = !!(live.agentState && live.agentState.seatUnwatched);
+    if (live.agent && !liveUnwatched) { log(`SKIP ${pick.conversationId}: ${live.agent} took the seat while we were deciding`); continue; }
     if (live.archived || live.stopAck === 'stopped') { log(`SKIP ${pick.conversationId}: closed while we were deciding`); continue; }
 
     const agent = agentName(live.title || pick.title, pick.conversationId);
