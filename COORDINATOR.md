@@ -133,6 +133,22 @@ node tools/autoseat.js --once --dry --explain  # decide, spawn nothing, show eve
 node tools/autoseat-selftest.js              # fixtures + mutation
 ```
 
+### It is supervised by a Scheduled Task. Do not start it by hand.
+
+**`relay-autoseat` (Windows Task Scheduler) is what keeps it alive** — at logon, and again every 5 minutes forever. Check it, rather than assuming, before concluding auto-seating is armed:
+
+```sh
+powershell -NoProfile -Command "(Get-ScheduledTask relay-autoseat).State"
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { \$_.CommandLine -match 'autoseat\.js' } | Select ProcessId"
+powershell -ExecutionPolicy Bypass -File tools\autoseat-install-task.ps1   # (re)install
+```
+
+`tools/autoseat-start.ps1` is the idempotent starter (**no-ops when a `node.exe` is already running `autoseat.js`**, which is what makes a 5-minute trigger a supervisor instead of a fork bomb); `tools/autoseat-start.vbs` only exists to suppress the console flash every tick would otherwise put on his desktop.
+
+- **This was added because the supervisor used to be a person remembering.** The log shows autoseat watching continuously from `2026-08-28 00:50:36` to `2026-08-29 00:32:56`, then stopping mid-stream with an **empty `.err.log`** — no crash and no stack, just a parent terminal closing and taking the process with it. Twenty minutes later a human message sat in the Flux Pavilion tab for 14+ minutes with nobody seated: the exact failure autoseat exists to prevent, reintroduced one level up the stack. **A mechanism whose own liveness depends on a human is not a fix, it is a relocation of the same bug.**
+- **The liveness check matches `node.exe` specifically, and that filter is load-bearing.** The start script's own path contains the string `autoseat`, and so does the `wscript`/`powershell` command line launching it, so a bare `CommandLine -match "autoseat"` finds *itself*, concludes autoseat is already up, and starts nothing — forever, while reporting success. A check that cannot return "no" is not a check.
+- **Known limit, by choice:** an Interactive-logon task does not run while nobody is logged on. A locked screen is fine; a logged-out box means no auto-seating until he logs in. The alternative (S4U, as `OllamaProxySupervisor` uses) runs in session 0, and nothing here has established that `claude` authenticates correctly from session 0. **Test that before switching the LogonType**; do not just change it and assume.
+
 **The trigger is `role === "user"` AND `from` in an allowlist of the human's own clients — `web`, `voice`, `voice-conversation` — and that is the whole test.** It is structural rather than a heuristic, which is what makes the dangerous loops impossible rather than merely unlikely: agent posts carry `role:"agent"`, the watchdog's own pokes carry `from:"relay-watchdog"`, and checklist settles carry `from:"checklist"`, and **none of those are on the list**. A dispatched agent therefore cannot dispatch anything by writing, and the watchdog cannot amplify itself through this. **Keep it an allowlist.** A blocklist would flip the default to *dispatch*, and every posting surface nobody remembered to exclude would become a loop.
 
 - **`voice` and `voice-conversation` were missing until 2026-08-29, and that was live harm.** He talks to relay by voice as often as by keyboard, and the test was a single equality against `"web"`, so **a tab holding a spoken message and an empty seat was a silent black hole** — no coordinator, no error, and no watchdog nag, because refusing on `from` is not a failure and raises nothing. One of his messages sat 23 minutes that way. **Adding a UI surface he can type or speak from? Add its origin to `HUMAN_ORIGINS` in the same commit.** Note this is *not* the server's `PAGE_ORIGINS`: that set includes `checklist`, and a ticked box is not an instruction.
@@ -143,7 +159,7 @@ Refused, each for its own reason: a tab whose `agent` is set and actually watche
 - **Written before the spawn, deliberately.** A crash in between loses the coordinator, not the memory that one was sent — the watchdog still alarms on that. The other order would re-dispatch every message in the file on every restart.
 - **All of a tab's pending human messages are recorded as covered, not just the one that triggered it**, because one coordinator answers the whole tab.
 - **Every dispatch writes its own child log**, and `--explain` prints every message considered with the reason it was or was not seated. A selector that only reported what it accepted could not be audited: "refused everything" and "looked at nothing" produce identical output.
-- Stop it and nothing else changes — the watchdog goes back to reporting unstaffed tabs to a router that may or may not be alive.
+- Stop it and nothing else changes — the watchdog goes back to reporting unstaffed tabs to a router that may or may not be alive. **But killing the process no longer stops it**: the `relay-autoseat` task restarts it within 5 minutes. To actually stop auto-seating, disable the task (`Disable-ScheduledTask -TaskName relay-autoseat`) and *then* kill the process; killing it alone buys you one tick.
 
 **`agent` being set is no longer, by itself, proof anyone is there.** On 2026-08-28 a coordinator (`FluxPrep`) answered a few messages, finished, and its whole process exited — `agent` stayed non-null the entire time afterward, because nothing here can observe a process exiting. For about 9 minutes, 12 human messages queued up with zero live listeners on the conversation's SSE stream, and nothing noticed: the seat looked occupied but nobody was actually holding it. This is the same failure class as "finished agents never release the chair", just without even the courtesy of an eventual `agentLeft`.
 
