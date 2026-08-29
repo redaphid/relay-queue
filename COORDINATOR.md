@@ -104,6 +104,16 @@ For container-level debugging: `docker logs -f relay-queue --since 1m 2>&1 | gre
 
 **The server backs this up itself.** If a conversation has an assigned agent and a task sits `pending` (unclaimed) for more than 2 minutes, `nudgeStalePending()` (server.js, same `WATCH_TICK_MS` tick as the deadman banner) queues one short push through the same pipeline as `notifyWatchLevel`, e.g. `"1 unclaimed 3 min in <title>"`. Re-nudges at most every few minutes while it stays unclaimed, never every tick — not a substitute for arming your own watcher, it's the backstop for when that watcher died or was never armed.
 
+### Don't build an external heartbeat. Relay already ticks on its own.
+
+**Asked on 2026-08-29 — "can Vikunja, or anything, ping relay every 5 minutes to keep it alive?" It would accomplish nothing.** Recorded so nobody builds it twice, with the measurements re-taken the day this was written:
+
+- **Relay's self-maintenance does not depend on external traffic at all.** `WATCH_TICK_MS` defaults to **15000** (`server.js:3044`), and `setInterval(pushWatch, WATCH_TICK_MS).unref()` (`server.js:8056`) runs `sweepVacantChairs()` and then `nudgeStalePending()` in sequence on every tick (`server.js:3365-3366`). A 5-minute external ping is **20x less frequent than what already happens by itself**, and would not make either function run any more or less often.
+- **Nothing here is at risk of being reaped for idleness.** The server is a plain long-lived `node server.js` process on the host, not a scale-to-zero container, so there is no "keep it warm" case either.
+- **The nearest thing to a scheduled poke already runs, and is narrower than it looks.** The `vikunja-reminders` container (`node:22-alpine`, `/app/reminders.js`, bind-mounted from `D:\projects\vikunja\reminders`) polls every `POLL_INTERVAL_SECONDS=60` and, when a reminder comes due, POSTs straight into relay `/messages` (`reminders.js:223`). But it targets **one hardcoded `RELAY_CONVERSATION_ID`** (`mtazdjld-rsrxl9`), not "whichever tab needs waking". A repeating Vikunja task buys you that cadence into that one tab, and nothing else. (Vikunja reports `"webhooks_enabled":true` on `GET /api/v1/info`; the event list itself needs an auth token to read, so treat any specific event name you have not personally confirmed as hearsay.)
+
+**The distinction the whole 2026-08-28/29 session turned on:** *keeping a live coordinator awake* and *reviving a dead one* are different problems. `Monitor` solves the first and does **nothing** for the second — it dies with the process that armed it, so a one-shot subagent that has already returned took its own watcher down with it. Reviving is what **Auto-seat** below is for, and it needs no `Monitor` at all.
+
 ## One coordinator, one tab
 
 **Every coordinator gets its own conversation, named for its purpose. Never attach a coordinator to an existing tab — including the tab where the request was raised.** Create the tab and attach the agent in the same call, so there is no ownerless window:
@@ -120,6 +130,21 @@ On 2026-08-27 a router gave every coordinator that night its own tab — Configu
 - **Name the tab for the work, not for the agent's cleverness.** The human scans this list on a phone.
 - **Prefer spawning a fresh agent over resuming one when a tab moves to new work.** Resuming replays the entire transcript — several coordinators ran past **300k tokens** on 2026-08-26/27, and a resumed agent carries all of it. Resume only when continuity genuinely matters.
 - **The server cannot enforce any of this.** It does not spawn, resume, or terminate anything (see **Conversations** on `stopRequested`). Whoever dispatches agents chooses fresh-spawn over resume; relay can only record the intent.
+
+### Before dispatching into a long existing tab, check mindmeld first
+
+Every agent sent into a tab pays the same boot tax: this file, **48 KB / ~12k tokens**, plus the whole thread it is being asked to catch up on. Three coordinators overlapped in the Flux Pavilion tab on 2026-08-29 (`FluxPrep`, `FluxPrep2`, `auto-flux-pavilion-show-abxx`) and the human asked, fairly, *"How could what we are doing possibly take 70k tokens?"* The answer in the thread was *"boot tax, paid 3 times"* — almost none of it was his to-do list.
+
+**Only take this detour for a long thread.** Re-measured on the 31-message tab that provoked it: **17,181 bytes** of JSON, **~554 bytes (~140 tokens) per message**. A thread has to run into the dozens before its own read cost rivals this file's fixed cost. **~20 messages is a starting point, not a benchmarked cutoff** — it rests on that single data point, and `GET /conversations` already returns the `messages` count you would test it against.
+
+- **Mindmeld answers plain HTTP with no auth at `http://localhost:3847`, and the route is `GET /api/search`** — bare `/search` returns 404. Required `q`; useful: `mode=text` (fastest, reads Postgres directly and needs no embeddings), `limit`, `dataClass`, `since`, `cwd`.
+- **`dataClass` defaults to `coding`, and that default is already correct here.** A relay coordinator *is* a Claude Code session on this box, indexed like any other: `source:"claude_code"`, `dataClass:"coding"`. No special filter is needed — confirmed by a live default search returning real coordinator sessions.
+- **Two gaps, so nobody over-trusts this.** (1) **No field ties a mindmeld session to a relay `conversationId`.** You search by content and infer, and one tab can be several sessions — Flux Pavilion was three, held as three unlinked records, not one history. (2) **A session that ended less than 30 minutes ago is excluded from summarization on both sides** (`mind-meld/CLAUDE.md:124`). So **this does nothing for the hot tab you are being dispatched into right now**; it helps only for a tab that has already gone quiet.
+- **If it is not indexed, or is too fresh, summarize the raw thread with local Ollama:** model **`qwen3:4b-instruct`** — note the exact tag, plain `qwen3:4b` is *not* pulled on this machine — and send it **through the gate on `:11436`, never real Ollama on `:11434`**. This adds no new dependency: mindmeld's own summarizer already runs exactly that model through exactly that gate (`SUMMARIZE_MODEL=qwen3:4b-instruct`, `OLLAMA_URL=http://host.docker.internal:11436`). **Measured 2026-08-29: HTTP 200 in 8s from cold.**
+- **Bound the call and fail open.** One stuck client can starve Ollama's single generate slot, and a resident VLM can collapse GPU work to a crawl. Time out and fall back to a raw-thread read — a summarizer that hangs is worse than one that never ran.
+- Write the result to **`data/summaries/<conversationId>.md`**. All of `data/` is gitignored already (`git check-ignore` confirms), so a generated summary can never reach git history.
+
+**One caution before adding anything else to this file.** The fix for "every agent loads 48 KB of docs" cannot itself be "write more docs." Everything here is paid for by every coordinator, forever — keep additions short, or put them somewhere an agent can choose to read rather than somewhere it must.
 
 ## Auto-seat — a tab with a message and no agent seats itself
 
