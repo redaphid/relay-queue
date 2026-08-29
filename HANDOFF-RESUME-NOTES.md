@@ -114,3 +114,72 @@ first, then `/result`, then `/relayed`. **Claimed tasks across all of relay: 0.*
 The 10 remaining `pending` are all correctly refused by autoseat and were
 audited with `--once --dry --explain`: 5 in archived tabs, 1 `from:checklist`,
 1 `from:relay-watchdog`, 4 already have coordinators dispatched.
+
+## Task 6 - COORDINATOR.md split into a skill - DONE (2026-08-29)
+
+**Progressive-disclosure split.** `COORDINATOR.md` (54,023 B on disk / 53,641 B
+LF-normalized) is now a **1,872 B stub**. The manual lives at
+`D:\projects\.claude\skills\relay-coordinator\`.
+
+**Location, and why:** coordinators are spawned with `cwd: 'D:\projects'`
+(`tools/autoseat.js:439`), so `D:\projects\.claude\skills\` is the project
+skills dir they actually see - sibling to the `hooks/coordinator-guard.js` that
+already governs them. relay-queue has no `.claude/` at all.
+
+**Byte counts (measured, not estimated):**
+
+- `SKILL.md` **27,248 B** total = 601 B frontmatter (always on) + 26,647 B body
+- `references/` **38,225 B** across **15** files (read only on demand)
+- `validate-routing.js` 4,173 B
+- stub `COORDINATOR.md` 1,872 B
+
+Always-loaded manual cost drops **53,641 -> 27,248 B (-49%)**. The measurement
+pass targeted ~21,900 B; it landed **~5.3 KB over**, and rules were NOT trimmed
+to hit the number. The overage is the routing table (2,069 B, which the target
+did not budget for) plus rule-bearing sentences kept in core against the
+governing principle "never demote a rule whose omission causes silent harm":
+the SSE keepalive/reconnect rules, the auto-seat seat-is-not-proof rule, and
+the activity-row-is-not-liveness rule.
+
+**No protocol was changed.** Every line was relocated verbatim by script
+(`data/tmp/split-coordinator-*.py`, gitignored scratch) from explicit line
+ranges, with asserted sub-line splits so a miss could not silently no-op - one
+assertion did fire and caught a wrong line number. `data/tmp/coverage-check.py`
+confirms every non-blank source line lands in the core or a reference; the only
+10 absences are the old H1, 7 section headings replaced by reference titles,
+and 2 paragraphs deliberately split across both tiers. Reproduce with
+`git show <pre-split-sha>:COORDINATOR.md`.
+
+**Three cross-references were retargeted** (they would otherwise dangle):
+"see deployment hazards below" -> `references/briefing-deploy-hazards.md`;
+"a source-change restart (see below)" -> same; "Different object from the
+section above" -> `references/checklists-in-messages.md`. Nothing else reworded.
+
+**Validator, proven red before green.** `validate-routing.js` checks ORPHAN (a
+reference with no routing row - it would never be read), DANGLING (a row
+pointing at a missing file), and BROKEN (a reference cross-referencing a file
+that does not exist). Each was made to fail on purpose and watched: orphan file
+added -> exit 1; `picks.md` renamed -> exit 1 with 2 problems; a cross-ref
+mutated (`grep -c` confirmed 2 replacements applied, not a CRLF no-op) ->
+exit 1. Restored -> exit 0.
+
+**S6 mindmeld pre-check was NOT deleted.** Demoted to
+`references/mindmeld-precheck-unexecuted.md` with a header recording that it has
+never executed: `data/summaries/` does not exist on disk and has no git history,
+and `coordinator-guard.js` refuses `curl` to `:3847` (rule `net-offrelay`,
+allowlist is port 3901 only), so its prescribed action is impossible for its
+intended reader. **Flagged for his decision** - delete, convert to briefing
+material for a guard-exempt subagent, or widen the guard.
+
+**Two things the measurement pass got wrong, both harmless:** it swapped the
+Sharing/Safety byte counts (Sharing is 509 B, Safety 876 B - both kept in core
+regardless), and it costed "S8 Scheduled Task supervision" at 9,184 B when that
+heading's span also contains the auto-seat trigger allowlist and unwatched-seat
+sweep. Only the 3,019 B that is genuinely Scheduled-Task ops became briefing
+material; the rest is `references/autoseat.md`. The same bytes left the core
+either way.
+
+**RISK, needs his call:** the manual now lives in `D:\projects\.claude\`,
+which is **not a git repository**. Git history still holds the old
+`COORDINATOR.md`, but the current authoritative copy is unversioned on a box
+that crashes. Candidate for the standing private-remote order.
