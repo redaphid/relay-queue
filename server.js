@@ -1851,6 +1851,62 @@ function agentLiveness(c) {
 }
 
 /*
+ * SEAT-UNWATCHED — an additional, faster signal alongside `state` above,
+ * feeding autoseat.js independently of whether `agent` is null.
+ *
+ * THE GAP THIS CLOSES. `agent` records who was TOLD to answer here, not
+ * whether their process is still running. A coordinator (`FluxPrep`, in the
+ * incident that motivated this) can finish or crash while its name stays on
+ * the seat forever — nothing here ever unset it on exit, because nothing here
+ * can observe a process exiting. autoseat.js's existing trigger is `agent ===
+ * null`, so a seat like that reads as staffed indefinitely: 12 messages queued
+ * for 9 minutes with zero live listeners, and nothing noticed.
+ *
+ * WHY NOT JUST "listeners === 0". A momentary zero is the normal case, not the
+ * fault one — a coordinator mid-tool-call (reading a file, running a
+ * subagent, thinking) has no open SSE connection at that instant, and the
+ * server restarting on its own source change (see the deployment-hazards
+ * section of COORDINATOR.md) drops every open stream on purpose. Firing on a
+ * bare zero would thrash: reseat, the real coordinator's reconnect loop comes
+ * back a moment later, two coordinators in one tab — the exact "worst outcome"
+ * autoseat.js's own re-read-before-spawn guard exists to avoid.
+ *
+ * So this asks the same question sweepVacantChairs asks — "is there ANY
+ * evidence of life, and has ALL of it gone quiet" — via the shared
+ * evidenceOfLifeMs(), just on SEAT_UNWATCHED_MS's much shorter clock (2 minutes
+ * by default, deliberately aligned with NUDGE_PENDING_MS) instead of
+ * CHAIR_VACANT_MS's 45. Folding the SSE-listener signal into the SAME max()
+ * as heartbeat/lastActedAt/lastProgressAt — rather than testing it alone —
+ * is what keeps a coordinator that is genuinely heads-down on a different,
+ * already-claimed task (posting progress notes, just not holding a stream)
+ * from being duplicated on top of: `lastProgressAt` alone already vouches for
+ * it here, exactly as it does for `state: 'working'` above.
+ *
+ * Gated on `counts.pending > 0` for the same reason autoseat.js only ever
+ * looks at tabs with an unanswered message: a quiet, caught-up tab with no
+ * listener is not a fault, it is Tuesday.
+ */
+function seatWatchInfo(c) {
+  const now = Date.now();
+  const w = convListeners.get(c.id);
+  const listeners = w ? w.count : 0;
+  const base = { listeners };
+  // No agent to be missing, or a stop is already in progress (same exemption
+  // sweepVacantChairs makes — do not race or second-guess a stop underway).
+  if (!c.agent || c.stopRequested || c.stopAck) return { ...base, unwatchedForSec: 0, seatUnwatched: false };
+  const pending = (c.counts && c.counts.pending) || 0;
+  if (pending <= 0) return { ...base, unwatchedForSec: 0, seatUnwatched: false };
+
+  // "Currently has a listener" is the freshest possible evidence (now); a past
+  // listener that has since dropped to zero contributes the moment it did.
+  const listenerEvidenceMs = listeners > 0 ? now : (w && w.zeroSinceMs) || 0;
+  const lastLife = evidenceOfLifeMs(c, listenerEvidenceMs);
+  const unwatchedForSec = lastLife ? Math.max(0, Math.round((now - lastLife) / 1000)) : 0;
+  const seatUnwatched = !!lastLife && (now - lastLife) >= SEAT_UNWATCHED_MS;
+  return { ...base, unwatchedForSec, seatUnwatched };
+}
+
+/*
  * THE LIFECYCLE VALUE — one field, and the only one a badge should switch on.
  *
  * Liveness (is it there?) and stopping (has it been asked to go?) are two
@@ -1922,12 +1978,14 @@ function stopStateOf(c) {
 function agentLifecycle(c) {
   const live = agentLiveness(c);
   const stop = stopStateOf(c);
+  const seat = seatWatchInfo(c);
   const lifecycle = stop.phase === 'stopped' ? 'stopped'
     : stop.phase === 'stopping' ? 'stopping'
       : stop.phase === 'requested' ? 'stop-requested'
         : live.state;
   return {
     ...live,
+    ...seat,
     lifecycle,
     stop,
     /*
@@ -1977,6 +2035,33 @@ function activitySummary(id) {
 // (GET /events with no query param, unchanged from before this existed).
 const streams = new Set();
 const MAX_STREAMS = 50;
+/*
+ * LIVE SSE SUBSCRIBER COUNT, PER CONVERSATION. What tells sweepVacantChairs's
+ * fast-path cousin (seatWatchInfo, below) that a seat with a name on it has
+ * nobody actually reading its stream right now — the gap the "FluxPrep" incident
+ * exposed: a coordinator's process exited, `agent` stayed non-null, and nothing
+ * server-side ever asked "but is anyone subscribed".
+ *
+ * Deliberately keyed on the SCOPED conversationId only — a firehose connection
+ * (`conv === null`, e.g. relay-watchdog) is not "watching" any one conversation
+ * and must never be counted as if it were, or every conversation would read
+ * `count >= 1` forever the moment the firehose watcher is up, and the signal
+ * this exists to provide would never fire.
+ *
+ * `zeroSinceMs` is the moment count last dropped to zero — not "since server
+ * boot", so a conversation that has simply never had a listener does not read
+ * as "vacant since epoch". It is combined with other evidence of life
+ * (heartbeat, lastActedAt, lastProgressAt, agentSince) in seatWatchInfo()
+ * rather than trusted alone, for the same reason CHAIR_VACANT_MS's sweep takes
+ * the most generous reading across several weak signals: a momentary zero here
+ * is normal (an agent between tool calls, a reconnect gap after a source-change
+ * restart) and must not by itself look like death.
+ *
+ * Never evicted for a conversation that stops existing — negligible footprint
+ * for a queue with, at most, a few hundred conversations over its lifetime, and
+ * simpler than chasing archival/deletion events that do not reliably fire.
+ */
+const convListeners = new Map(); // conversationId -> { count, zeroSinceMs }
 const SSE_PING_MS = 25000; // under the ~100 s idle timeout proxies typically use
 const SSE_RETRY_MS = 3000; // client reconnect delay
 
@@ -2058,6 +2143,14 @@ function sseRoute(req, res, q, opts) {
   res.write(`: connected ${nowIso()}\n\n`);
   const conn = { res, conv };
   streams.add(conn);
+  // Scoped connections only — see the comment on convListeners above for why a
+  // firehose connection (conv === null) must never bump a specific
+  // conversation's count.
+  if (conv !== null) {
+    let w = convListeners.get(conv);
+    if (!w) { w = { count: 0, zeroSinceMs: null }; convListeners.set(conv, w); }
+    w.count++;
+  }
   // A page opening into an already-stranded state must see it immediately, not
   // on the next tick. Reconnects land here too, so a dropped stream self-heals.
   // Only for an unscoped connection: the watch snapshot is global health, not
@@ -2074,7 +2167,17 @@ function sseRoute(req, res, q, opts) {
     try { res.write(': ping\n\n'); } catch { /* closing */ }
   }, SSE_PING_MS);
   if (ping.unref) ping.unref(); // never hold shutdown open
-  const done = () => { clearInterval(ping); streams.delete(conn); };
+  const done = () => {
+    clearInterval(ping);
+    streams.delete(conn);
+    if (conv !== null) {
+      const w = convListeners.get(conv);
+      if (w) {
+        w.count = Math.max(0, w.count - 1);
+        if (w.count === 0) w.zeroSinceMs = Date.now();
+      }
+    }
+  };
   req.on('close', done);
   res.on('close', done);
   res.on('error', done);
@@ -2458,6 +2561,24 @@ const STUCK_ALARM_MS = Number(process.env.STUCK_ALARM_MS || 60 * 60 * 1000);
  * reason).
  */
 const NUDGE_PENDING_MS = Number(process.env.NUDGE_PENDING_MS || 2 * 60 * 1000);
+/*
+ * THE FAST VACANCY CHECK. CHAIR_VACANT_MS (45 min, below) is a sweep for "has
+ * whoever is sitting here gone for good" — deliberately slow, because
+ * unassigning a live coordinator is expensive to be wrong about. This is a
+ * different question, asked on a much shorter clock: "is a message piling up
+ * RIGHT NOW with nobody actually reading this conversation's stream", which is
+ * exactly the shape of the incident that motivated it — a coordinator's
+ * process exited, `agent` stayed non-null, and the 45-minute sweep was much too
+ * slow to be the thing that caught it.
+ *
+ * Deliberately reuses NUDGE_PENDING_MS rather than inventing a third unrelated
+ * magnitude: that constant already encodes "how long a pending message must
+ * wait before it's worth acting on, tuned to survive normal claim latency
+ * without crying wolf" (see the comment above it), which is precisely the
+ * grace period this needs too. Independently overridable, in case the two
+ * ever need to diverge — but they start aligned on purpose, not by accident.
+ */
+const SEAT_UNWATCHED_MS = Number(process.env.SEAT_UNWATCHED_MS || NUDGE_PENDING_MS);
 // Once a stale task has been nudged, don't repeat it every 15s tick forever —
 // that is exactly the "token wasteful" spam this was built to avoid. Re-nudge
 // only if it is STILL the oldest unclaimed task after this long.
@@ -3100,6 +3221,53 @@ function routeLiveness(category, text, conversationId, taskId, escalates = true)
  * gone has already stopped counting as staffed by the time stalePending() is
  * asked about it.
  */
+/*
+ * THE MOST RECENT MOMENT THERE IS ANY EVIDENCE OF LIFE. Shared by
+ * sweepVacantChairs (45-minute horizon, below) and seatWatchInfo (2-minute
+ * horizon — see SEAT_UNWATCHED_MS) — same "take the most generous reading,
+ * require every signal silent" shape, just asked on two different clocks for
+ * two different questions ("is anyone EVER coming back" vs "is anyone
+ * answering RIGHT NOW"). Extracted so the two cannot quietly drift apart on
+ * what counts as evidence.
+ *
+ * Every kind of evidence that anyone is home, weakest included. A heartbeat is
+ * a weak signal and this file says so everywhere — but the cost of being wrong
+ * here is unassigning (or duplicating) a live agent, so take the most generous
+ * reading and require all of them silent.
+ *
+ * `agentSince` belongs in here even though it is not evidence of life, and it
+ * is the difference between measuring the OCCUPANT's silence and the TAB's.
+ * Every other term describes the tab, so on a tab that has been quiet for an
+ * hour they are all already expired at the instant a new agent is seated —
+ * and since appendEvent() ends in pushWatch(), which calls sweepVacantChairs,
+ * the eviction happened inside the very request that did the seating. The
+ * attach returned HTTP 200 with `agent: null` in the body, which is how it
+ * went unexplained for a while: every observation said it had worked.
+ *
+ * With it, a new occupant starts a fresh clock, which is what CHAIR_VACANT_MS
+ * (and SEAT_UNWATCHED_MS) already promise. It does not weaken either check:
+ * the clock still only ever runs from a real event, and an agent that is
+ * seated and then never shows up is still caught on schedule — just measured
+ * from when they arrived rather than from something the last occupant did.
+ *
+ * `extraSignalMs`, when given, is one more piece of evidence folded into the
+ * same max() — seatWatchInfo passes the SSE-listener signal here rather than
+ * this function reaching for convListeners itself, so sweepVacantChairs stays
+ * exactly as it was (byte-for-byte the same evidence set) unless a caller
+ * deliberately opts in.
+ */
+function evidenceOfLifeMs(c, extraSignalMs) {
+  const beat = HEARTBEATS.get(c.agent);
+  const seenAt = beat ? msOf(beat.at) : 0;
+  const signals = [msOf(c.lastActedAt), msOf(c.lastProgressAt), seenAt, msOf(c.agentSince)];
+  if (extraSignalMs) signals.push(extraSignalMs);
+  // Never acted at all? Then the clock runs from when it was given the tab, so
+  // an agent that was assigned and never showed up is still caught. (Conversations
+  // recorded before `agentSince` existed have none, and fall back to this
+  // exactly as they always did.)
+  return Math.max(...signals) || msOf(c.createdAt);
+}
+
 function sweepVacantChairs() {
   if (notifyDepth > 0) return;
   const now = Date.now();
@@ -3117,37 +3285,7 @@ function sweepVacantChairs() {
     // not race a stop that is already under way, or answer it on the agent's
     // behalf — "asked to stop and never answered" is a report someone wants.
     if (c.stopRequested || c.stopAck) continue;
-    /*
-     * Every kind of evidence that anyone is home, weakest included. A heartbeat
-     * is a weak signal and this file says so everywhere — but for the ONLY
-     * question asked here, "is this chair occupied", weak evidence of presence
-     * is still evidence, and the cost of being wrong is unassigning a live
-     * agent. So take the most generous reading and require all of them silent.
-     */
-    const beat = HEARTBEATS.get(c.agent);
-    const seenAt = beat ? msOf(beat.at) : 0;
-    /*
-     * `agentSince` belongs in here even though it is not evidence of life, and
-     * it is the difference between measuring the OCCUPANT's silence and the
-     * TAB's. Every other term describes the tab, so on a tab that has been
-     * quiet for an hour they are all already expired at the instant a new agent
-     * is seated — and since appendEvent() ends in pushWatch(), which calls this
-     * sweep, the eviction happened inside the very request that did the seating.
-     * The attach returned HTTP 200 with `agent: null` in the body, which is how
-     * it went unexplained for a while: every observation said it had worked.
-     *
-     * With it, a new occupant starts a fresh CHAIR_VACANT_MS clock, which is
-     * what the constant already promises. It does not weaken the sweep: the
-     * clock still only ever runs from a real event, and an agent that is seated
-     * and then never shows up is still vacated on schedule — just measured from
-     * when they arrived rather than from something the last occupant did.
-     */
-    const lastLife = Math.max(msOf(c.lastActedAt), msOf(c.lastProgressAt), seenAt, msOf(c.agentSince))
-      // Never acted at all? Then the clock runs from when it was given the tab,
-      // so an agent that was assigned and never showed up is still swept.
-      // (Conversations recorded before `agentSince` existed have none, and fall
-      // back to this exactly as they always did.)
-      || msOf(c.createdAt);
+    const lastLife = evidenceOfLifeMs(c);
     if (!lastLife || now - lastLife < CHAIR_VACANT_MS) continue;
 
     const who = c.agent;

@@ -43,6 +43,15 @@ const ago = (sec) => new Date(NOW - sec * 1000).toISOString();
 const conversations = [
   { id: 'c-seat', title: 'Seat me', agent: null, archived: false, stopAck: null },
   { id: 'c-staffed', title: 'Staffed', agent: 'live-coord', archived: false, stopAck: null },
+  /*
+   * Occupied by a name, but the server itself says nobody is listening
+   * (SEAT_UNWATCHED_MS elapsed with zero SSE subscribers - see seatWatchInfo()
+   * in server.js). This is the "FluxPrep" shape: a coordinator's process
+   * exited, `agent` never changed, and only agentState.seatUnwatched can tell
+   * the two apart from `conv.agent` alone.
+   */
+  { id: 'c-unwatched', title: 'Staffed but unwatched', agent: 'DeadCoord', archived: false, stopAck: null,
+    agentState: { seatUnwatched: true, unwatchedForSec: 300, listeners: 0 } },
   { id: 'c-archived', title: 'Archived', agent: null, archived: true, stopAck: null },
   { id: 'c-stopped', title: 'Stopped', agent: null, archived: false, stopAck: 'stopped' },
   { id: 'c-ignored', title: 'Ignored', agent: null, archived: false, stopAck: null },
@@ -58,6 +67,7 @@ const conversations = [
 const tasks = [
   { id: 't-seat', conversationId: 'c-seat', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-staffed', conversationId: 'c-staffed', role: 'user', from: 'web', ts: ago(120) },
+  { id: 't-unwatched', conversationId: 'c-unwatched', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-archived', conversationId: 'c-archived', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-stopped', conversationId: 'c-stopped', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-ignored', conversationId: 'c-ignored', role: 'user', from: 'web', ts: ago(120) },
@@ -114,6 +124,36 @@ function check(mod) {
   ok(seated.includes('t-two-a'), 'the OLDER of two waiting messages was not the one that seated');
 
   ok(seated.length === 2, `expected exactly 2 dispatches, got ${seated.length}: ${seated.join(',')}`);
+
+  /*
+   * t-unwatched is a REAL, otherwise-eligible candidate at the same age as
+   * t-seat, so under the default cap (3, with one slot already held by
+   * c-inflight) it is legitimately cap-refused here — proof it is competing
+   * on equal footing with every other candidate, not silently exempted from
+   * the cap. Its actual rescue is asserted below under a raised cap, the same
+   * way `roomy` isolates the one-per-tab guard from the cap guard.
+   */
+  ok(refused('t-unwatched'), 'an occupied-but-unwatched seat should still be subject to the concurrency cap like any other candidate');
+
+  /*
+   * THE FLUXPREP CASE. A seat with a name on it, but the server itself says
+   * nobody is subscribed to its SSE stream (agentState.seatUnwatched, folded
+   * in with a grace window and every other liveness signal server-side - see
+   * seatWatchInfo() in server.js). `conv.agent` being non-null must no longer
+   * be an unconditional refusal, or this exact incident recurs: a coordinator
+   * exits, its name never leaves the seat, and nothing ever answers the human
+   * again. Cap raised out of the way, same isolation `roomy` uses above.
+   */
+  const unwatchedRun = run(mod, { maxConcurrent: 99, inFlight: new Set() });
+  const unwatchedWhy = Object.fromEntries(unwatchedRun.considered.map((r) => [r.taskId, r.why]));
+  ok(unwatchedRun.chosen.some((c) => c.taskId === 't-unwatched'),
+    'a seat occupied by a name but flagged agentState.seatUnwatched was NOT rescued - this is the FluxPrep gap');
+  ok(/DeadCoord/.test(unwatchedWhy['t-unwatched'] || '') && /unwatched/.test(unwatchedWhy['t-unwatched'] || ''),
+    `the reason for seating t-unwatched should name the stale coordinator and say why it was rescued: ${unwatchedWhy['t-unwatched']}`);
+  // The negative control in the SAME run: a genuinely staffed seat (no
+  // agentState.seatUnwatched at all) must still be refused, cap or no cap.
+  ok(!unwatchedRun.chosen.some((c) => c.taskId === 't-staffed'),
+    'a genuinely staffed seat was seated once the cap was raised - it must be refused on its own merits, not just by the cap');
 
   /*
    * The same one-per-tab rule again, but with the cap raised out of the way.
@@ -204,7 +244,14 @@ function loadMutant(find, replace) {
 const MUTATIONS = [
   ['the human-vs-agent test', "if (t.role !== 'user')", 'if (false)'],
   ['the human-client test', 'if (t.from !== HUMAN_FROM)', 'if (false)'],
-  ['the occupied-seat test', 'if (conv.agent)', 'if (false)'],
+  ['the occupied-seat test', 'if (conv.agent && !unwatched)', 'if (false)'],
+  /*
+   * THE FLUXPREP REGRESSION, REPRODUCED ON PURPOSE. Reverting to the OLD,
+   * pre-fix guard (`if (conv.agent)`, with no seatUnwatched override at all)
+   * must make t-unwatched go unseated again - if it didn't, the override was
+   * never the thing doing the work.
+   */
+  ['the seat-unwatched override', 'if (conv.agent && !unwatched)', 'if (conv.agent)'],
   ['the archived test', 'if (conv.archived)', 'if (false)'],
   ['the stopped test', "if (conv.stopAck === 'stopped')", 'if (false)'],
   ['the ignore list', 'if (ignore.has(cid))', 'if (false)'],
