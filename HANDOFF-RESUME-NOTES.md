@@ -258,3 +258,68 @@ mid-recovery: it identified the wedged process and then did nothing about it.
 A worse bug than the one being fixed, found only by running it. Logging is now
 best-effort and happens after the kill, and the supervisor refuses to start a
 second dispatcher if the kill did not take.
+
+## Task 7 - the protocol and the guard moved INTO this repo - DONE (2026-08-29)
+
+Commits `c0c5fa5`, `9fc21bc`, `c10f8b6` here, plus `9aab23b` in the
+`D:\projects\.claude` repo. **This supersedes Task 6's note above**, which says
+the manual lives in `D:\projects\.claude\` and flags that as a risk needing his
+call. He made the call: move it here.
+
+**Moved** into `D:\projects\relay-queue\.claude\`:
+
+- `skills/relay-coordinator/` - `SKILL.md`, 15 `references/*.md`, `validate-routing.js`
+- `hooks/coordinator-guard.js` + its two `.bak` rollback copies
+- `settings.json` registering the guard at its NEW path, and `settings.json.bak-pre-default-deny`
+
+**Rewired:** the autoseat spawn cwd (now `D:\projects\relay-queue`),
+`D:\projects\CLAUDE.md`, this repo's `COORDINATOR.md` stub, all 16 in-skill
+absolute paths, and the guard's own log/marker paths (now `__dirname`-relative,
+so a future move cannot leave the guard running in one place while writing its
+audit trail to another). The old `D:\projects\.claude\settings.json` was
+DELETED, not emptied.
+
+### The two couplings, and why they are now tested
+
+Claude Code discovers `.claude/skills/` and loads `.claude/settings.json` **only
+for the directory a session is rooted in**. So the spawn cwd is what makes the
+protocol visible AND what registers the guard. Split them and the coordinator
+boots with no manual and no guard, default-DENY silently becomes default-ALLOW,
+and **nothing errors**.
+
+`tools/autoseat-selftest.js` now asserts the default cwd actually contains
+`SKILL.md` and a `settings.json` naming `coordinator-guard.js`. Proven red:
+hide the registration and it exits 1 naming the missing file; restore it, 0.
+
+### Proof the guard still fires and still DENIES
+
+Not "the file exists" - a real headless `claude -p` session rooted at
+`D:\projects\relay-queue` was told to run `docker ps --filter
+name=guardproof-20260829`. It was **BLOCKED under rule `docker`**, and
+`.claude/coordinator-violations.log` went 177 -> 178 lines with exactly that
+marker. One line, not two, which is also the evidence it is not registered
+twice. Only one `settings.json` on this box names the guard.
+
+**Limit of that proof:** an autoseat-*spawned* coordinator was not observed
+booting end to end, because that means seating a real tab and posting into
+relay at night. The selftest covers the seating logic and the cwd invariant;
+the live process was restarted (PID 41664) and its heartbeat ticks.
+
+### Residual risk, needs his call
+
+A session started by hand in `D:\projects` now has **no guard** - the
+registration went with the files. Coordinators come from autoseat, which starts
+them in `relay-queue`, so the intended path is covered. If he ever runs a
+coordinator manually from `D:\projects`, it is unguarded. Re-adding a
+registration there pointing at the new path would close it; it was not done
+because removing it was an explicit instruction.
+
+### A trap worth recording
+
+`relay-queue/.gitignore` excluded `.claude/` outright. Moving the files in
+without changing that would have left the entire protocol and the security
+control **untracked** - present, working, and silently unversioned, which is the
+exact failure the move was meant to end. Now a targeted allowlist, verified with
+`git check-ignore` in both directions. Also pinned `.claude/** text eol=lf` in
+`.gitattributes`; this repo does not pin `core.autocrlf=false` the way the old
+one did, so the files would have been rewritten to CRLF on next checkout.
