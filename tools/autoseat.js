@@ -71,6 +71,37 @@ const DEFAULT_QUEUE = 'http://127.0.0.1:3901';
 const DEFAULT_STATE = path.join(os.homedir(), '.relay-autoseat', 'state.json');
 
 /*
+ * PROOF OF LIFE, written every completed poll.
+ *
+ * The supervisor (tools/autoseat-start.ps1) used to decide "is autoseat up?"
+ * by asking whether a node.exe with autoseat.js in its command line exists.
+ * That check cannot fail for a process that is running but no longer working,
+ * which is the failure it most needs to catch.
+ *
+ * Nothing else here could stand in for it, which is the point:
+ *
+ *   - THE LOG CANNOT. `nothing to seat` is deliberately printed only when the
+ *     text CHANGES (see the note at the quiet branch below), so a healthy
+ *     autoseat with a steady queue writes nothing for hours by design. On
+ *     2026-08-29 that produced a 16.7-hour silence that was investigated as a
+ *     hang and was not one - the process was polling correctly the whole time,
+ *     and settling that took TCP-socket forensics because no artifact on disk
+ *     could tell "idle and fine" from "wedged". Log silence is not evidence.
+ *
+ *   - state.json CANNOT. It is written only when a coordinator is dispatched,
+ *     so it is untouched for days at a time during normal operation.
+ *
+ * So the heartbeat is a separate file that means one specific thing: a poll
+ * ran to completion this recently. It is deliberately NOT written at the top
+ * of a tick. setInterval keeps firing even while an earlier tick is stuck
+ * awaiting a hung fetch, so a heartbeat stamped on entry would keep reading
+ * fresh while no poll ever finished - a green light for the exact fault it is
+ * meant to expose. It is written when a tick RESOLVES, so a wedged fetch
+ * starves it and the supervisor sees the staleness.
+ */
+const DEFAULT_HEARTBEAT = path.join(os.homedir(), '.relay-autoseat', 'heartbeat.json');
+
+/*
  * The human's own clients - the surfaces HE posts from, and nothing else.
  *
  * THIS IS AN ALLOWLIST ON PURPOSE. KEEP IT ONE. The loop-safety property of
@@ -297,6 +328,35 @@ function saveState(file, state) {
   fs.renameSync(tmp, file);
 }
 
+/*
+ * Same tmp-and-rename as saveState, for the same reason: the supervisor reads
+ * this file on a timer, and a half-written one would parse as "no heartbeat",
+ * which is the restart signal. A torn read must never be able to order a kill.
+ *
+ * The pid is part of the record, not decoration. Without it a `--once` run
+ * (mine, a selftest's, anyone debugging by hand) would refresh the file and
+ * vouch for a daemon that had actually died - so the supervisor cross-checks
+ * that the heartbeat was written by a process that is still alive. `--once`
+ * does not write one at all, which closes the same hole from the other side.
+ */
+function writeHeartbeat(file, outcome) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({
+      pid: process.pid,
+      ts: new Date().toISOString(),
+      outcome: outcome || 'ok',
+    }, null, 1));
+    fs.renameSync(tmp, file);
+  } catch {
+    /* A heartbeat that cannot be written must not take the dispatcher down
+     * with it. The supervisor will read it as stale and restart, which is a
+     * survivable outcome; throwing here would turn a full disk into a dead
+     * dispatcher, which is not. */
+  }
+}
+
 function stamp() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 
 // -------------------------------------------------------------------- run
@@ -309,6 +369,16 @@ async function tick(cfg, runtime) {
     convs = (await getJson(cfg.queue, '/conversations?archived=1')).conversations || [];
   } catch (e) {
     log(`queue unreachable: ${e.message}`);
+    /*
+     * This still counts as a completed poll. autoseat asked, got a definite
+     * answer, and reported it - the loop is turning and the code is working.
+     * Withholding the heartbeat here would make a relay outage look like an
+     * autoseat wedge and restart this process every 5 minutes for as long as
+     * relay stayed down, which cannot fix relay and would destroy the run
+     * history that a relay outage most needs. The outcome is recorded so the
+     * distinction is legible in the file itself.
+     */
+    runtime.lastOutcome = `queue unreachable: ${e.message}`;
     return;
   }
 
@@ -342,6 +412,7 @@ async function tick(cfg, runtime) {
      */
     const quiet = `nothing to seat (${considered.length} pending message(s) considered)`;
     if (!cfg.explain && quiet !== runtime.lastQuiet) { log(quiet); runtime.lastQuiet = quiet; }
+    runtime.lastOutcome = `idle, ${considered.length} considered`;
     return;
   }
   runtime.lastQuiet = null;
@@ -425,6 +496,7 @@ async function tick(cfg, runtime) {
       log(`DISPATCH ERROR ${agent}: ${e.message}`);
     });
   }
+  runtime.lastOutcome = `seated ${chosen.length}`;
 }
 
 function parseArgs(argv) {
@@ -434,6 +506,7 @@ function parseArgs(argv) {
     graceMs: 20000,
     maxConcurrent: 3,
     stateFile: DEFAULT_STATE,
+    heartbeatFile: DEFAULT_HEARTBEAT,
     logDir: path.join(path.dirname(DEFAULT_STATE), 'logs'),
     claude: process.env.AUTOSEAT_CLAUDE || path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
     cwd: 'D:\\projects',
@@ -451,6 +524,7 @@ function parseArgs(argv) {
     else if (a === '--grace') cfg.graceMs = Number(next()) * 1000;
     else if (a === '--max-concurrent') cfg.maxConcurrent = Number(next());
     else if (a === '--state') cfg.stateFile = next();
+    else if (a === '--heartbeat') cfg.heartbeatFile = next();
     else if (a === '--log-dir') cfg.logDir = next();
     else if (a === '--claude') cfg.claude = next();
     else if (a === '--cwd') cfg.cwd = next();
@@ -474,6 +548,7 @@ const USAGE = `autoseat - dispatch a coordinator into a tab that has a human mes
   --grace SEC          seconds a message must wait before seating (default 20)
   --max-concurrent N   most coordinators dispatched at once (default 3)
   --state FILE         dispatch memory (default ${DEFAULT_STATE})
+  --heartbeat FILE     proof-of-life for the supervisor (default ${DEFAULT_HEARTBEAT})
   --log-dir DIR        per-dispatch child logs
   --claude PATH        the claude executable
   --cwd DIR            working directory for the coordinator (default D:\\projects)
@@ -490,7 +565,7 @@ async function main() {
   if (cfg.help) { console.log(USAGE); return; }
 
   const log = (m) => console.log(`${stamp()}  ${m}`);
-  const runtime = { state: loadState(cfg.stateFile), inFlight: new Set(), log };
+  const runtime = { state: loadState(cfg.stateFile), inFlight: new Set(), log, lastOutcome: 'starting' };
 
   log(`autoseat watching ${cfg.queue} every ${cfg.intervalMs / 1000}s; grace ${cfg.graceMs / 1000}s, `
     + `cap ${cfg.maxConcurrent}, ${Object.keys(runtime.state.dispatched).length} message(s) already dispatched`
@@ -502,12 +577,26 @@ async function main() {
    * exits on one bad poll is a dispatcher that is not running the next time it
    * is needed - the exact failure mode of the router it replaces.
    */
-  const safeTick = () => tick(cfg, runtime).catch((e) => log(`tick failed: ${e.message}`));
+  /*
+   * A tick that THREW deliberately does not beat. The catch keeps the watcher
+   * alive (see above), but an unexpected fault every poll is not a working
+   * dispatcher, and letting the heartbeat go stale hands the supervisor the
+   * one remedy that might clear it: a fresh process. Only a tick that RAN TO
+   * COMPLETION - seated, idle, or cleanly reporting relay unreachable - is
+   * allowed to vouch for this process.
+   */
+  const beat = () => { if (!cfg.once) writeHeartbeat(cfg.heartbeatFile, runtime.lastOutcome); };
+  const safeTick = () => tick(cfg, runtime).then(beat, (e) => log(`tick failed: ${e.message}`));
+
+  /* Stamp one before the first poll, so a just-started autoseat is never
+   * mistaken for a wedged one during the seconds its first tick takes. */
+  beat();
+
   await safeTick();
   if (cfg.once) return; /* a spawned child keeps running; we just stop deciding */
   setInterval(safeTick, cfg.intervalMs);
 }
 
-module.exports = { selectSeats, coveredBy, agentName, brief, HUMAN_ORIGINS };
+module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, HUMAN_ORIGINS };
 
 if (require.main === module) main();
