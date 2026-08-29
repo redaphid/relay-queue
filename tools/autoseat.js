@@ -296,8 +296,32 @@ function brief(o) {
 
 // --------------------------------------------------------------------- io
 
+/*
+ * EVERY POLL IS BOUNDED. `fetch` has no default overall timeout - undici's
+ * headers/body timeouts are 300s each, so a relay that accepts a connection
+ * and then goes quiet parks a tick for five minutes, and a proxy or a
+ * half-open socket can park it far longer. setInterval keeps firing behind it,
+ * so the visible symptom is not an error but an autoseat that is alive,
+ * responding, and quietly doing nothing.
+ *
+ * 8s is chosen against the observed workload, not by feel: both routes are
+ * local (127.0.0.1) reads that normally answer in single-digit milliseconds,
+ * so 8s is ~1000x the expected cost - it cannot fire on a slow-but-working
+ * relay, and it converts an indefinite hang into an ordinary handled error
+ * that the next tick retries 10s later.
+ *
+ * This is belt AND braces with the heartbeat, deliberately. The timeout stops
+ * the most likely hang from happening; the heartbeat catches the hangs nobody
+ * predicted. Neither replaces the other - a timeout only bounds the waits it
+ * was wrapped around, and the failure worth guarding is the one not thought of.
+ */
+const FETCH_TIMEOUT_MS = 8000;
+
 async function getJson(base, route) {
-  const r = await fetch(base + route, { headers: { accept: 'application/json' } });
+  const r = await fetch(base + route, {
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (!r.ok) throw new Error(`GET ${route} -> ${r.status}`);
   return r.json();
 }
