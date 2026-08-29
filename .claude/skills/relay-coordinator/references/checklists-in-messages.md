@@ -17,4 +17,4 @@ Any `- [ ]` / `- [x]` in a message or result body renders as real, tickable chec
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

@@ -7,4 +7,4 @@ Read when: you need to open an image that came back on a thread entry.
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

@@ -8,4 +8,4 @@ This exists because it used to return **`200` with the full conversation object 
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

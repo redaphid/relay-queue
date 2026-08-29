@@ -40,4 +40,4 @@ Every agent sent into a tab pays the same boot tax: this file, **48 KB / ~12k to
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

@@ -29,4 +29,4 @@ For container-level debugging: `docker logs -f relay-queue --since 1m 2>&1 | gre
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

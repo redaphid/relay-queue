@@ -18,4 +18,4 @@ A `channel` message lands as `role:agent, status:done` — a statement, not a re
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

@@ -21,4 +21,4 @@ A flat 1-credit-per-feature economy: a "Chores" coordinator awards credits at it
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

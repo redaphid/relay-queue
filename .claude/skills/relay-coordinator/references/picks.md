@@ -13,4 +13,4 @@ Same id/settle mechanics as checklists (`from:"picks"` instead).
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.

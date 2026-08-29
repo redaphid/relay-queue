@@ -7,8 +7,8 @@ description: >-
   about to post, claim, answer, progress or mark-relayed anything on relay -
   messages, tasks, conversations, seats, checklists, picks, images, credits or
   activity rows. Also use before briefing a subagent that will touch relay or
-  the relay-queue repo, and whenever D:\projects\relay-queue\COORDINATOR.md
-  points here.
+  the relay-queue repo, and whenever the relay-queue COORDINATOR.md stub points
+  here.
 ---
 
 # relay-queue - coordinator manual (core)
@@ -16,7 +16,7 @@ description: >-
 API and operating mechanics for relay-queue only. This file does not cover
 Hue/voice/harness behavior, human-communication style, or general agent
 workflow philosophy — those live in the CLAUDE.md of whatever project you're
-actually working (e.g. `D:\mechs\<harness>\CLAUDE.md`), not here.
+actually working, not here.
 
 Base URL: `http://127.0.0.1:3901`. No auth of its own — see **Safety** below.
 
@@ -27,14 +27,14 @@ matters, it is here, not there.
 
 `Read`, `Grep` and `Glob` are unrestricted by the coordinator guard, so an
 on-demand reference read always works. Reference paths below are relative to
-this file: `D:\projects\relay-queue\.claude\skills\relay-coordinator\`.
+this file.
 
 ## Routing - read a reference only when its trigger fires
 
 | If you are about to... | read |
 |---|---|
 | deploy, merge, bisect, do git archaeology, delete a worktree, or touch `node_modules` in relay-queue | `references/briefing-deploy-hazards.md` **(brief a subagent; you cannot run it)** |
-| check, install, restart or disable the `relay-autoseat` Scheduled Task | `references/briefing-autoseat-task.md` **(brief a subagent; you cannot run it)** |
+| hit a Windows-only mechanic - mangled body bytes, a `.ps1`, the `relay-autoseat` Scheduled Task, an NTFS junction, a CRLF no-op | `references/windows-legacy.md` **(LEGACY - Windows only)** |
 | edit `tools/autoseat.js`, add a UI surface he types or speaks from, or work out why a tab was or was not seated | `references/autoseat.md` |
 | need the unscoped firehose on purpose, cut 4x duplicate wakeups on a busy tab, work on a build with no `?conversation=`, or read container logs | `references/events-sse.md` |
 | answer "can something ping relay every N minutes to keep it alive?", or wonder why `Monitor` will not revive a dead coordinator | `references/heartbeat-decision.md` |
@@ -127,7 +127,7 @@ On 2026-08-27 a router gave every coordinator that night its own tab — Configu
 
 **`agent` being set is no longer, by itself, proof anyone is there.** A seat can look occupied with nobody holding it, so read `pending` and the seat-release fields, never the bare `agent` name, before concluding a tab is staffed.
 
-Trigger allowlist, refusal reasons, dedupe-on-identity and the unwatched-seat sweep: `references/autoseat.md`. Supervision of the process itself: `references/briefing-autoseat-task.md`.
+Trigger allowlist, refusal reasons, dedupe-on-identity and the unwatched-seat sweep: `references/autoseat.md`. Supervision of the host process: `references/windows-legacy.md`.
 
 ## Watch, don't poll
 
@@ -202,8 +202,9 @@ Firehose, redundant-wake filtering, older builds, container logs and the server'
 - No bulk-cancel/bulk-close route exists. Every pending task is answered individually.
 - `progress` doesn't consume the result slot — post as many as you like while a claim is in flight. The ownership rule is narrower than it looks: no `by` is fine, `by` matching the holder is fine, and `by` on a task **nobody** holds is fine; only "I am B" about a task held by A is refused 409. A progress note vouches for you for 10 minutes, then stops counting — post again if you're still working past that, from inside real work, never from a timer.
 - **Report progress *while* working, not one dump at the end.** Work longer than ~10 minutes without a signal and relay treats you as dead, and **re-claiming does not reset that clock** — a claim is not a signal, only results and progress notes are. This is the same failure as never acking at all (see **Announce yourself before you work**), just arriving later: the human and the watchdog both read a long quiet stretch as death, and neither can tell a wedged agent from a thorough one. If the work has no task to hang a `progress` note on, post a plain message into the conversation instead.
-- Build result JSON with a serializer, not a hand-rolled heredoc — a malformed body reads back as `"result is required"`, which looks like a missing field, not a parse failure. PowerShell + `ConvertTo-Json` + a UTF-8 byte body is reliable on this box; `node -e` hits Git-Bash path translation. **Never hand the body between two tools via a `/tmp` file** — node writes `/tmp/x.json` to `C:\tmp\`, MSYS `curl @/tmp/x.json` reads `%TEMP%\`, so they are different files. This does not error: on 2026-08-26 an agent serialized its summary with node, POSTed with curl, and published a *stale unrelated message another agent had left in `%TEMP%` weeks earlier* under its own name — and there is no delete route to take it back. Serialize and POST inside one process, or use an agent-namespaced absolute Windows path.
-- **Plain ASCII only in any JSON body.** This box's shell re-encodes em-dashes/smart quotes into bytes the server rejects outright: `"the request body is not valid UTF-8, so nothing was stored"`. Use `-`, not `—` or `–`.
+- **Serialize every JSON body, never hand-roll a heredoc — then read the reply.** Malformed JSON does not announce itself: it reads back as `"result is required"`, which looks like a missing field, not the parse failure it is, and leaves your claim held with no result — indistinguishable from a closed one. Silence is not success.
+- **Never pass a body between two tools through a `/tmp` file** — they can disagree about where `/tmp` is, and the mismatch does not error. On 2026-08-26 that published a *stale unrelated message another agent had left there weeks earlier* under an agent's own name, with no delete route to take it back. Serialize and POST in one process.
+- **Plain ASCII only in any JSON body.** A non-UTF-8 body is refused outright and nothing is stored: `"the request body is not valid UTF-8, so nothing was stored"`. Use `-`, not `—` or `–`. Why bytes get mangled here: `references/windows-legacy.md`.
 
 ## Reading messages back — which route proves a write landed
 
@@ -248,12 +249,12 @@ The `/activity` call itself, and the `kind` / pairing rules: `references/activit
 
 That is what this skill is: the core is the rules, `references/` is the lookups. **Before adding anything here, ask whether omitting it causes silent harm.** If the answer is "no, you would just look it up", it belongs in a reference with a trigger row in the routing table above - and the routing table is validated, so add the row in the same edit as the file.
 
-`D:\projects\relay-queue\COORDINATOR.md` is a stub that points here. It must keep existing: `D:\projects\CLAUDE.md` sends coordinators to it, and it is the pointer that does not depend on skill discovery working.
+`COORDINATOR.md` at the repo root is a stub that points here. It must keep existing: the workspace CLAUDE.md one level above this repo sends coordinators to it, and it is the pointer that does not depend on skill discovery working.
 
-**This skill and the guard live in the relay-queue repo, and that is load-bearing.** Coordinators are started by `tools/autoseat.js` with `cwd: D:\projects\relay-queue`, which is what makes `.claude/skills/` here discoverable and what makes `.claude/settings.json` here register the guard. Claude Code reads project settings only for the directory the session is rooted in, so **the spawn cwd, the skill and the guard registration must move together or not at all** — split them and the guard silently stops firing.
+**This skill and the guard live in the relay-queue repo, and that is load-bearing.** Coordinators are started by `tools/autoseat.js` with its `cwd` set to this repo root, which is what makes `.claude/skills/` here discoverable and what makes `.claude/settings.json` here register the guard. Claude Code reads project settings only for the directory the session is rooted in — CLAUDE.md walks up the tree, `settings.json` does **not** — so **the spawn cwd, the skill and the guard registration must move together or not at all**: split them and the guard silently stops firing.
 
 Validate the routing table against the files on disk:
 
 ```sh
-node D:/projects/relay-queue/.claude/skills/relay-coordinator/validate-routing.js
+node .claude/skills/relay-coordinator/validate-routing.js   # from the repo root
 ```

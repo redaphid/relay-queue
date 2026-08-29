@@ -16,4 +16,4 @@ curl -X POST http://127.0.0.1:3901/conversations/<id>/activity -H 'content-type:
 
 ---
 
-Back to the core manual: `D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md`.
+Back to the core manual: `SKILL.md`.
