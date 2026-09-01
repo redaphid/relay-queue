@@ -127,10 +127,20 @@ const DEFAULT_HEARTBEAT = path.join(os.homedir(), '.relay-autoseat', 'heartbeat.
  * origin too - a ticked box is not an instruction, and the server's own
  * PAGE_ORIGINS set is therefore NOT the right list to borrow here.
  *
- * ADDING A UI SURFACE HE CAN SPEAK OR TYPE FROM? ADD IT HERE, IN THE SAME
- * COMMIT. The failure is silent in the safe direction: he gets ignored.
+ * ADDING A UI SURFACE HE CAN SPEAK OR TYPE FROM? ADD IT IN ../staffability.js,
+ * IN THE SAME COMMIT. The failure is silent in the safe direction: he gets
+ * ignored.
+ *
+ * DEFINED ONCE, IN ../staffability.js, AND REQUIRED BY server.js TOO. Both
+ * processes have to answer "would autoseat ever seat this?" - autoseat to
+ * decide, the server to EXPLAIN a backlog on GET /tasks and /health - and a
+ * second copy of this set is a copy that can drift. Drift here is not cosmetic:
+ * the set is what makes agent-seats-agent loops impossible rather than merely
+ * unlikely, and a structural guard that exists in two versions is no longer
+ * structural. The refusal wording is single-sourced with it, for the same
+ * reason - the server quotes these sentences verbatim.
  */
-const HUMAN_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
+const { HUMAN_ORIGINS, REASON } = require('../staffability');
 
 /* How long a dispatch record is kept. Long enough that a message from last week
  * cannot be re-dispatched by a restart; short enough that the file stays small. */
@@ -174,12 +184,12 @@ function selectSeats(opts) {
     const no = (why) => { row.seat = false; row.why = why; considered.push(row); };
 
     if (dispatched.has(t.id)) { no('a coordinator was already dispatched for this message'); continue; }
-    if (t.role !== 'user') { no(`role is ${JSON.stringify(t.role)}, so this is not the human speaking`); continue; }
-    if (!HUMAN_ORIGINS.has(t.from)) { no(`from is ${JSON.stringify(t.from)}, not a human client; he posts from ${[...HUMAN_ORIGINS].join(', ')}`); continue; }
+    if (t.role !== 'user') { no(REASON.notUserRole(t)); continue; }
+    if (!HUMAN_ORIGINS.has(t.from)) { no(REASON.notHumanOrigin(t)); continue; }
     if (ignore.has(cid)) { no('conversation is on the ignore list'); continue; }
-    if (!conv) { no('conversation is not in the conversation list'); continue; }
-    if (conv.archived) { no('conversation is archived, which IS the answer'); continue; }
-    if (conv.stopAck === 'stopped') { no('conversation was deliberately stopped'); continue; }
+    if (!conv) { no(REASON.noConversation()); continue; }
+    if (conv.archived) { no(REASON.archived()); continue; }
+    if (conv.stopAck === 'stopped') { no(REASON.stopped()); continue; }
     /*
      * SEAT-UNWATCHED: the server's own answer to "is anyone actually reading
      * this conversation's SSE stream right now", combined server-side with a
@@ -265,8 +275,8 @@ function brief(o) {
     `   {"conversationId":"${o.conversationId}","agent":"${o.agent}","text":"..."}.`,
     '   A silent agent is indistinguishable from a dead one.',
     `3. GET /tasks?conversation=${o.conversationId}&status=pending and answer each one:`,
-    `   claim with {"by":"${o.agent}"} - the field is \`by\`, NOT \`agent\`, and getting it wrong`,
-    '   returns 200 while claiming for nobody - then do the work, then',
+    `   claim with {"by":"${o.agent}"} - \`by\` is the canonical field, though \`agent\`,`,
+    '   `author` and `claimedBy` are accepted aliases now and record the same holder - then do the work, then',
     `   POST /tasks/<id>/result {"result":"...","by":"${o.agent}"}, then POST /tasks/<id>/relayed.`,
     '   Post the RESULT on the task, not just a message. A message alone leaves the task open.',
     `4. Before concluding the tab is clear, also check GET /checklist?conversation=${o.conversationId}`,
