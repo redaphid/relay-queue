@@ -24,8 +24,19 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
+const os = require('node:os');
 
 const SRC = path.join(__dirname, 'autoseat.js');
+/*
+ * The allowlist and the refusal wording live one directory up now, in
+ * ../staffability.js, so server.js can explain a stalled backlog using the SAME
+ * set autoseat decides on rather than a second copy of it. The two allowlist
+ * mutants below had to follow them across that boundary. This is not a detail:
+ * a mutation target that has quietly stopped matching is the one failure mode
+ * `loadMutant` was built to make impossible, and moving a guard into another
+ * file is the easiest way in the world to do it by accident.
+ */
+const DEP = path.join(__dirname, '..', 'staffability.js');
 const real = require('./autoseat.js');
 
 const NOW = Date.parse('2026-08-27T23:30:00.000Z');
@@ -268,19 +279,49 @@ function check(mod) {
 
 // ------------------------------------------------------------- mutations
 
-function loadMutant(find, replace) {
-  const src = fs.readFileSync(SRC, 'utf8');
-  const hits = src.split(find).length - 1;
-  /*
-   * The check that makes this honest. A mutation that matched nothing would run
-   * the ORIGINAL code, the suite would pass, and the report would read
-   * "survived" - indistinguishable from a genuinely untested guard.
-   */
-  if (hits !== 1) throw new Error(`mutation target ${JSON.stringify(find)} matched ${hits} times, expected exactly 1`);
+/*
+ * The check that makes this honest. A mutation that matched nothing would run
+ * the ORIGINAL code, the suite would pass, and the report would read
+ * "survived" - indistinguishable from a genuinely untested guard.
+ */
+function mutate(text, find, replace, label) {
+  const hits = text.split(find).length - 1;
+  if (hits !== 1) {
+    throw new Error(`mutation target ${JSON.stringify(find)} matched ${hits} times in ${label}, expected exactly 1`);
+  }
+  return text.split(find).join(replace);
+}
+
+/*
+ * `where === 'staffability'` mutates autoseat's DEPENDENCY instead of autoseat.
+ *
+ * It cannot use the in-memory Module trick the local case uses: autoseat
+ * resolves `require('../staffability')` by path, so the only way to hand it a
+ * different one is to lay out a real directory with the mutant in the right
+ * place and require autoseat from there. Copying autoseat verbatim beside it
+ * keeps the thing under test genuinely unmodified - the ONLY difference between
+ * this run and the real one is the allowlist.
+ */
+function loadMutant(find, replace, where) {
+  if (where === 'staffability') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoseat-mutant-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'tools'));
+      fs.writeFileSync(path.join(dir, 'staffability.js'),
+        mutate(fs.readFileSync(DEP, 'utf8'), find, replace, 'staffability.js'));
+      fs.copyFileSync(SRC, path.join(dir, 'tools', 'autoseat.js'));
+      const entry = path.join(dir, 'tools', 'autoseat.js');
+      delete require.cache[entry];
+      return require(entry); // already in memory once this returns, so the dir can go
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const src = mutate(fs.readFileSync(SRC, 'utf8'), find, replace, 'autoseat.js');
   const m = new Module(SRC, null);
   m.filename = SRC;
   m.paths = Module._nodeModulePaths(path.dirname(SRC));
-  m._compile(src.split(find).join(replace), SRC);
+  m._compile(src, SRC);
   return m.exports;
 }
 
@@ -321,10 +362,10 @@ const MUTATIONS = [
    */
   ['voice dropped back out of the human allowlist',
     "const HUMAN_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);",
-    "const HUMAN_ORIGINS = new Set(['web']);"],
+    "const HUMAN_ORIGINS = new Set(['web']);", 'staffability'],
   ['machine origins let into the human allowlist',
     "new Set(['web', 'voice', 'voice-conversation'])",
-    "new Set(['web', 'voice', 'voice-conversation', 'relay-watchdog', 'checklist'])"],
+    "new Set(['web', 'voice', 'voice-conversation', 'relay-watchdog', 'checklist'])", 'staffability'],
 ];
 
 // ------------------------------------------------------------------ main
@@ -341,10 +382,10 @@ if (baseline.length) {
 }
 
 console.log('\nmutation - each guard is removed in turn; the suite MUST go red:');
-for (const [name, find, replace] of MUTATIONS) {
+for (const [name, find, replace, where] of MUTATIONS) {
   let mutantFailures;
   try {
-    mutantFailures = check(loadMutant(find, replace));
+    mutantFailures = check(loadMutant(find, replace, where));
   } catch (e) {
     console.log(`FAIL  ${name}: mutant could not be built or run - ${e.message}`);
     bad++;

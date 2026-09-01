@@ -11,6 +11,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 // The home-screen icons, drawn and PNG-encoded rather than committed as blobs.
 const icons = require('./icons.js');
+const staffability = require('./staffability.js');
 /*
  * Publishing a conversation as a public snapshot. It COPIES rather than
  * proxies, because he asked for a link that works when this machine is off —
@@ -738,6 +739,44 @@ function send(res, code, obj) {
   res.end(body);
 }
 
+/*
+ * ------------------------------------------------------------- the envelope rule
+ *
+ * ONE ACCESSOR FOR EVERY ROUTE. Collection routes have always answered
+ * `{count, tasks}` / `{count, defaultId, conversations}`, while single-resource
+ * routes answered the record BARE at the top level. A caller could not write
+ * one accessor against that, and on 2026-08-31 one did not: a guard reading
+ * `body.task.claimedBy` got `undefined` on four SUCCESSFUL claims, concluded
+ * they had failed, and skipped posting the results - leaving four tasks
+ * `claimed` with `result:null`, the exact stranded state the coordinator manual
+ * warns about. The claims had all worked. Only the read was wrong.
+ *
+ * THE FIX IS ADDITIVE, DELIBERATELY. The bare fields stay at the top level,
+ * byte for byte, because tools/*-selftest.js, public/, tools/autoseat.js, push,
+ * share and the external relay-watchdog all read them there - a rename would
+ * break every one of them at once for a defect that costs a caller one wrong
+ * guess. So the canonical key is added ALONGSIDE, pointing at the same record:
+ *
+ *     POST /tasks/<id>/claim -> { id, status, claimedBy, ..., task: {...same} }
+ *
+ * Both `body.claimedBy` and `body.task.claimedBy` are now right, and a caller
+ * that guessed the collection convention is no longer silently wrong. This is
+ * not a new invention either: the SSE dispatcher has always framed a
+ * conversation change as `{conversation:{...}}`, and public/index.html keys off
+ * exactly that - so half the system was already using the canonical key and the
+ * HTTP routes were the half that was not.
+ *
+ * The self-reference is a copy, not a cycle: the spread happens first, so
+ * JSON.stringify terminates, and the stored record is never mutated. The
+ * `in` guard means a record that ever grows a real field of this name keeps it
+ * rather than having it silently overwritten by a copy of itself.
+ */
+function sendResource(res, code, key, obj) {
+  const out = { ...obj };
+  if (!(key in out)) out[key] = obj;
+  return send(res, code, out);
+}
+
 const fail = (res, code, error, extra) => send(res, code, { error, ...extra });
 const httpErr = (code, message) => Object.assign(new Error(message), { code });
 
@@ -1106,6 +1145,83 @@ function entriesOf(t) {
 
 /** A task's conversation, defaulting for records written before they existed. */
 const convIdOf = (t) => (typeof t.conversationId === 'string' && t.conversationId ? t.conversationId : DEFAULT_CONV);
+
+/*
+ * ------------------------------------------------- why a pending task is stuck
+ *
+ * A nonzero `pending` count says work is waiting. It does NOT say anyone is
+ * ever going to pick it up, and until now nothing did. On 2026-08-31 seven
+ * tasks had been pending for up to eight days; every one was being refused BY
+ * DESIGN by tools/autoseat.js - five for an archived conversation, two for
+ * `from:"relay-watchdog"`, one for `from:"checklist"` - and the only way to
+ * learn that was to go and read autoseat's source. A permanent, correct backlog
+ * looked exactly like a broken dispatcher, and the obvious remedy (restart
+ * autoseat) would have been wrong every single time.
+ *
+ * `../staffability.js` holds the reasons, and tools/autoseat.js decides with
+ * the SAME module, so this cannot drift into a plausible second opinion. Only
+ * autoseat's PERMANENT refusals are answerable here; its transient ones (grace
+ * window, concurrency cap, in-flight, seat filled) live in the dispatcher's own
+ * process and resolve themselves. See that file for why the split falls exactly
+ * where the server's knowledge ends.
+ *
+ * `null` is not a promise of a seat. It says only that nothing PERMANENT is
+ * stopping one.
+ */
+function unstaffableOf(t) {
+  return staffability.unstaffable(t, conversations.get(convIdOf(t)) || null);
+}
+
+/*
+ * Decorates a task for a read route. Never mutates the record: `unstaffable` is
+ * a judgement about the world right now, not a fact about the task, so it is
+ * computed on read and never written to the event log.
+ */
+function withStaffability(t) {
+  return { ...t, unstaffable: unstaffableOf(t) };
+}
+
+/*
+ * The same question asked of the whole queue, for /health: is this backlog
+ * waiting on somebody, or is it never moving?
+ *
+ * `byReason` is keyed on the short code rather than the sentence so a caller
+ * can count without parsing prose - and so this reads as a diagnosis rather
+ * than a wall of repeated text when 40 tasks share one cause.
+ */
+function unstaffableSummary() {
+  const byReason = {};
+  let count = 0;
+  for (const t of tasks.values()) {
+    if (isInternal(t)) continue; // agent chatter is not queue depth, here either
+    const u = unstaffableOf(t);
+    if (!u) continue;
+    count++;
+    byReason[u.code] = (byReason[u.code] || 0) + 1;
+  }
+  return { count, byReason };
+}
+
+/*
+ * TWO NUMBERS CALLED "CONVERSATIONS", AND NOTHING SAYING SO.
+ *
+ * /health reported `conversations: 69` while GET /conversations returned 5, and
+ * both were correct: the map holds every tab ever made, the list hides archived
+ * ones by default. Read side by side - which is how anyone diagnosing relay
+ * reads them - that is a 64-tab discrepancy with no explanation, and it cost
+ * real time on 2026-08-31.
+ *
+ * The bare `conversations` count stays exactly what it was, because the
+ * external relay-watchdog reads /health and this is not worth breaking it for.
+ * The breakdown is added beside it, and the breakdown is what explains it:
+ * `total` is the number that was already there, and `live` is the one the list
+ * shows.
+ */
+function conversationCounts() {
+  let archived = 0;
+  for (const c of conversations.values()) if (c.archived) archived++;
+  return { total: conversations.size, live: conversations.size - archived, archived };
+}
 
 // ---------------------------------------------------------------- checklists
 /*
@@ -5533,7 +5649,7 @@ function createTask(res, body) {
       note: 'not refused, because this is also the route his own typed and dictated messages use',
     } });
   }
-  send(res, 201, task);
+  sendResource(res, 201, 'task', task);
 }
 
 /*
@@ -5920,7 +6036,9 @@ function createMessage(res, body) {
   // classify() drops anything internal, so a `channel` message can never buzz
   // his phone — that is the single most important rule in this whole feature.
   notify('message', task, readNotifyHint(body));
-  send(res, 201, task);
+  // A message is stored as a task record, but callers of THIS route asked for a
+  // message, so that is the key it gets. `task` would be honest and useless.
+  sendResource(res, 201, 'message', task);
 }
 
 /**
@@ -6174,6 +6292,11 @@ function spendCredits(res, body) {
  * `agent`/`author`/`by` in createMessage), which is exactly why an agent
  * reached for one of them here and lost its name doing it.
  *
+ * `claimedBy` is on the list for a narrower reason: it is the name this route
+ * ANSWERS with. A caller that reads `claimedBy` back and then writes it again
+ * on the next claim is echoing our own vocabulary, and refusing to understand a
+ * word we ourselves chose is the least defensible way to drop an agent's name.
+ *
  * Deliberately lenient rather than strict: a claim carrying NO identity is
  * still accepted and still recorded as null. resultTask() warns that tightening
  * this path risks breaking agents that work perfectly well without claiming,
@@ -6182,7 +6305,7 @@ function spendCredits(res, body) {
  * than none, because it looks like a holder everywhere the field is printed.
  */
 function claimantOf(body) {
-  for (const raw of [body.by, body.agent, body.author]) {
+  for (const raw of [body.by, body.agent, body.author, body.claimedBy]) {
     if (typeof raw !== 'string') continue;
     // Trimmed so "X " and "X" are one holder rather than two that can never
     // renew each other's lease; capped so a junk name cannot grow the record.
@@ -6204,14 +6327,14 @@ function claimTask(res, id, body) {
       // the job, given from inside a turn, which is the only evidence we trust.
       if (by !== null && by === task.claimedBy) {
         appendEvent({ t: 'patch', id, patch: { claimedAt: nowIso() } });
-        return send(res, 200, task);
+        return sendResource(res, 200, 'task', task);
       }
       if (lease.expired) {
         const from = task.claimedBy || null;
         appendEvent({ t: 'patch', id, patch: {
           claimedBy: by, claimedAt: nowIso(), takenOverFrom: from, takenOverAt: nowIso(),
         } });
-        return send(res, 200, task);
+        return sendResource(res, 200, 'task', task);
       }
     }
     return fail(res, 409, `task is already ${task.status}`, {
@@ -6231,7 +6354,7 @@ function claimTask(res, id, body) {
   }
   const patch = { status: 'claimed', claimedBy: by, claimedAt: nowIso() };
   appendEvent({ t: 'patch', id, patch });
-  send(res, 200, task);
+  sendResource(res, 200, 'task', task);
 }
 
 /*
@@ -6391,7 +6514,7 @@ function resultTask(res, id, body) {
   if (imgs && preset) patch.resultImageSelected = preset.filter((b) => imgs.indexOf(b) >= 0);
   appendEvent({ t: 'patch', id, patch });
   notify('result', task, readNotifyHint(body));
-  send(res, 200, task);
+  sendResource(res, 200, 'task', task);
 }
 
 /*
@@ -6413,7 +6536,7 @@ function createConversation(res, body) {
   if (agent instanceof Error) return fail(res, 400, agent.message);
   const conv = newConversation(newId(conversations), title, agent);
   appendEvent({ t: 'conv', conv });
-  send(res, 201, conv);
+  sendResource(res, 201, 'conversation', conv);
 }
 
 function readAgent(body) {
@@ -6843,7 +6966,7 @@ function updateConversation(res, id, body) {
    * says so in words a UI can put straight on the screen.
    */
   if (patch.stopRequested === true) {
-    return send(res, 200, withRelease({ ...conv, stopRequestEffect: stopRequestEffect(conv) }));
+    return sendResource(res, 200, 'conversation', withRelease({ ...conv, stopRequestEffect: stopRequestEffect(conv) }));
   }
   /*
    * Filing away a conversation whose agent never stood down leaves a process
@@ -6853,7 +6976,7 @@ function updateConversation(res, id, body) {
    * made by accident.
    */
   if (patch.archived === true) {
-    return send(res, 200, withRelease({
+    return sendResource(res, 200, 'conversation', withRelease({
       ...conv,
       ghost: ghostWarning(conv),
       /*
@@ -6872,7 +6995,7 @@ function updateConversation(res, id, body) {
       } : null,
     }));
   }
-  send(res, 200, withRelease(conv));
+  sendResource(res, 200, 'conversation', withRelease(conv));
 }
 
 /** null when there is genuinely nothing left running; otherwise, the bad news. */
@@ -7227,7 +7350,7 @@ function relayTask(res, id) {
     }
     appendEvent({ t: 'patch', id, patch: { relayed: true, relayedAt: nowIso() } });
   }
-  send(res, 200, task); // idempotent: re-flagging keeps the original relayedAt
+  sendResource(res, 200, 'task', task); // idempotent: re-flagging keeps the original relayedAt
 }
 
 /*
@@ -7570,6 +7693,10 @@ async function route(req, res) {
       port: server.address() ? server.address().port : PORT,
       counts: counts(),
       conversations: conversations.size,
+      // What that number counts, and the one GET /conversations shows.
+      conversationCounts: conversationCounts(),
+      // Of `counts.pending`, how much of it is never moving on its own.
+      unstaffable: unstaffableSummary(),
       streams: streams.size,
       uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
     });
@@ -7578,7 +7705,7 @@ async function route(req, res) {
   // /tasks
   if (seg.length === 1 && seg[0] === 'tasks') {
     if (m === 'GET') {
-      const list = applyFilters([...tasks.values()], q);
+      const list = applyFilters([...tasks.values()], q).map(withStaffability);
       return send(res, 200, { count: list.length, tasks: list });
     }
     if (m === 'POST') return createTask(res, await readBody(req));
@@ -7613,7 +7740,7 @@ async function route(req, res) {
     if (m === 'GET') {
       const found = conversationsWithLiveness().find((c) => c.id === seg[1]);
       if (!found) return fail(res, 404, `no conversation with id "${seg[1]}"`);
-      return send(res, 200, found);
+      return sendResource(res, 200, 'conversation', found);
     }
     if (m === 'POST') return updateConversation(res, seg[1], await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
@@ -7975,7 +8102,7 @@ async function route(req, res) {
     if (!need('GET')) return;
     const task = tasks.get(seg[1]);
     if (!task) return fail(res, 404, `no task with id "${seg[1]}"`);
-    return send(res, 200, task);
+    return sendResource(res, 200, 'task', withStaffability(task));
   }
 
   fail(res, 404, `no route for ${m} ${url.pathname}`);
