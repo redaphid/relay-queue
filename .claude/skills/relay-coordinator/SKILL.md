@@ -113,8 +113,10 @@ That was the problem — the time went into writing them.
 
 ```sh
 curl -s -X POST http://127.0.0.1:3901/conversations -H 'content-type: application/json' \
-  -d '{"title":"Clear tab session state","agent":"TabLifecycle"}'
+  -d '{"title":"Clear tab session state","agent":"TabLifecycle","spawnedBy":"<your own name>"}'
 ```
+
+**`spawnedBy` is not optional bookkeeping - it is the only answer to "is this mine to stop?"** Relay never witnesses a spawn, so if the spawner does not say, nobody can. On 2026-08-31 the clear-session control told the human `spawnedBy=no record` about an agent the coordinator reading that message had spawned minutes earlier, and had to hedge with "if this session spawned it". Send it on the create call, or on the `POST /conversations/<id>` that seats an agent you started. **It is never inferred and never guessed** - and `spawnedBySource` says which shape of call carried it (`asserted` for a conversation write, whose sender relay cannot identify; `declared` for an `/activity {"kind":"spawned"}` row, where the reporter named itself). Neither is verified, and no UI may render either as a promised kill.
 
 On 2026-08-27 a router gave every coordinator that night its own tab — Configure relay, Vikunja to-do, Instagram, Queue Scout, Push, Fix mindmeld — then reused the general "Relay" tab for one more because that was where the human had raised the request. He replied: **"I don't see the tablifecycle coordinator tab."** He could not tell which coordinator owned what, or where its context lived.
 
@@ -188,6 +190,7 @@ Firehose, redundant-wake filtering, older builds, container logs and the server'
 - `stop-ack {"phase":"stopped"}` sets `agent:null` automatically and is one-way — `stopped → stopping` is refused 409.
 - Own exactly one conversation. Never claim, answer, or mark-relayed a task outside it — the queue accepts one result per task, so a cross-conversation claim silently steals another agent's message.
 - Check `stopRequested` whenever you poll your own conversation. On seeing it: post a result for anything claimed (an orphaned claim with no result is invisible to future polls), `stop-ack {"phase":"stopping","worktrees":[...]}`, finish, then `stop-ack {"phase":"stopped"}`.
+- **Before you stop or replace an agent, read `heldTasks` - do not go from memory.** The reply to `POST /conversations/<id> {"stopRequested":true}` (and to `{"archived":true}`, and `GET /conversations/<id>`) now carries every claim in that tab with no result: `byAgent` are the occupant's, `unheld` are claimed by nobody. **Nothing is released** - a claim with no result stays invisible to `?status=pending` and reads as answered everywhere else, so each one needs a result posted or a named successor before the agent goes. `tools/seat-lifecycle-selftest.js`.
 
 ## Tasks
 
