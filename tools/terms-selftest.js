@@ -61,6 +61,55 @@ fixes('the coordinate or should pick this up', 'the coordinator should pick this
 fixes('the worst recognition is terrible today', 'the voice recognition is terrible today');
 fixes('ask the communicate or to relay it', 'ask the communicator to relay it');
 
+console.log('\nVikunja - every one of these is a verbatim line he actually dictated');
+/*
+ * The worst term in the file after "Claude", and the one the phonetic pass
+ * cannot reach: the engine drops the leading v- in nearly every miss, so
+ * "Bacunya" and "Vikunja" are nowhere near each other by sound. Only the exact
+ * list catches these. Sentences below are quoted from the relay record, not
+ * composed for the test - the dates are in stt-terms.json beside the entries.
+ */
+fixes('you always need to be making real tasks in Bacunya',
+  'you always need to be making real tasks in Vikunja');
+fixes('set a reminder in Bacunia for that putting the colors in the dryer task',
+  'set a reminder in Vikunja for that putting the colors in the dryer task');
+fixes('catch that buckoonia thing and makes it for Koenja',
+  'catch that Vikunja thing and makes it for Vikunja');
+fixes('I want you to set reminders via the kunea for the watch',
+  'I want you to set reminders via the Vikunja for the watch');
+fixes('Set the Kunia schedules for all of these',
+  'Set the Vikunja schedules for all of these');
+fixes('use Vaccunia to set a alarm for half an hour',
+  'use Vikunja to set a alarm for half an hour');
+fixes('have the Kuna use a loud alarm, not a silent one',
+  'have the Vikunja use a loud alarm, not a silent one');
+fixes('work on getting that the KoongJub MCP running',
+  'work on getting that the Vikunja MCP running');
+fixes('a progressive disclosure format inside Baccuna',
+  'a progressive disclosure format inside Vikunja');
+
+/*
+ * The word AFTER the term has to survive. "koenja thing" was briefly listed as
+ * a span of its own and ate the "thing"; these two lock that shut.
+ */
+fixes('that Koenja thing needs doing', 'that Vikunja thing needs doing');
+fixes('the buckoonia thing is broken', 'the Vikunja thing is broken');
+
+/*
+ * NOT asserted, on purpose, so nobody re-adds either of them:
+ *
+ * - lowercase 'vikunja' -> 'Vikunja'. loadTerms() drops a heard form that
+ *   differs from its term only by case, and `canonical` then claims the span,
+ *   so this and the capitalisation-only entries for MCP, Docker and GitHub have
+ *   never fired. The _readme documents behaviour the matcher does not have.
+ *   Vikunja #147. Left alone here: changing the matcher is a wholly different
+ *   blast radius from adding vocabulary.
+ * - 'the vicuna is a kind of llama' surviving. It does not - 'vicuna' has been a
+ *   listed mishearing since the first version of this entry, and the animal
+ *   loses. Pre-existing and deliberate; noted so it is a known cost, not a
+ *   surprise.
+ */
+
 console.log('\npunctuation and capitalisation survive');
 fixes('Ask cloud, then wait.', 'Ask Claude, then wait.');
 fixes('is cloud there?', 'is Claude there?');
@@ -116,6 +165,12 @@ leaves('I do not want to talk about it');
 leaves('let me think about this for a minute');
 leaves('there is an echo in this room');
 leaves('whisper it to me quietly');
+// The b- and k- Vikunja variants are one consonant from ordinary words. Bare
+// 'kuna' is the knowingly-risky one, exactly like bare 'cloud' above.
+leaves('I made a tuna sandwich for lunch');
+leaves('put it in the back of the truck');
+leaves('that costs a buck fifty');
+leaves('she came back and unpacked it');
 
 console.log('\nnothing silly happens at the edges');
 check('empty string survives', repairTranscript('').text === '');

@@ -47,7 +47,14 @@
     },
     {
       "term": "Vikunja",
-      "heard": ["vikunya", "vicuna", "vic una", "vikuna", "the kunja", "vi kunja", "become ya"]
+      "heard": [
+        "vikunya", "vicuna", "vic una", "vikuna", "the kunja", "vi kunja", "become ya",
+        "bacunya", "bacunia", "bakunya", "baccuna", "buckoonia", "buccoonia", "koenja",
+        "buck oonia", "back unia", "back unya",
+        "kunia", "kunea", "vaccunia", "kuna",
+        "koongjub", "koong jub"
+      ],
+      "note": "The worst term in this file after 'Claude', and the only one the phonetic pass cannot help with at all: the engine loses the leading v- in nearly every miss, so 'Bacunya' and 'Vikunja' are nowhere near each other by sound and this exact list is the ONLY thing that catches them. Everything after the original seven was read back out of the relay record rather than guessed, and every one is a word he actually dictated: 'KoongJub' (08-08, 'getting that the KoongJub MCP running', one minute after Vikunja was named in the same tab), 'Baccuna' (08-27), 'kunea' + 'Kunia' + 'Vaccunia' (08-28), 'Kuna' (08-29), 'Bacunya' + 'Bacunia' + 'buckoonia' + 'Koenja' (09-01, four different non-words in one session, the last two inside the very sentence asking for this fix). 'bakunya', 'buccoonia' and the three split spans are NOT separately observed - they are alternate spellings and word-breaks of sounds that were, and they cost nothing because none of them is an English word or phrase. TWO THINGS WERE DELIBERATELY LEFT OUT. 'koenja thing' was listed briefly and REMOVED: a span ending in an ordinary word swallows it, so 'that Koenja thing needs doing' came out as 'that Vikunja needs doing' - a word silently deleted from an instruction an agent then acts on, which is the exact failure this file exists to prevent. Bare 'koenja' already catches it and keeps the noun. Lowercase 'vikunja' was left out because it does nothing: loadTerms() drops a heard form that differs from its term only by case, and `canonical` then claims the span - so the capitalisation-only entries this file documents for MCP, Docker and GitHub have never once fired. That is a matcher bug, not a vocabulary bug; tracked as Vikunja #147 and deliberately not fixed here. Bare 'kuna' IS listed, knowingly, the way bare 'cloud' is: it is not English, but it is one consonant away from 'tuna'. If it ever rewrites a sandwich, delete that one entry."
     },
     {
       "term": "MetaMCP",
