@@ -256,7 +256,7 @@ function brief(o) {
     'You were dispatched AUTOMATICALLY because a message arrived in this tab and nobody was seated in it.',
     'The human did not ask for you by hand and is not watching a terminal. The tab is your only channel.',
     '',
-    'FIRST, read `D:\\projects\\relay-queue\\COORDINATOR.md`. It is the mechanical reference for this API',
+    'FIRST, read `/home/hypnodroid/Projects/relay-queue/COORDINATOR.md`. It is the mechanical reference for this API',
     'and it documents several traps that fail silently. Then, in this order:',
     '',
     `1. Take the seat: POST /conversations/${o.conversationId} with {"agent":"${o.agent}"}.`,
@@ -532,16 +532,22 @@ function parseArgs(argv) {
     stateFile: DEFAULT_STATE,
     heartbeatFile: DEFAULT_HEARTBEAT,
     logDir: path.join(path.dirname(DEFAULT_STATE), 'logs'),
-    claude: process.env.AUTOSEAT_CLAUDE || path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
-    // SECURITY-COUPLED, do not "tidy" this to D:\projects.
+    claude: process.env.AUTOSEAT_CLAUDE || path.join(os.homedir(), '.local', 'bin', 'claude'),
+    // SECURITY-COUPLED, do not "tidy" this to some other checkout.
     // Claude Code discovers .claude/skills/ and loads .claude/settings.json
     // ONLY for the directory the session is rooted in. The coordinator
     // protocol (skills/relay-coordinator) and the default-deny PreToolUse
     // guard (hooks/coordinator-guard.js) both live in
-    // D:\projects\relay-queue\.claude. Point this anywhere else and the
-    // coordinator boots with no protocol AND no guard, silently: nothing
-    // errors, and default-deny quietly becomes default-allow.
-    cwd: 'D:\\projects\\relay-queue',
+    // /home/hypnodroid/Projects/relay-queue/.claude. Point this anywhere else
+    // and the coordinator boots with no protocol AND no guard, silently:
+    // nothing errors, and default-deny quietly becomes default-allow.
+    //
+    // 2026-09-01: moved off D:\projects\relay-queue with the container's code
+    // mount. The cwd, the skill and the guard have to travel together - the D:
+    // tree's .claude/settings.json carries WINDOWS hook paths, so rooting a WSL
+    // session there would load a guard command that cannot execute, which is
+    // the default-allow case above rather than an error anyone would see.
+    cwd: '/home/hypnodroid/Projects/relay-queue',
     model: '',
     ignore: new Set(),
     once: false,
@@ -583,7 +589,7 @@ const USAGE = `autoseat - dispatch a coordinator into a tab that has a human mes
   --heartbeat FILE     proof-of-life for the supervisor (default ${DEFAULT_HEARTBEAT})
   --log-dir DIR        per-dispatch child logs
   --claude PATH        the claude executable
-  --cwd DIR            working directory for the coordinator (default D:\\projects\\relay-queue;
+  --cwd DIR            working directory for the coordinator (default /home/hypnodroid/Projects/relay-queue;
                        this is where the coordinator skill and the guard are found - see the note in parseArgs)
   --model NAME         model for the coordinator (default: whatever claude is configured with)
   --ignore A,B         conversation ids never to seat

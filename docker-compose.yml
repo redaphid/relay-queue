@@ -22,7 +22,13 @@ services:
       # image routes report the host spelling so an agent handed a picture can
       # actually open the file instead of being sent to a path that exists only
       # inside this container. Must match the data/ bind mount below.
-      HOST_DATA_DIR: "D:/projects/relay-queue/data"
+      #
+      # This is the WSL spelling of the SAME NTFS directory the Windows side
+      # called D:/projects/relay-queue/data - the store did not move, only the
+      # name for it did. Agents now run in WSL and cannot open a "D:/..." path
+      # at all, so handing them one sent them to a file that, for them, does
+      # not exist. /mnt/d is what they can actually open.
+      HOST_DATA_DIR: "/mnt/d/projects/relay-queue/data"
     ports:
       # Loopback only. The page has no auth of its own, so the sole way in is
       # relay.hypnodroid.com through the tunnel, where Cloudflare Access checks
@@ -57,9 +63,33 @@ services:
       # the original inode — the container would never see a pulled change.
       # server.js and public/index.html are both served straight from here, so a
       # git pull is the whole deploy. (This retired the data/ui/index.html copy.)
-      - D:/projects/relay-queue:/app:ro
+      #
+      # 2026-09-01: this moved from D:/projects/relay-queue to the WSL checkout.
+      # Until it did, the WSL tree deployed NOTHING - every edit made there was
+      # invisible to the running page, which was still serving the D: copy.
+      #
+      # EVERY bind-mount source in this file must be a WSL-native path, because
+      # compose is now run from WSL and the Linux CLI splits "D:/x:/app" on the
+      # FIRST colon: "D" becomes the source and ":/projects/..." the mode, so it
+      # dies with `invalid mode`. A Windows-style source is not merely wrong
+      # here, it is unparseable. Hence /mnt/d and /mnt/c below.
+      - /home/hypnodroid/Projects/relay-queue:/app:ro
       # ...except data/, the writable durable store, shared with the bare-node fallback.
-      - D:/projects/relay-queue/data:/app/data
+      #
+      # THE CHECKOUT MUST CONTAIN AN (empty is fine) data/ DIRECTORY or this
+      # container will not start at all. /app is mounted read-only, so runc
+      # cannot CREATE the /app/data mountpoint; it can only mount over one that
+      # already exists. data/ is gitignored, so a fresh clone does NOT have it -
+      # which is exactly how the 2026-09-01 cutover took the page down:
+      #   error mounting ... to rootfs at "/app/data": create mountpoint for
+      #   /app/data mount: mkdirat ...: read-only file system
+      # The D: tree never hit this because its data/ had existed for months.
+      # `mkdir -p data` in the checkout is the whole fix.
+      # DELIBERATELY still on the NTFS disk: only the CODE mount moved to WSL.
+      # Moving code and data in the same cutover is how the conversations and
+      # the ~3.6k done tasks get lost, so the store stays exactly where it was
+      # and this is just /mnt/d - the same bytes the D: spelling reached.
+      - /mnt/d/projects/relay-queue/data:/app/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3901/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -83,7 +113,9 @@ services:
       SYNC_BRANCH: "main"
     volumes:
       # Writable: this one is here to update the working tree.
-      - D:/projects/relay-queue:/repo
+      # Follows the code mount to WSL - a sync sidecar pulling into the D: tree
+      # while the server serves the WSL tree would deploy nothing, silently.
+      - /home/hypnodroid/Projects/relay-queue:/repo
       # origin is a PRIVATE repo, so the fetch needs a credential. This is a
       # dedicated READ-ONLY DEPLOY KEY for relay-queue alone — not the human's
       # personal key, which can push to everything he owns. GitHub refuses
@@ -94,9 +126,9 @@ services:
       # `origin`'s URL is deliberately left alone. The key is selected inside
       # the container via GIT_SSH_COMMAND (see tools/sync-repo.sh), so his own
       # pushes from the host still authenticate with his own key as before.
-      - C:/Users/hypnodroid/.ssh/relay_queue_deploy:/keys/deploy_key:ro
+      - /mnt/c/Users/hypnodroid/.ssh/relay_queue_deploy:/keys/deploy_key:ro
       # GitHub's published host keys, verified against api.github.com/meta.
       # This is what makes StrictHostKeyChecking=yes possible: the original
       # breakage was a missing known_hosts, and the shortcut fix would have been
       # to stop checking host keys at all.
-      - C:/Users/hypnodroid/.ssh/github_known_hosts:/keys/known_hosts:ro
+      - /mnt/c/Users/hypnodroid/.ssh/github_known_hosts:/keys/known_hosts:ro
