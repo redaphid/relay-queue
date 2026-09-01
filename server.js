@@ -449,6 +449,29 @@ function newConversation(id, title, agent) {
      */
     spawnedBy: null,
     /*
+     * WHEN, AND ON WHOSE WORD. `spawnedBy` alone is a bare name with no account
+     * of where it came from, and this server never witnesses a spawn - it only
+     * ever hears about one. So the name is stored with the shape of the call
+     * that carried it, and every reader is expected to say which it was:
+     *
+     *   'declared'  a POST /conversations/:id/activity {kind:"spawned"} row in
+     *               which the reporter named ITSELF as the spawner of the agent
+     *               currently holding this seat. First person, about the
+     *               occupant, in the caller's own name.
+     *   'asserted'  a `spawnedBy` field on a conversation write. Somebody said
+     *               so. This server does not know who, and does not guess.
+     *   null        nothing has ever said.
+     *
+     * NEITHER IS VERIFIED, and no consumer may render either as though it were.
+     * The distinction is only how much the API shape forced the caller to
+     * commit to - exactly the distinction `agentLeftReason` draws between a
+     * word an agent chose and the sweep's `presumed-gone`. A control that turns
+     * an unverified name into a promised kill is the failure this whole field
+     * exists to refuse.
+     */
+    spawnedByAt: null,
+    spawnedBySource: null,
+    /*
      * The context watermark for a cleared session. A fresh agent seated in this
      * conversation reads `?since=<contextFrom>` instead of the whole backlog, so
      * "clear" means the next occupant genuinely starts blank while the history
@@ -498,7 +521,8 @@ function normaliseConv(conv) {
     archived: false, archivedAt: null,
     stopRequested: false, stopRequestedAt: null, stopRequestedBy: null,
     stopAck: null, stopAckAt: null, stoppedAt: null, stopNote: null, worktrees: null,
-    spawnedBy: null, contextFrom: null, contextMarks: [], pendingDispatch: null,
+    spawnedBy: null, spawnedByAt: null, spawnedBySource: null,
+    contextFrom: null, contextMarks: [], pendingDispatch: null,
   };
   for (const [k, v] of Object.entries(base)) if (conv[k] === undefined) conv[k] = v;
   return conv;
@@ -6412,6 +6436,33 @@ function createConversation(res, body) {
   const agent = readAgent(body);
   if (agent instanceof Error) return fail(res, 400, agent.message);
   const conv = newConversation(newId(conversations), title, agent);
+  /*
+   * THE ONE CALL A SPAWNER ALREADY MAKES AT THE MOMENT IT SPAWNS.
+   *
+   * The documented way to start a coordinator is to create its tab and seat it
+   * in the same request, precisely so there is no ownerless window. That made
+   * this the only place in the API where "an agent is being started, and the
+   * caller is the thing starting it" is true by construction - and until now it
+   * was the one conversation write that could not carry `spawnedBy` at all. So
+   * a spawner that wanted to be honest had to make a second request it had no
+   * reason to know about, which is a large part of why the field has been null
+   * on every conversation this server has ever stored.
+   *
+   * Still `asserted`, not `declared`: creating a tab does not prove you started
+   * the process you named in it. Refused rather than ignored when it names an
+   * agent while seating nobody, because that is a caller that believes it has
+   * recorded a spawner and has not.
+   */
+  if (body.spawnedBy !== undefined && body.spawnedBy !== null && body.spawnedBy !== '') {
+    if (typeof body.spawnedBy !== 'string') return fail(res, 400, 'spawnedBy must be a string or null');
+    if (!agent) {
+      return fail(res, 400, 'spawnedBy describes who started the agent being seated, so it needs '
+        + '"agent" in the same request (this request seats nobody)');
+    }
+    conv.spawnedBy = body.spawnedBy.trim().slice(0, MAX_AGENT);
+    conv.spawnedByAt = nowIso();
+    conv.spawnedBySource = 'asserted';
+  }
   appendEvent({ t: 'conv', conv });
   send(res, 201, conv);
 }
@@ -6670,17 +6721,38 @@ function updateConversation(res, id, body) {
    * wrong. Absent, it stays null and every client is obliged to say "no record".
    */
   if (body.spawnedBy !== undefined) {
-    if (body.spawnedBy === null || body.spawnedBy === '') patch.spawnedBy = null;
-    else if (typeof body.spawnedBy !== 'string') return fail(res, 400, 'spawnedBy must be a string or null');
-    else patch.spawnedBy = body.spawnedBy.trim().slice(0, MAX_AGENT);
+    if (body.spawnedBy === null || body.spawnedBy === '') {
+      patch.spawnedBy = null;
+      patch.spawnedByAt = null;
+      patch.spawnedBySource = null;
+    } else if (typeof body.spawnedBy !== 'string') {
+      return fail(res, 400, 'spawnedBy must be a string or null');
+    } else {
+      patch.spawnedBy = body.spawnedBy.trim().slice(0, MAX_AGENT);
+      /*
+       * `asserted`, never `declared`. This route has no idea who is calling it:
+       * the body could come from the session that really did start the agent,
+       * from the agent itself repeating what its brief told it, or from a third
+       * party guessing. All three arrive identically, so all three are recorded
+       * identically and the word says so. The stronger word is reserved for the
+       * one call shape that forces the caller to name itself - see
+       * activityRoute() and the `spawned` kind.
+       */
+      patch.spawnedByAt = nowIso();
+      patch.spawnedBySource = 'asserted';
+    }
   } else if (patch.agent !== undefined && patch.agent !== conv.agent) {
     /*
      * A new occupant arrived without saying who started it. The previous
      * agent's spawner describes the previous agent and nothing else, so it is
      * dropped rather than inherited — an inherited value would point a kill
      * button at a session that never started the process now sitting here.
+     * The provenance goes with it: a source with no name is a claim about
+     * nothing, and would read as though the null had been vouched for.
      */
     patch.spawnedBy = null;
+    patch.spawnedByAt = null;
+    patch.spawnedBySource = null;
   }
 
   /*
@@ -6875,6 +6947,131 @@ function updateConversation(res, id, body) {
   send(res, 200, withRelease(conv));
 }
 
+/*
+ * WHAT STOPPING THIS AGENT WOULD STRAND.
+ *
+ * A claim with no result is INVISIBLE. `?status=pending` does not list it - the
+ * task is `claimed` - and nothing else in the API volunteers it either, so a
+ * question that was picked up and never answered reads, from every ordinary
+ * poll, exactly like one that was answered. The only place it surfaces is an
+ * explicit `?status=claimed`, which nobody runs unless they already suspect.
+ *
+ * On 2026-08-31 the clear-session control stopped an agent that was holding TWO
+ * of the human's tasks that way. Both would have looked answered forever. It
+ * was caught only because the coordinator running the clear happened to check
+ * `?status=claimed` by hand first; the instruction the control generated said
+ * nothing about them, because nothing in the API had told it there was anything
+ * to say. This is the same failure as the empty seat with no vacancy notice -
+ * a state that matters, rendered identical to a state that does not.
+ *
+ * IT DOES NOT RELEASE ANYTHING, deliberately. An unanswerable claim is a real
+ * signal and auto-releasing it would delete the signal to tidy the symptom -
+ * and it is not even necessary: leaseOf() already lets another agent take a
+ * claim over once the 15-minute lease lapses. What was missing was never the
+ * mechanism to recover one, it was anybody being told there was one to recover.
+ *
+ * TWO LISTS, NOT ONE, because they need different actions:
+ *   byAgent  held by the occupant this control is about to stop. Its work.
+ *   unheld   `claimedBy: null` - claimed by NOBODY, the documented result of
+ *            sending `{"agent":...}` instead of `{"by":...}` on a claim. Very
+ *            often the same agent's, but this server cannot know that, so it is
+ *            reported separately rather than attributed.
+ * Claims held by some OTHER named agent are left out: they are not this seat's
+ * to reassign, and listing them would invite someone to take live work away.
+ */
+const HELD_CAP = 20;
+
+function heldClaims(conv) {
+  const byAgent = [];
+  const unheld = [];
+  for (const t of tasks.values()) {
+    if (convIdOf(t) !== conv.id) continue;
+    // leaseOf() is already exactly "claimed, and no result" - reused rather than
+    // re-derived, so the two can never drift into disagreeing about what is
+    // still outstanding.
+    const lease = leaseOf(t);
+    if (!lease) continue;
+    const row = {
+      id: t.id,
+      claimedBy: t.claimedBy || null,
+      claimedAt: t.claimedAt || null,
+      heldForSec: secSince(t.claimedAt),
+      // Not an invitation to wait - it is the difference between "somebody may
+      // still answer this" and "anyone may take it right now".
+      leaseExpired: lease.expired,
+      leaseExpiresInSec: lease.leftSec,
+      text: asText(t.instruction).replace(/\s+/g, ' ').trim().slice(0, 120),
+    };
+    if (conv.agent && t.claimedBy === conv.agent) byAgent.push(row);
+    else if (!t.claimedBy) unheld.push(row);
+  }
+  const oldestFirst = (a, b) => msOf(a.claimedAt) - msOf(b.claimedAt);
+  byAgent.sort(oldestFirst);
+  unheld.sort(oldestFirst);
+  const count = byAgent.length + unheld.length;
+  return {
+    count,
+    byAgent: byAgent.slice(0, HELD_CAP),
+    unheld: unheld.slice(0, HELD_CAP),
+    truncated: byAgent.length > HELD_CAP || unheld.length > HELD_CAP,
+    /*
+     * Zero is an answer, not an absence, and it is said in words. "No held
+     * claims" and "nobody looked" are the two readings of a missing field, and
+     * the whole point of this object is that the operator can tell them apart.
+     */
+    summary: count === 0
+      ? 'Nothing in this tab is claimed and unanswered, so stopping the agent strands no questions.'
+      : `${count} task${count === 1 ? ' is' : 's are'} claimed here with no result`
+        + (conv.agent ? ` (${byAgent.length} held by "${conv.agent}"` : ' (0 held by a named occupant')
+        + `, ${unheld.length} claimed by nobody). Stopping the agent does not release them.`,
+    detail: count === 0 ? null
+      : 'A claim with no result is invisible to every future poll: it is not pending, so it '
+        + 'will never be offered again, and it reads as answered from everywhere except '
+        + '?status=claimed. Post a result on each one (even "abandoned, not answered") or '
+        + 'hand it to the replacement, before you stop anything. Once a claim\'s lease lapses '
+        + 'another agent can take it over with an ordinary claim - but nothing will ever '
+        + 'prompt anyone to, which is why this list exists.',
+  };
+}
+
+/*
+ * WHERE THE `spawnedBy` NAME CAME FROM, in words, said once here so the API and
+ * the page cannot drift. `verified` is a constant `false` and must stay one:
+ * this server never observes a spawn, it only ever receives a claim about one,
+ * and a consumer that has to infer that fact will eventually infer it wrong.
+ */
+function spawnOrigin(conv) {
+  if (!conv.spawnedBy) {
+    return {
+      by: null,
+      at: null,
+      source: null,
+      verified: false,
+      summary: 'No record of who spawned the agent in this tab.',
+      detail: 'Nothing has ever said, and this server does not guess. Only the session that '
+        + 'started an agent can stop it, so with no record nothing here can promise a stop '
+        + 'is available - not even that one is unavailable.',
+    };
+  }
+  const declared = conv.spawnedBySource === 'declared';
+  return {
+    by: conv.spawnedBy,
+    at: conv.spawnedByAt || null,
+    source: conv.spawnedBySource || null,
+    agoSec: secSince(conv.spawnedByAt),
+    verified: false,
+    summary: `"${conv.spawnedBy}" is recorded as having spawned ${conv.agent ? `"${conv.agent}"` : 'the agent here'}.`,
+    detail: declared
+      ? `"${conv.spawnedBy}" reported the spawn itself, in its own name, about the agent `
+        + 'holding this seat. That is the strongest record this API can hold - and it is '
+        + 'still a report. Relay did not witness the spawn and cannot confirm the session '
+        + 'is still alive to act on a stop.'
+      : 'Somebody asserted this on a conversation write. Relay does not know who sent it: '
+        + 'it may be the spawning session, the agent itself repeating its brief, or a third '
+        + 'party. Treat it as a lead, not as proof that this session can stop anything.',
+  };
+}
+
 /** null when there is genuinely nothing left running; otherwise, the bad news. */
 function ghostWarning(conv) {
   if (!conv.agent || conv.stopAck === 'stopped') return null;
@@ -6886,6 +7083,9 @@ function ghostWarning(conv) {
       + 'be running, still holding git worktrees, and still able to post here — where you '
       + 'will no longer see it. Ask it to stop first if you want it wound down.',
     forceKill: FORCE_KILL_NOTE,
+    // Archiving a tab whose agent is holding unanswered claims buries them
+    // twice over: the row is gone AND the claims still read as answered.
+    heldTasks: heldClaims(conv),
   };
 }
 
@@ -6909,6 +7109,13 @@ function stopRequestEffect(conv) {
       + 'its own. Until it acknowledges, assume it is still running and still holding any '
       + 'git worktrees it checked out.',
     forceKill: FORCE_KILL_NOTE,
+    /*
+     * Computed at the moment of asking, and returned to whoever asked, because
+     * this is the only point in the whole flow where someone is deciding to end
+     * an agent and can still do something about what it is holding. Anything
+     * later is archaeology.
+     */
+    heldTasks: heldClaims(conv),
   };
 }
 
@@ -7086,7 +7293,53 @@ function activityRoute(res, id, body) {
   } else {
     pushActivity(entry);
   }
-  send(res, 201, { ok: true, entry, durable: DURABLE_KINDS.has(kind) });
+
+  /*
+   * THE ONE PLACE THIS SERVER HEARS A SPAWN DECLARED IN THE FIRST PERSON.
+   *
+   * `spawnedBy` has existed since the clear-session control shipped and has
+   * been null on every conversation ever stored, because the only way to set it
+   * was a conversation write that no caller had any reason to make. Meanwhile
+   * this row - which coordinators are already told to post, and already do -
+   * carries the identical fact in a shape that cannot be sent by accident:
+   * `agent` is the reporter and `subagent` is who it spawned. When the subagent
+   * is the one sitting in this seat, the row IS the declaration.
+   *
+   * Narrow on purpose:
+   *   - only `spawned`, never `finished`;
+   *   - only when the reporter named itself (`agent` present);
+   *   - only when the seat is currently held by that exact subagent. A row
+   *     about somebody who is not here describes another tab's occupant, and
+   *     writing it would point a stop control at the wrong process.
+   * Nothing is inferred from a row that fails any of those - it is simply an
+   * activity row, as before.
+   *
+   * `declared` outranks `asserted`, so a first-person report replaces a
+   * third-hand one. It does not outrank itself: two sessions each claiming the
+   * same agent is last-write-wins, and `spawnedByAt` says which was last.
+   *
+   * REPORTED IN THE REPLY, never silent. A side effect on another record that
+   * the caller cannot see is how a field ends up lying about its own history.
+   */
+  let spawnRecorded = null;
+  if (kind === 'spawned' && entry.agent && conv.agent && conv.agent === subagent) {
+    if (conv.spawnedBy !== entry.agent || conv.spawnedBySource !== 'declared') {
+      const was = conv.spawnedBy || null;
+      appendEvent({ t: 'convpatch', id, patch: {
+        spawnedBy: entry.agent, spawnedByAt: at, spawnedBySource: 'declared',
+      } });
+      spawnRecorded = {
+        spawnedBy: entry.agent,
+        source: 'declared',
+        replaced: was,
+        detail: `"${entry.agent}" is now recorded as having spawned "${subagent}", the agent `
+          + 'holding this seat, because it said so itself. Relay did not witness the spawn '
+          + 'and this is not a verification of it.',
+      };
+    }
+  }
+
+  send(res, 201, { ok: true, entry, durable: DURABLE_KINDS.has(kind), spawnRecorded });
 }
 
 /*
@@ -7613,7 +7866,15 @@ async function route(req, res) {
     if (m === 'GET') {
       const found = conversationsWithLiveness().find((c) => c.id === seg[1]);
       if (!found) return fail(res, 404, `no conversation with id "${seg[1]}"`);
-      return send(res, 200, found);
+      /*
+       * On the ONE conversation, never on the list. Both of these are per-tab
+       * paragraphs that only the manage panel reads, and the list is already
+       * the largest response this server sends; adding a couple of sentences
+       * per row to it would be paid for by every poll of every client forever.
+       * The scalars (`spawnedBy`, `spawnedByAt`, `spawnedBySource`) ride the
+       * list as they always have, so nothing that only needs the fact loses it.
+       */
+      return send(res, 200, { ...found, heldTasks: heldClaims(found), spawnOrigin: spawnOrigin(found) });
     }
     if (m === 'POST') return updateConversation(res, seg[1], await readBody(req));
     return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });

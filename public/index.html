@@ -4354,8 +4354,67 @@
       return { can: false, line: '"' + c.agent + '" was spawned by "' + c.spawnedBy + '", not by "' + r.name
         + '". Only the session that started an agent can stop it, so this is a request, not a kill.' };
     }
-    return { can: true, line: '"' + r.name + '" spawned "' + c.agent + '" and is listening, so it can genuinely stop it. '
-      + 'Relay still cannot see whether it worked.' };
+    /*
+     * The name matches the listening Router — but a name is only as good as
+     * what put it there. `declared` means that Router reported the spawn itself,
+     * in its own name, about this occupant. `asserted` means somebody sent the
+     * field on a conversation write and relay does not know who: it may be the
+     * agent repeating its own brief back, in which case this reads as "the
+     * Router can stop it" on the agent's say-so alone. Both stay `can: true` —
+     * the request is worth making either way — but they must not read alike,
+     * because the whole point of recording provenance was to stop a control
+     * promising more than the record supports.
+     */
+    if (c.spawnedBySource !== 'declared') {
+      return { can: true, line: '"' + r.name + '" is recorded as having spawned "' + c.agent
+        + '" and is listening, so the request will reach a session that may be able to stop it. '
+        + 'That record was asserted on a conversation write, not reported by "' + r.name
+        + '" itself, so relay cannot tell you who wrote it.' };
+    }
+    return { can: true, line: '"' + r.name + '" reported spawning "' + c.agent + '" itself and is listening, '
+      + 'so it can genuinely stop it. Relay still cannot see whether it worked.' };
+  }
+
+  /*
+   * The spawn record, written for the session that has to act on it, and never
+   * shortened into a bare name. "spawnedBy=RelayCoord" alone invites the reader
+   * to treat it as ownership; who put the name there is the part that decides
+   * whether it is ownership or a rumour, so the two always travel together.
+   */
+  function spawnLine(c, who) {
+    if (!c || !c.spawnedBy) {
+      return '1. Stop ' + who + ' if this session spawned it. Relay has NO record of who spawned it - '
+        + 'nothing ever said, and relay does not guess. It cannot tell you whether this is yours to stop.';
+    }
+    return '1. Stop ' + who + ' if this session spawned it. Relay recorded spawnedBy=' + c.spawnedBy
+      + (c.spawnedBySource === 'declared'
+        ? ', which "' + c.spawnedBy + '" reported itself. Relay did not witness the spawn.'
+        : ', asserted on a conversation write by a caller relay cannot identify - a lead, not proof.');
+  }
+
+  /*
+   * WHAT THE STOP WOULD STRAND, spelled out in the instruction itself.
+   *
+   * A claim with no result is invisible to every future poll, so an agent
+   * stopped while holding one takes the question with it and the task reads as
+   * answered forever. That happened on 2026-08-31 with two of his messages, and
+   * the instruction this control generated said nothing about it. The operator
+   * is not expected to know to look; it is put in front of them.
+   */
+  function heldLines(h) {
+    if (!h || !h.count) return [];
+    var out = ['', 'BEFORE YOU STOP IT: ' + h.summary, h.detail, ''];
+    var all = (h.byAgent || []).concat(h.unheld || []);
+    for (var i = 0; i < all.length; i++) {
+      var t = all[i];
+      out.push('   - task ' + t.id + ', held by ' + (t.claimedBy || 'NOBODY (claimedBy is null)')
+        + ' for ' + Math.round((t.heldForSec || 0) / 60) + ' min, '
+        + (t.leaseExpired ? 'lease EXPIRED - another agent can take it over now'
+          : 'lease has ~' + Math.round((t.leaseExpiresInSec || 0) / 60) + ' min left')
+        + ': ' + t.text);
+    }
+    if (h.truncated) out.push('   - (more not listed - GET /tasks?conversation=' + tabId + '&status=claimed)');
+    return out;
   }
 
   function tabSet(tone, title, steps) {
@@ -4453,11 +4512,19 @@
           ]);
         });
       }
+      var held = null;
       var chain = who
         ? tabPost({ stopRequested: true, stopRequestedBy: 'human (archive)' }).then(function (s) {
           steps.push(s.ok
             ? ((s.b.stopRequestEffect && s.b.stopRequestEffect.summary) || 'Asked the coordinator to stop.')
             : 'The stop request FAILED: ' + ((s.b && s.b.error) || 'HTTP ' + s.status));
+          /*
+           * Captured from THIS reply, not read back later. The detach two steps
+           * down empties the seat, and after that nothing can still say which
+           * claims belonged to the agent being archived away.
+           */
+          if (s.ok && s.b.stopRequestEffect) held = s.b.stopRequestEffect.heldTasks || null;
+          if (held && held.count) steps.push(held.summary);
         })
         : Promise.resolve();
 
@@ -4491,13 +4558,17 @@
             return null;
           }
           var k = killPath(c || {});
-          var text = 'Tab "' + ((c && c.title) || tabId) + '" (' + tabId + ') has been ARCHIVED.\n\n'
-            + '1. Stop ' + who + ' if this session spawned it. Relay recorded spawnedBy='
-            + ((c && c.spawnedBy) || 'no record') + '.\n'
-            + '2. Do NOT spawn a replacement. The tab is closed.\n'
-            + '3. If a clear was queued for this tab, it is cancelled - do not act on it.\n\n'
-            + 'Relay has already asked the coordinator to stand down and detached it from the tab. '
-            + 'Neither of those stops a process; that is what this message is for.';
+          var text = ['Tab "' + ((c && c.title) || tabId) + '" (' + tabId + ') has been ARCHIVED.']
+            .concat(heldLines(held))
+            .concat([
+              '',
+              spawnLine(c, who),
+              '2. Do NOT spawn a replacement. The tab is closed.',
+              '3. If a clear was queued for this tab, it is cancelled - do not act on it.',
+              '',
+              'Relay has already asked the coordinator to stand down and detached it from the tab. '
+                + 'Neither of those stops a process; that is what this message is for.',
+            ]).filter(function (l) { return l !== null && l !== undefined; }).join('\n');
           return postTask(text, 'web', DEFAULT_CONV).then(function () {
             steps.push('Asked "' + DEFAULT_CONV + '" to stop it, as work a coordinator has to claim. ' + k.line);
             tabSet(k.can ? 'ok' : '', 'Archived, and a stop was requested.', steps.concat([
@@ -4541,20 +4612,35 @@
           return tabPost({ stopRequested: true, stopRequestedBy: 'human (clear session)' }).then(function (s) {
             if (!s.ok) steps.push('The stop request FAILED: ' + ((s.b && s.b.error) || 'HTTP ' + s.status));
             else steps.push((s.b.stopRequestEffect && s.b.stopRequestEffect.summary) || 'Asked the coordinator to stop.');
-            return mark;
+            /*
+             * WHAT THIS CLEAR WOULD STRAND, carried forward from the one reply
+             * that reports it. The stop request is the last moment the agent is
+             * still the seat's occupant, so it is the last moment anything can
+             * say which unanswered claims are its. Reported to the human in the
+             * panel AND written into the instruction, because the two readers
+             * act on different halves of it.
+             */
+            var h = (s.ok && s.b.stopRequestEffect && s.b.stopRequestEffect.heldTasks) || null;
+            if (h && h.count) steps.push(h.summary);
+            return { mark: mark, held: h };
           });
         })
-        .then(function (mark) {
+        .then(function (got) {
+          var mark = got.mark;
           var title = (c && c.title) || tabId;
           var who = (c && c.agent) || 'the coordinator';
-          var text = 'Clear session for tab "' + title + '" (' + tabId + ').\n\n'
-            + '1. Stop ' + who + ' if this session spawned it. Relay recorded spawnedBy='
-            + ((c && c.spawnedBy) || 'no record') + '.\n'
-            + '2. Spawn a fresh coordinator on the SAME tab.\n'
-            + '3. The fresh coordinator reads ONLY from the watermark forward:\n'
-            + '   GET /thread?conversationId=' + tabId + '&since=' + mark + '\n'
-            + '   Put that in its brief explicitly, or it will read the whole tab anyway.\n\n'
-            + 'Everything before the watermark stays visible to the human. Do not delete or hide any of it.';
+          var text = ['Clear session for tab "' + title + '" (' + tabId + ').']
+            .concat(heldLines(got.held))
+            .concat([
+              '',
+              spawnLine(c, who),
+              '2. Spawn a fresh coordinator on the SAME tab.',
+              '3. The fresh coordinator reads ONLY from the watermark forward:',
+              '   GET /thread?conversationId=' + tabId + '&since=' + mark,
+              '   Put that in its brief explicitly, or it will read the whole tab anyway.',
+              '',
+              'Everything before the watermark stays visible to the human. Do not delete or hide any of it.',
+            ]).filter(function (l) { return l !== null && l !== undefined; }).join('\n');
           /*
            * POSTED AS A TASK, NOT AS A MESSAGE — and the difference is the
            * whole control working or silently doing nothing.
@@ -4628,7 +4714,20 @@
      * answer here — nothing wrote this field before tonight — and it is the
      * answer that decides whether the clear control can promise anything.
      */
-    srow(info, 'Spawned by', c.spawnedBy || 'no record');
+    srow(info, 'Spawned by', c.spawnedBy
+      ? c.spawnedBy + ' · ' + (c.spawnedBySource === 'declared' ? 'reported by itself' : 'asserted, source unknown')
+      : 'no record');
+    /*
+     * WHAT A STOP WOULD STRAND. Shown before the controls, not after, because
+     * it is the one fact that should change whether he presses them. Zero is
+     * said out loud too: "nothing held" and "nobody checked" are the two
+     * readings of a missing row, and the point of this is telling them apart.
+     */
+    if (c.heldTasks) {
+      srow(info, 'Unanswered claims',
+        c.heldTasks.count ? c.heldTasks.count + ' claimed, no result' : 'none',
+        c.heldTasks.count ? 'bad' : '');
+    }
     srow(info, 'Context from', c.contextFrom ? rel(c.contextFrom) : 'never cleared');
     /*
      * An outstanding request naming this tab. Shown because archiving is about
