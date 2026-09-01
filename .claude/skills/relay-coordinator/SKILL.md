@@ -67,6 +67,9 @@ curl -s -X POST http://127.0.0.1:3901/messages -H 'content-type: application/jso
 - **If you were briefed to do something and the brief did not tell you to ack, ack anyway.** The two coordinators above followed their briefs exactly.
 - Plain ASCII in the body (see **Tasks**).
 
+- **While you are running, watch your own tab and claim your own tasks** — don't wait for a router to relay each message, which costs a coordinator round-trip every time. See **Watch, don't poll**; after any reconnect, poll `GET /tasks?conversation=<yours>&status=pending`, because a stream only carries events forward.
+- **A seat means a live process, not an assignment. If your process is ending, release the seat — even mid-topic.** A turn-scoped agent cannot hold a stream across turns, so "I'll keep the seat and keep watching" is a claim you cannot honour: `agentState.listeners` is the server counting live SSE subscribers on *your* conversation, and it will read `0` the moment you stop. Leaving your name there produces a phantom seat that `seatUnwatched` flags in 2 minutes and that autoseat will not replace, because the chair looks taken. **An honestly empty seat gets refilled; a falsely occupied one strands the tab.** Vacating often is correct and cheap — say why (`agentLeftReason`) and let the next dispatch pick it up.
+
 **If you dispatch agents, brief them with this rule.** The failure above was not the workers' — it was in the dispatch. Naming and announcing are covered in **Activity reporting**.
 
 ## Be terse — the coordinator is the bottleneck
