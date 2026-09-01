@@ -136,6 +136,182 @@ const HUMAN_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
  * cannot be re-dispatched by a restart; short enough that the file stays small. */
 const STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+/* ------------------------------------------------- dead-on-arrival alarm
+ *
+ * A DISPATCH THAT DIES AT BIRTH MUST BE AS LOUD AS ONE THAT NEVER HAPPENED.
+ *
+ * On 2026-09-01 autoseat was healthy and dispatching correctly, and every
+ * coordinator it spawned died in about two seconds with exit=1. The whole
+ * content of each per-dispatch log was 73 bytes:
+ *
+ *     Failed to authenticate: OAuth session expired and could not be refreshed
+ *
+ * The child's stdout and stderr go straight into that file, and the exit
+ * handler logged only the number. So the REASON was captured on disk and then
+ * surfaced nowhere a human or an agent would ever look. Tabs sat with
+ * `agent:null` and waiting human messages for hours while every component
+ * reported itself healthy, and `relay-watchdog` could only say "AUTOSEAT IS
+ * NOT SEATING ... check the autoseat process" - pointing at the one part that
+ * was fine.
+ *
+ * WHY THE TEST IS "LEFT NO TRACE" AND NOT A STOPWATCH.
+ *
+ * The obvious gate is "nonzero exit within N seconds". It is the wrong one in
+ * both directions: a child that takes 12s to fail its auth refresh is just as
+ * dead, and N is a number nobody can defend. The question that actually
+ * separates died-at-birth from ran-and-crashed is whether the coordinator ever
+ * did anything, and relay already knows: step 2 of every brief is to post an
+ * ack into the tab. So the test is `exit != 0 AND the tab holds no message
+ * authored by this agent`. A coordinator that worked for an hour and then
+ * exited nonzero has acked, and cannot trip this - no wolf is cried. Runtime
+ * is reported in the alarm because it is useful context, never as the gate.
+ *
+ * WHY A MESSAGE INTO THE AFFECTED TAB, AND NOT A TASK.
+ *
+ * `relay-watchdog` posts its alarms into `main` as TASKS with
+ * `from: "relay-watchdog"`, which is not in HUMAN_ORIGINS - so the alarm about
+ * autoseat being broken is itself permanently unstaffable. It lands where
+ * nothing can ever pick it up, and two of them sat unread for two days. An
+ * alarm that can only be acted on by an agent autoseat would have to seat is
+ * worthless in exactly the case it exists for.
+ *
+ * So this is a plain `POST /messages` into the tab that is stranded, written
+ * by autoseat itself. It needs reading, not staffing. It lands directly under
+ * the human message nobody answered, which is the one place he looks when he
+ * wonders why nobody answered. `POST /messages` is server-set `role: "agent"`,
+ * so it cannot feed back into the trigger and dispatch anything.
+ */
+const DOA_LOG_TAIL_BYTES = 600;
+
+/* How long an identical failure stays "already reported" for the `main`
+ * escalation. The per-tab alarm needs no cooldown - dispatch memory is keyed on
+ * task id, so a given human message can produce at most one dispatch and
+ * therefore at most one alarm, ever. The escalation is the only path that can
+ * repeat, because ten stranded tabs are ten different messages saying the same
+ * thing. One clear alarm, not fifty. */
+const ALARM_REPEAT_MS = 30 * 60 * 1000;
+
+/*
+ * The last few lines of the child log, flattened into one line relay will
+ * accept: pure ASCII (a non-UTF-8 body is refused outright and NOTHING is
+ * stored, so a mangled reason would silently lose the whole alarm), no ANSI
+ * escapes, no control characters, bounded length.
+ */
+function readableReason(raw) {
+  const ascii = String(raw == null ? '' : raw)
+    .replace(/\x1B\[[0-9;?]*[A-Za-z]/g, '')     // ANSI colour from a TTY-ish child
+    .replace(/[^\x20-\x7E\n\r\t]/g, ' ')        // anything relay would call damaged
+    .replace(/[\r\t]+/g, ' ');
+  const lines = ascii.split('\n').map((l) => l.trim()).filter(Boolean);
+  const text = lines.slice(-3).join(' | ').replace(/\s+/g, ' ').trim();
+  return text.length > 400 ? `${text.slice(0, 397)}...` : text;
+}
+
+function reasonFromLogFile(file, bytes) {
+  try {
+    const size = fs.statSync(file).size;
+    const want = Math.min(size, bytes == null ? DOA_LOG_TAIL_BYTES : bytes);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(want);
+      fs.readSync(fd, buf, 0, want, size - want);
+      return readableReason(buf.toString('utf8'));
+    } finally { fs.closeSync(fd); }
+  } catch (e) {
+    return `the child log could not be read (${e.message})`;
+  }
+}
+
+/*
+ * A key for "this same failure again", so the escalation can be suppressed
+ * without suppressing a DIFFERENT failure that happens to arrive next.
+ * Digits, ids, paths and quoted fragments vary between dispatches for one
+ * underlying cause, so they are stripped rather than compared.
+ */
+function failureSignature(reason) {
+  return String(reason || '')
+    .toLowerCase()
+    .replace(/[^a-z ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'unknown';
+}
+
+/*
+ * The whole decision, as a function of data, so it can be driven by fixtures.
+ * `trace` is tri-state on purpose: true (it spoke), false (it never did), or
+ * null (relay could not be asked). A null must not silently become "it spoke",
+ * because that is the reading that suppresses the alarm.
+ */
+function classifyDispatchExit(o) {
+  const code = o.code;
+  const signal = o.signal || null;
+  const spawnError = o.spawnError || null;
+  const trace = o.trace === undefined ? null : o.trace;
+  const ranMs = Number(o.ranMs || 0);
+
+  if (spawnError) {
+    return { alarm: true, kind: 'spawn-failed', ranMs, trace,
+      reason: readableReason(spawnError) };
+  }
+  const failed = signal !== null || (code !== 0 && code !== null && code !== undefined);
+  if (!failed) return { alarm: false, kind: 'clean', ranMs, trace, reason: o.reason || '' };
+  if (trace === true) {
+    return { alarm: false, kind: 'crashed-after-working', ranMs, trace, reason: o.reason || '' };
+  }
+  return {
+    alarm: true,
+    kind: trace === null ? 'died-unverified' : 'died-on-arrival',
+    ranMs,
+    trace,
+    reason: o.reason || 'the child wrote nothing before it died',
+  };
+}
+
+/*
+ * What the human reads. Pure ASCII, bulleted, leads with the fact that this
+ * tab has nobody in it - not with the investigation.
+ *
+ * It says the message will NOT be retried, because that is true and because
+ * the alternative is worse: dispatch memory is written BEFORE the spawn
+ * precisely so a persistent fault cannot build a backlog, and clearing it here
+ * would turn a stuck auth into a coordinator spawned every ten seconds
+ * forever. The bounded, honest outcome is one dispatch and one alarm that says
+ * a human has to reseat.
+ */
+function alarmText(o) {
+  const secs = Math.max(0, Math.round(Number(o.ranMs || 0) / 1000));
+  const how = o.kind === 'spawn-failed'
+    ? 'it could not be started at all'
+    : `it exited ${o.signal ? `on ${o.signal}` : `with code ${o.code}`} after ${secs}s`;
+  const lines = [
+    `**autoseat: the coordinator for this tab died on arrival.** \`${o.agent}\` was dispatched and ${how}, `
+      + 'without ever posting here.',
+    '',
+    '- **Nobody is answering this tab.** The dispatch happened; the coordinator never started work.',
+    `- **Reason:** \`${o.reason}\``,
+  ];
+  if (o.kind === 'died-unverified') {
+    lines.push('- **Unverified:** relay could not be asked whether it had posted, so this may be a late crash rather than a birth failure.');
+  }
+  if (o.logFile) lines.push(`- **Full child log:** \`${o.logFile}\``);
+  lines.push('- **This message will not be re-dispatched automatically.** Autoseat records one dispatch per message'
+    + ' before spawning, so a persistent fault cannot build a backlog. Fix the cause, then seat this tab by hand.');
+  return lines.join('\n');
+}
+
+function escalationText(o) {
+  return [
+    `**autoseat: dispatched coordinators are dying at birth.** ${o.count} so far; the newest was \`${o.agent}\` `
+      + `in ${o.title ? `"${o.title}" ` : ''}(${o.conversationId}).`,
+    '',
+    '- **Autoseat itself is fine** - it is seating tabs correctly. The coordinators it starts are failing immediately.',
+    `- **Reason:** \`${o.reason}\``,
+    '- **Effect:** every affected tab holds an unanswered message and an empty seat, and will not be retried.',
+    '- **Repeat alarms for this same reason are suppressed for 30 minutes.**',
+  ].join('\n');
+}
+
 // --------------------------------------------------------------- pure core
 
 /*
@@ -326,6 +502,137 @@ async function getJson(base, route) {
   return r.json();
 }
 
+/*
+ * The only write this file makes to relay, and it is deliberately the most
+ * boring one available: POST /messages needs nothing but a conversation id, is
+ * born `done` and `relayed`, does not touch the seat, and is server-set
+ * `role: "agent"` so it can never come back round as a dispatch trigger.
+ *
+ * A failure to post is logged and swallowed. The alarm is a report about a
+ * failure; it must not be able to become one.
+ */
+async function postMessage(base, body) {
+  const r = await fetch(`${base}/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!r.ok) throw new Error(`POST /messages -> ${r.status} ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+
+/*
+ * Did this coordinator ever speak? Step 2 of every brief is an ack into the
+ * tab, so a message authored by its name is proof the process got as far as
+ * doing real work. Returns null - NOT false - when relay cannot be asked, so
+ * "I do not know" cannot be mistaken for "it never spoke" or for "it did".
+ */
+async function agentSpokeIn(base, conversationId, agent) {
+  try {
+    const j = await getJson(base, `/messages?conversationId=${encodeURIComponent(conversationId)}`);
+    const msgs = (j && j.messages) || [];
+    return msgs.some((m) => m && (m.author === agent || m.from === agent));
+  } catch {
+    return null;
+  }
+}
+
+/*
+ * Turn a dead dispatch into something a human will actually see.
+ *
+ * Order matters: the per-tab alarm goes first and is never suppressed, because
+ * it is the one that lands where the stranded message is. The `main`
+ * escalation is second and IS suppressed on a repeat, because that is the only
+ * path that can fire many times for one underlying cause.
+ */
+async function reportDispatchExit(cfg, runtime, o) {
+  const log = runtime.log;
+  const trace = o.spawnError ? false : await agentSpokeIn(cfg.queue, o.conversationId, o.agent);
+  const verdict = classifyDispatchExit({
+    code: o.code,
+    signal: o.signal,
+    spawnError: o.spawnError,
+    ranMs: o.ranMs,
+    trace,
+    reason: o.logFile ? reasonFromLogFile(o.logFile) : '',
+  });
+
+  if (!verdict.alarm) {
+    if (verdict.kind === 'crashed-after-working') {
+      log(`FINISHED ${o.agent} exit=${o.code} after ${Math.round(verdict.ranMs / 1000)}s (${o.conversationId})`
+        + ' - it had already posted in the tab, so this is a late crash, not a birth failure. No alarm.');
+    }
+    return verdict;
+  }
+
+  log(`DEAD ON ARRIVAL ${o.agent} (${o.conversationId}) after ${Math.round(verdict.ranMs / 1000)}s: ${verdict.reason}`);
+
+  const body = {
+    conversationId: o.conversationId,
+    agent: 'autoseat',
+    text: alarmText({
+      agent: o.agent,
+      kind: verdict.kind,
+      code: o.code,
+      signal: o.signal,
+      ranMs: verdict.ranMs,
+      reason: verdict.reason,
+      logFile: o.logFile,
+    }),
+  };
+  try {
+    await postMessage(cfg.queue, body);
+  } catch (e) {
+    log(`ALARM FAILED to reach ${o.conversationId}: ${e.message}`);
+  }
+
+  const sig = failureSignature(verdict.reason);
+  const now = Date.now();
+  runtime.state.alarms = runtime.state.alarms || {};
+  const seen = runtime.state.alarms[sig];
+  const count = (seen ? seen.count : 0) + 1;
+  /*
+   * `escalatedAt` is tracked separately from `at`, and that separation is the
+   * whole cooldown. Measuring the window from the last FAILURE means a fault
+   * that fires every minute keeps pushing the deadline out and the escalation
+   * posts exactly once, then never again for the rest of a six-hour outage -
+   * the suppression would be strongest precisely when the problem is worst.
+   * Measuring from the last ESCALATION gives what was asked for: one alarm,
+   * repeated on a slow clock while it is still true, not fifty.
+   */
+  const escalatedAt = seen && seen.escalatedAt ? Date.parse(seen.escalatedAt) : 0;
+  const dueAgain = !(now - escalatedAt < ALARM_REPEAT_MS);
+  runtime.state.alarms[sig] = {
+    at: new Date(now).toISOString(),
+    escalatedAt: dueAgain ? new Date(now).toISOString() : (seen && seen.escalatedAt) || null,
+    count,
+    conversationId: o.conversationId,
+  };
+  if (dueAgain && cfg.alarmConversation) {
+    try {
+      await postMessage(cfg.queue, {
+        conversationId: cfg.alarmConversation,
+        agent: 'autoseat',
+        text: escalationText({
+          agent: o.agent,
+          title: o.title,
+          conversationId: o.conversationId,
+          reason: verdict.reason,
+          count,
+        }),
+      });
+    } catch (e) {
+      log(`ALARM FAILED to reach ${cfg.alarmConversation}: ${e.message}`);
+    }
+  } else if (!dueAgain) {
+    log(`(escalation to ${cfg.alarmConversation} suppressed - same failure ${count} times within 30m)`);
+  }
+
+  saveState(cfg.stateFile, runtime.state);
+  return verdict;
+}
+
 function loadState(file) {
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -334,9 +641,17 @@ function loadState(file) {
     for (const [k, v] of Object.entries(raw.dispatched || {})) {
       if (Date.parse(v && v.at) >= cutoff) out[k] = v;
     }
-    return { dispatched: out };
+    const alarms = {};
+    /* Alarm records are suppression state, not history: one that can no longer
+     * suppress anything is dead weight, and its `count` would misreport a fresh
+     * failure as the continuation of an outage that ended hours ago. */
+    const alarmCutoff = Date.now() - ALARM_REPEAT_MS;
+    for (const [k, v] of Object.entries(raw.alarms || {})) {
+      if (Date.parse(v && v.at) >= alarmCutoff) alarms[k] = v;
+    }
+    return { dispatched: out, alarms };
   } catch {
-    return { dispatched: {} };
+    return { dispatched: {}, alarms: {} };
   }
 }
 
@@ -498,26 +813,57 @@ async function tick(cfg, runtime) {
     const args = ['-p', brief({ ...pick, title: live.title || pick.title, agent, queue: cfg.queue })];
     if (cfg.model) args.push('--model', cfg.model);
 
+    /*
+     * WHO THE ALARM IS ABOUT, captured here rather than re-derived in the
+     * handlers, because by the time a child exits the loop variable this all
+     * hangs off is long gone and `live` has been reassigned by later picks.
+     */
+    const failed = {
+      agent,
+      conversationId: pick.conversationId,
+      title: live.title || pick.title,
+      logFile,
+      startedMs: Date.now(),
+    };
+    /*
+     * Node may emit BOTH 'error' and 'exit' for a child that never started, and
+     * two alarms for one dead dispatch is the spam this is supposed to prevent.
+     * One report per dispatch, whichever fires first.
+     */
+    let reported = false;
+    const report = (extra) => {
+      if (reported) return;
+      reported = true;
+      reportDispatchExit(cfg, runtime, {
+        ...failed,
+        ranMs: Date.now() - failed.startedMs,
+        ...extra,
+      }).catch((e) => log(`ALARM FAILED for ${agent}: ${e.message}`));
+    };
+
     let child;
     try {
       child = spawn(cfg.claude, args, { cwd: cfg.cwd, stdio: ['ignore', fd, fd], windowsHide: true });
     } catch (e) {
       fs.closeSync(fd);
       log(`DISPATCH FAILED ${agent} -> ${pick.conversationId}: ${e.message}`);
+      report({ spawnError: e.message });
       continue;
     }
 
     runtime.inFlight.add(pick.conversationId);
     log(`DISPATCH ${agent} -> ${pick.title} (${pick.conversationId}) covering ${covered.length} message(s), log ${path.basename(logFile)}`);
 
-    child.on('exit', (code) => {
+    child.on('exit', (code, signal) => {
       try { fs.closeSync(fd); } catch { /* already closed */ }
       runtime.inFlight.delete(pick.conversationId);
       log(`FINISHED ${agent} exit=${code} (${pick.conversationId})`);
+      report({ code, signal });
     });
     child.on('error', (e) => {
       runtime.inFlight.delete(pick.conversationId);
       log(`DISPATCH ERROR ${agent}: ${e.message}`);
+      report({ spawnError: e.message });
     });
   }
   runtime.lastOutcome = `seated ${chosen.length}`;
@@ -549,6 +895,13 @@ function parseArgs(argv) {
     // the default-allow case above rather than an error anyone would see.
     cwd: '/home/hypnodroid/Projects/relay-queue',
     model: '',
+    /*
+     * Where the deduped escalation goes when coordinators are dying at birth.
+     * `main` because it is the tab he actually watches; the per-tab alarm is
+     * the primary channel and does not depend on this. Set it to '' or 'none'
+     * to post only into the affected tabs.
+     */
+    alarmConversation: process.env.AUTOSEAT_ALARM_CONVERSATION || 'main',
     ignore: new Set(),
     once: false,
     dry: false,
@@ -567,6 +920,7 @@ function parseArgs(argv) {
     else if (a === '--claude') cfg.claude = next();
     else if (a === '--cwd') cfg.cwd = next();
     else if (a === '--model') cfg.model = next();
+    else if (a === '--alarm-conversation') { const v = next(); cfg.alarmConversation = (!v || v === 'none') ? null : v; }
     else if (a === '--ignore') String(next()).split(',').forEach((x) => x && cfg.ignore.add(x.trim()));
     else if (a === '--once') cfg.once = true;
     else if (a === '--dry') cfg.dry = true;
@@ -592,6 +946,8 @@ const USAGE = `autoseat - dispatch a coordinator into a tab that has a human mes
   --cwd DIR            working directory for the coordinator (default /home/hypnodroid/Projects/relay-queue;
                        this is where the coordinator skill and the guard are found - see the note in parseArgs)
   --model NAME         model for the coordinator (default: whatever claude is configured with)
+  --alarm-conversation ID  where to escalate coordinators dying at birth (default main; 'none' to
+                       post only into the affected tab)
   --ignore A,B         conversation ids never to seat
   --once               run a single pass and exit
   --dry                decide, log, spawn nothing
@@ -640,6 +996,13 @@ async function main() {
 // DEFAULT cwd is a directory actually containing the coordinator skill and the
 // guard registration. That coupling has no runtime symptom when broken, so it
 // needs a test rather than a comment.
-module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, parseArgs, HUMAN_ORIGINS };
+module.exports = {
+  selectSeats, coveredBy, agentName, brief, writeHeartbeat, parseArgs, HUMAN_ORIGINS,
+  // Dead-on-arrival alarm. Exported for autoseat-doa-selftest.js, which drives
+  // the whole path against a real relay without spawning a real Claude.
+  classifyDispatchExit, readableReason, reasonFromLogFile, failureSignature,
+  alarmText, escalationText, reportDispatchExit, agentSpokeIn, loadState, saveState,
+  ALARM_REPEAT_MS, DOA_LOG_TAIL_BYTES,
+};
 
 if (require.main === module) main();
