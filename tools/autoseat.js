@@ -132,6 +132,13 @@ const DEFAULT_HEARTBEAT = path.join(os.homedir(), '.relay-autoseat', 'heartbeat.
  */
 const HUMAN_ORIGINS = new Set(['web', 'voice', 'voice-conversation']);
 
+/*
+ * The exact flags `--no-mcp` appends. A named const so the wiring is testable
+ * (tools/autoseat-nomcp-selftest.js) without standing up a real spawn, and so
+ * the measured saving stays attached to the literal it was measured for.
+ */
+const NO_MCP_ARGS = ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'];
+
 /* How long a dispatch record is kept. Long enough that a message from last week
  * cannot be re-dispatched by a restart; short enough that the file stays small. */
 const STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -497,6 +504,33 @@ async function tick(cfg, runtime) {
 
     const args = ['-p', brief({ ...pick, title: live.title || pick.title, agent, queue: cfg.queue })];
     if (cfg.model) args.push('--model', cfg.model);
+    /*
+     * `--no-mcp` (OFF by default) drops every MCP server from a dispatched
+     * coordinator.
+     *
+     * MEASURED, on this box, 2026-09-01, via `claude -p --output-format json`
+     * reading the reported usage:
+     *   default spawn ................................. 23,323 boot tokens
+     *   + --strict-mcp-config --mcp-config {} ......... 19,021 boot tokens
+     * so 4,302 tokens, and the boot payload is re-fed on EVERY turn of the
+     * session, not once. A 60-turn coordinator therefore pays ~258K tokens
+     * purely to carry MCP tool definitions it does not use: relay coordination
+     * is curl plus file edits, and brief() already forbids the two MCP-shaped
+     * things a coordinator might reach for (speaking aloud, push notifications).
+     *
+     * It is OFF by default and left as the operator's switch on purpose. It
+     * removes capability, not just cost - a tab that asks a coordinator for
+     * something an MCP server provides would silently be unable to do it - and
+     * that is a trade for a human to make knowingly rather than a saving to
+     * take by stealth.
+     *
+     * NOT combined with `--setting-sources`: trimming settings saves a further
+     * ~2,200 tokens but drops the project `.claude/settings.json` that
+     * registers the coordinator guard, and Claude Code does NOT inherit
+     * settings up the tree. That would disable a safety check to save tokens,
+     * so it is deliberately not offered here.
+     */
+    if (cfg.noMcp) args.push(...NO_MCP_ARGS);
 
     let child;
     try {
@@ -553,6 +587,9 @@ function parseArgs(argv) {
     once: false,
     dry: false,
     explain: false,
+    // See the --no-mcp block in the dispatch path for the measurement. Off by
+    // default: it removes capability from a coordinator, not just tokens.
+    noMcp: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -571,6 +608,7 @@ function parseArgs(argv) {
     else if (a === '--once') cfg.once = true;
     else if (a === '--dry') cfg.dry = true;
     else if (a === '--explain') cfg.explain = true;
+    else if (a === '--no-mcp') cfg.noMcp = true;
     else if (a === '--help' || a === '-h') cfg.help = true;
     else throw new Error(`unknown argument ${a}`);
   }
@@ -640,6 +678,6 @@ async function main() {
 // DEFAULT cwd is a directory actually containing the coordinator skill and the
 // guard registration. That coupling has no runtime symptom when broken, so it
 // needs a test rather than a comment.
-module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, parseArgs, HUMAN_ORIGINS };
+module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, parseArgs, HUMAN_ORIGINS, NO_MCP_ARGS };
 
 if (require.main === module) main();
