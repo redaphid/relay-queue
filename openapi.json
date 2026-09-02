@@ -1,0 +1,2416 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "relay-queue",
+    "version": "1.6.0",
+    "summary": "The message queue between the human and his agents.",
+    "description": "A minimal, durable, local-only HTTP task queue with a mobile web UI. Every mutation is appended to `data/events.jsonl` (write + fsync) BEFORE the response is sent, then replayed into memory on boot. The core server has zero runtime dependencies.\n\nTHIS DOCUMENT IS HAND-WRITTEN AND DRIFT-CHECKED. `openapi.json` is the source of truth; `openapi.yaml` is generated from it by `node openapi-yaml.js`. `tools/openapi-selftest.js` boots a real server, proves every path+method documented here actually routes, and scans `server.js` for route segments that are NOT documented here. Add a route, and that suite fails until this file grows with it.\n\nCONVENTIONS THAT HOLD EVERYWHERE\n\n- No authentication. The server binds 127.0.0.1 by default and trusts every caller. Do not expose it.\n- JSON in, JSON out, `cache-control: no-store`, except for the static UI, the icons, the image bytes and `/tts`.\n- Request bodies are decoded with a STRICT UTF-8 decoder. A body that is not valid UTF-8 is refused 400 (`the request body is not valid UTF-8, so nothing was stored`) with a `detail` object naming the first bad byte. NOTHING IS STORED. Build bodies with `curl --data-binary @file.json`, never with a shell-quoted `-d` string.\n- Text that already contains U+FFFD (a replacement character - the damage happened before it got here) is refused 400 on agent-written routes (`/messages`, `/tasks/{id}/result`, `/tasks/{id}/progress`, `/credits/*`). `POST /tasks` is the exception: it WARNS AND STORES, because that is the route the human's own typed and dictated messages arrive on and dropping one would be worse than the damage.\n- An EMPTY body is a valid `{}`. `POST /tasks/{id}/claim` and `POST /tasks/{id}/progress` depend on that.\n- Bodies are capped at 1 MiB (413). `instruction`/`text` is capped at 8000 chars; a progress `note` at 500.\n- List filters: `conversation` is canonical, `conversationId` is accepted everywhere as an alias. `since` takes ISO 8601 or epoch milliseconds and is STRICTLY after. `limit` must be a non-negative integer.\n- Wrong method on a real path is 405 with `{ allow }`. An unknown path is 404 `no route for <METHOD> <path>`.\n\nTHE TRAPS, IN ONE PLACE (each is repeated on the operation it bites)\n\n1. `POST /tasks/{id}/claim` with NO identity field returns 200 with `claimedBy: null`. The seat then reads occupied with nobody in it, the real worker cannot renew its own lease, and the task never returns to `pending`. Always send `by`.\n2. `POST /tasks/{id}/result` is one-shot. 409 if already done, 400 if `result` is null, 409 if `by` names someone other than the holder. Omit `by` to answer a task whose claim is orphaned.\n3. Never `POST /tasks/{id}/relayed` before the `result` POST returned 200.\n4. `/checklist` (singular) and `/checklists` (plural) are DIFFERENT SYSTEMS one letter apart.\n5. `POST /conversations/{id}` answers 409 when the patch it just applied was overwritten inside its own request. Nothing you asked for is in effect.\n6. `agentLeftReason: \"presumed-gone\"` is reserved for the vacant-chair sweep and is refused 400 from callers.\n7. `DELETE /conversations/{id}/share` is destructive, and revoke-then-republish mints a NEW slug. Re-POST to refresh instead.\n8. `pick` events never reach the SSE stream. `check` events do.\n9. The word `agent` means three different things on three routes. See `POST /tasks/{id}/claim`.",
+    "license": { "name": "MIT" }
+  },
+  "servers": [
+    { "url": "http://127.0.0.1:3901", "description": "the local queue" }
+  ],
+  "tags": [
+    { "name": "tasks", "description": "The queue itself: ask, claim, report progress, answer, mark delivered." },
+    { "name": "thread", "description": "The chronological human+agent view, and the read-only projections over it." },
+    { "name": "conversations", "description": "Tabs. Every task belongs to exactly one." },
+    { "name": "messages", "description": "An agent speaking rather than answering, plus the agent-to-agent channels." },
+    { "name": "checklists", "description": "Two systems one letter apart. Read both descriptions before using either." },
+    { "name": "picks", "description": "Selectable image sets: \"here are five seeds, pick one\"." },
+    { "name": "images", "description": "Content-addressed image blobs and the gallery over them." },
+    { "name": "agents", "description": "The roster, the tree, the graveyard, and the addressed inbox." },
+    { "name": "health", "description": "Is anything listening, and is anyone home." },
+    { "name": "voice", "description": "Speech in, speech out, and the dictionary the transcript is repaired against." },
+    { "name": "push", "description": "Web push subscriptions and quiet hours." },
+    { "name": "credits", "description": "The flat one-credit-per-feature economy." },
+    { "name": "share", "description": "Publishing a conversation as a public snapshot. A copy, never a proxy." },
+    { "name": "events", "description": "Server-Sent Events. Watch, do not poll." },
+    { "name": "meta", "description": "This document, the static UI and the installable-app files." },
+    { "name": "v2", "description": "A bounded Hono + zod-openapi proof-of-concept over 5 existing routes. See HONO-POC.md." }
+  ],
+  "paths": {
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenapiJson",
+        "tags": ["meta"],
+        "summary": "This document",
+        "description": "The hand-written OpenAPI 3.1 description of every route on this server, served from `openapi.json` on disk. The checkout is bind-mounted READ-ONLY into the container, so this is a read; nothing here can write it.",
+        "responses": {
+          "200": {
+            "description": "the spec",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          },
+          "503": {
+            "description": "openapi.json is missing or unreadable on disk",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/openapi.yaml": {
+      "get": {
+        "operationId": "getOpenapiYaml",
+        "tags": ["meta"],
+        "summary": "This document, as YAML",
+        "description": "The same document, rendered from `openapi.json` on every request by `openapi-yaml.js`. Rendered rather than read from the `openapi.yaml` file so the two can never disagree: the file on disk exists for git and for tooling that wants a path, and `node openapi-yaml.js` regenerates it. `tools/openapi-selftest.js` fails if the checked-in file has drifted.",
+        "responses": {
+          "200": {
+            "description": "the spec as YAML",
+            "content": { "application/yaml": { "schema": { "type": "string" } } }
+          },
+          "503": {
+            "description": "openapi.json is missing or unreadable on disk",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "operationId": "getIndex",
+        "tags": ["meta"],
+        "summary": "The mobile web UI",
+        "description": "One self-contained HTML file, served with a tight CSP and the `x-relay-app: 1` header the service worker keys its cache on.",
+        "responses": {
+          "200": { "description": "the page", "content": { "text/html": { "schema": { "type": "string" } } } },
+          "503": {
+            "description": "no UI file found on disk",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/sw.js": {
+      "get": {
+        "operationId": "getServiceWorker",
+        "tags": ["meta"],
+        "summary": "The service worker",
+        "description": "The one file the page cannot inline: a service worker must be a real same-origin script.",
+        "responses": {
+          "200": { "description": "the worker", "content": { "text/javascript": { "schema": { "type": "string" } } } },
+          "503": { "description": "not on disk", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/manifest.webmanifest": {
+      "get": {
+        "operationId": "getManifest",
+        "tags": ["meta"],
+        "summary": "Installable-app metadata",
+        "responses": {
+          "200": { "description": "the manifest", "content": { "application/manifest+json": { "schema": { "type": "object" } } } }
+        }
+      }
+    },
+    "/icon-192.png": {
+      "get": {
+        "operationId": "getIcon192",
+        "tags": ["meta"],
+        "summary": "Home-screen icon, 192px",
+        "description": "Icons are drawn and PNG-encoded by `icons.js` at boot, never read from disk and never looked up by joining anything from the URL onto a path.",
+        "responses": {
+          "200": { "description": "PNG", "content": { "image/png": { "schema": { "type": "string", "format": "binary" } } } }
+        }
+      }
+    },
+    "/icon-512.png": {
+      "get": {
+        "operationId": "getIcon512",
+        "tags": ["meta"],
+        "summary": "Home-screen icon, 512px",
+        "responses": {
+          "200": { "description": "PNG", "content": { "image/png": { "schema": { "type": "string", "format": "binary" } } } }
+        }
+      }
+    },
+    "/icon-maskable-512.png": {
+      "get": {
+        "operationId": "getIconMaskable",
+        "tags": ["meta"],
+        "summary": "Maskable icon, 512px",
+        "responses": {
+          "200": { "description": "PNG", "content": { "image/png": { "schema": { "type": "string", "format": "binary" } } } }
+        }
+      }
+    },
+    "/apple-touch-icon.png": {
+      "get": {
+        "operationId": "getAppleTouchIcon",
+        "tags": ["meta"],
+        "summary": "iOS home-screen icon",
+        "responses": {
+          "200": { "description": "PNG", "content": { "image/png": { "schema": { "type": "string", "format": "binary" } } } }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "tags": ["health"],
+        "summary": "Liveness, version and queue depth",
+        "description": "Cheap and always safe. `boot` echoes `RELAY_BOOT_NONCE` and is null in production: a test harness passes a nonce in and refuses to proceed until this route echoes THAT token back, which is how it tells its own child from whoever else holds the port.",
+        "responses": {
+          "200": {
+            "description": "alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status", "name", "version", "counts"],
+                  "properties": {
+                    "status": { "type": "string", "const": "ok" },
+                    "name": { "type": "string", "const": "relay-queue" },
+                    "version": { "type": "string" },
+                    "boot": { "type": ["string", "null"], "description": "RELAY_BOOT_NONCE, echoed. null in production." },
+                    "port": { "type": "integer" },
+                    "counts": { "$ref": "#/components/schemas/Counts" },
+                    "conversations": { "type": "integer" },
+                    "streams": { "type": "integer", "description": "open SSE connections" },
+                    "uptimeSec": { "type": "integer" }
+                  }
+                },
+                "examples": {
+                  "live": {
+                    "value": {
+                      "status": "ok", "name": "relay-queue", "version": "1.6.0", "boot": null, "port": 3901,
+                      "counts": { "pending": 2, "claimed": 1, "done": 431, "unrelayed": 3 },
+                      "conversations": 14, "streams": 2, "uptimeSec": 91244
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "tags": ["health"],
+        "summary": "Is anyone actually home?",
+        "description": "The expensive one: a headline sentence, the deadman verdict, abandoned claims, response-time quantiles, the coordinator roster and (optionally) live TCP probes of the speech engines. Poll `/watch` instead if all you want is the verdict.",
+        "parameters": [
+          {
+            "name": "engines", "in": "query", "required": false,
+            "schema": { "type": "string" },
+            "description": "truthy value probes the Wyoming STT/TTS engines over TCP; costs a connection each"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the state of the queue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "now": { "type": "string", "format": "date-time" },
+                    "headline": { "type": "object", "description": "one sentence a human can read off a phone" },
+                    "watch": { "type": "object", "description": "the deadman verdict; same shape as GET /watch" },
+                    "stuck": { "type": "array", "items": { "type": "object" }, "description": "claimed and abandoned: invisible to a pending-only poll, and nothing will ever retry them" },
+                    "counts": { "$ref": "#/components/schemas/Counts" },
+                    "server": { "type": "object" },
+                    "activity": { "type": "object" },
+                    "responsiveness": { "type": "object" }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch": {
+      "get": {
+        "operationId": "getWatch",
+        "tags": ["health"],
+        "summary": "Just the deadman verdict",
+        "description": "Deliberately separate from `/status`: this is the fallback poll and must stay cheap, so it never probes an engine. The same snapshot is pushed down the unscoped SSE stream on connect and on every change.",
+        "responses": {
+          "200": { "description": "the verdict", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }
+        }
+      }
+    },
+    "/heartbeat": {
+      "post": {
+        "operationId": "postHeartbeat",
+        "tags": ["health"],
+        "summary": "\"I am here\"",
+        "description": "IN MEMORY ONLY. Never logged, never replayed, and deliberately NOT evidence of life for a claim lease - only acts from inside a turn count for that (a claim, a progress note). Use `POST /tasks/{id}/progress` if you want a lease to move.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agent": { "type": "string", "maxLength": 100, "description": "defaults to the literal string \"agent\"" },
+                  "note": { "type": "string", "maxLength": 200 }
+                }
+              },
+              "examples": { "alive": { "value": { "agent": "iceland", "note": "still building" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "noted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "ok": { "type": "boolean" }, "agent": { "type": "string" }, "lastSeen": { "type": "string", "format": "date-time" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks": {
+      "get": {
+        "operationId": "listTasks",
+        "tags": ["tasks"],
+        "summary": "List tasks",
+        "description": "Internal agent-to-agent traffic is invisible to any query that does not name a `channel` or pass `internal=1`. `expired=1` is the only way an abandoned claim is ever found: nothing sweeps them up.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["pending", "claimed", "done"] }, "description": "anything else is a 400" },
+          { "name": "channel", "in": "query", "schema": { "type": "string" }, "description": "restrict to one internal channel; without it, internal traffic is excluded entirely" },
+          { "name": "internal", "in": "query", "schema": { "type": "string" }, "description": "truthy: include internal channel traffic" },
+          { "name": "unread", "in": "query", "schema": { "type": "string" }, "description": "anything but \"false\": only `relayed: false`" },
+          { "name": "expired", "in": "query", "schema": { "type": "string" }, "description": "truthy: only claims whose lease has run out" },
+          { "$ref": "#/components/parameters/since" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "takes the FIRST n (unlike /thread and /messages, which take the last n)" }
+        ],
+        "responses": {
+          "200": {
+            "description": "matching tasks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["count", "tasks"],
+                  "properties": { "count": { "type": "integer" }, "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } } }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      },
+      "post": {
+        "operationId": "createTask",
+        "tags": ["tasks"],
+        "summary": "Ask for something (the human's side)",
+        "description": "Creates a `pending` task with `role: \"user\"` - the role is server-set and never taken from the client. This is the route the human's own typed and dictated messages arrive on, which is why it is the ONE write path that warns about mojibake instead of refusing it: a stored message with a `warning` block beats a dropped message. An agent making a statement should use `POST /messages` instead, which is born `done`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "instruction": { "type": "string", "maxLength": 8000, "description": "what to do. Alias: `text`. Required UNLESS the message carries images." },
+                  "text": { "type": "string", "maxLength": 8000, "description": "alias for `instruction` - the field name the UI uses" },
+                  "conversationId": { "type": "string", "description": "must already exist, or 400. Alias: `conversation`. Omitted = \"main\"." },
+                  "conversation": { "type": "string" },
+                  "from": { "type": ["string", "null"], "description": "free text, recorded as-is" },
+                  "images": { "type": "array", "items": { "type": "string" }, "maxItems": 24, "description": "blob ids from POST /images. Validated against what has actually been uploaded." },
+                  "select": { "type": "string", "enum": ["one", "many", "none"], "description": "make the attached images selectable" },
+                  "selected": { "type": "array", "items": { "type": "string" }, "description": "pre-mark a suggestion; reads back as source:\"declared\" so an agent never mistakes its own default for his decision" },
+                  "notify": { "description": "push hint" }
+                }
+              },
+              "examples": {
+                "plain": { "summary": "the ordinary case", "value": { "text": "check the deploy", "conversationId": "main" } },
+                "photo": { "summary": "a photo with no caption - allowed", "value": { "images": ["b1946ac92492d2347c6235b4d2611184b3f6dbee1e2b0a1e0a0a5f6c0e0f0a0b"], "conversationId": "main" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created. May carry a `warning` when the text contains U+FFFD - stored anyway, on purpose.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } }
+          },
+          "400": {
+            "description": "empty instruction with no images, text over 8000 chars, unknown conversationId, or a bad images/select/selected list",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "/tasks/{id}": {
+      "get": {
+        "operationId": "getTask",
+        "tags": ["tasks"],
+        "summary": "One task record",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "responses": {
+          "200": { "description": "the record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/tasks/{id}/claim": {
+      "post": {
+        "operationId": "claimTask",
+        "tags": ["tasks"],
+        "summary": "Take a task, renew your own claim, or take over an expired lease",
+        "description": "SEND `by`. IT IS THE WHOLE POINT OF THE CALL.\n\nIdentity is read by `claimantOf()` from `by`, then `agent`, then `author` - first non-blank string wins, trimmed and capped at 200 chars. `by` is canonical and still wins when several are sent.\n\nTHE HISTORICAL TRAP (fixed in commit fa28bfa, still live on any older deployment): this route read `body.by` ALONE, so `{\"agent\":\"docker-coord2\"}` parsed as anonymous and the route answered `200 {\"status\":\"claimed\",\"claimedBy\":null}` - a success shape over an answer to a different question.\n\nTHE TRAP THAT IS STILL LIVE TODAY: a claim carrying NO identity at all is still accepted and still recorded as `claimedBy: null`, deliberately, because `resultTask()` warns that tightening this would break agents that answer perfectly well without ever claiming. The cost of landing there is not a missing label:\n\n- The holder cannot renew. Renewal is `by === task.claimedBy`, and `\"X\" === null` is false, so the ONE agent actually doing the work is told 409 about its own task.\n- A takeover records `takenOverFrom: null`, so nothing remembers anyone dropped it.\n- The task never returns to `pending`, so the nudge, the pending counts and every work poll stay blind to it. The work is lost silently, for a full lease.\n\nTHE ASYMMETRY THAT CAUSES IT: `agent` is a first-class field with a DIFFERENT meaning on two neighbouring routes - `POST /conversations/{id}` (`agent` = who is seated in this tab) and `POST /conversations/{id}/activity` (`agent` = who is filing the report). One word, three routes, three meanings. Here it is merely an alias.\n\nWHAT THE THREE OUTCOMES LOOK LIKE, all of them 200 with the task record:\n\n- `pending` -> `claimed`, `claimedBy` set.\n- already yours -> `claimedAt` refreshed. This is a renewal and is proof of life, given from inside a turn.\n- held by someone else BUT the lease has expired -> taken over, recording `takenOverFrom`.\n\nThe lease is `CLAIM_LEASE_MS` (defaults to `STUCK_CLAIM_MS`) measured from the newest of `claimedAt` and `lastProgressAt`. A heartbeat does NOT move it.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "requestBody": {
+          "required": false,
+          "description": "Optional. An empty body is valid and means an ANONYMOUS claim - see above for why you do not want one.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "by": { "type": "string", "maxLength": 200, "description": "who is taking it. CANONICAL. Send this one." },
+                  "agent": { "type": "string", "description": "accepted alias for `by` since fa28bfa" },
+                  "author": { "type": "string", "description": "accepted alias for `by`" }
+                }
+              },
+              "examples": {
+                "correct": { "summary": "the only form worth sending", "value": { "by": "iceland" } },
+                "anonymous": { "summary": "accepted, and a mistake: 200 with claimedBy null", "value": {} }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "claimed, renewed, or taken over. The body is the task record.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Task" },
+                "examples": {
+                  "claimed": { "value": { "id": "md3x9k-4f2a1c", "conversationId": "main", "instruction": "check the deploy", "status": "claimed", "claimedBy": "iceland", "claimedAt": "2026-09-01T11:04:02.118Z", "result": null, "relayed": false } },
+                  "anonymousClaim": { "summary": "what the trap looks like on the wire", "value": { "id": "md3x9k-4f2a1c", "status": "claimed", "claimedBy": null, "claimedAt": "2026-09-01T11:04:02.118Z" } }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "held by someone else and the lease has NOT expired, or the task is already done. `leaseExpiresInSec` tells \"come back in a moment\" apart from \"this is never coming back\".",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "held": { "value": { "error": "task is already claimed", "status": "claimed", "id": "md3x9k-4f2a1c", "claimedBy": "iceland", "claimedAt": "2026-09-01T11:04:02.118Z", "leaseExpiresInSec": 512 } }
+                }
+              }
+            }
+          },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "/tasks/{id}/progress": {
+      "post": {
+        "operationId": "progressTask",
+        "tags": ["tasks"],
+        "summary": "\"Still here\", said cheaply and repeatedly, without spending the answer",
+        "description": "A task accepts exactly ONE result and posting it closes the task, so an agent doing ten minutes of real work had two options: stay silent, or spend its one answer saying \"not done yet\". Every one of them stayed silent, and silence is the same shape as death - in one night the watchdog reported three healthy agents dead and a coordinator started a replacement on top of a working agent.\n\nWHAT IT DOES: appends a note (newest 20 kept on the record, the event log keeps them all), refreshes the lease, and feeds `lastActedAt`.\n\nWHAT IT DELIBERATELY DOES NOT DO: it does not touch `result`, does not change `status`, and does not create a task - so it can never appear as backlog, be claimed, or show up in a work poll.\n\nA BARE POST WITH NO BODY IS A VALID \"still here\". `note` has an alias, `text`.\n\nOWNERSHIP, drawn exactly as narrowly as on `/result`: no `by` is fine, `by` matching the holder is fine, nothing holding it is fine. Only \"I am B\" about a task held by A is refused - letting the loser refresh the winner's lease would be this route causing the collision it exists to prevent.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "note": { "type": "string", "maxLength": 500, "description": "short running commentary. Alias: `text`. Refused 400 if it contains U+FFFD." },
+                  "text": { "type": "string", "maxLength": 500 },
+                  "by": { "type": "string", "maxLength": 200, "description": "must match the current holder if the task is claimed" }
+                }
+              },
+              "examples": {
+                "note": { "value": { "note": "running the suites", "by": "iceland" } },
+                "bare": { "summary": "a valid \"still here\"", "value": {} }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "noted; the lease moved; the result is still open",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "id": { "type": "string" },
+                    "at": { "type": "string", "format": "date-time" },
+                    "note": { "type": ["string", "null"] },
+                    "progressCount": { "type": "integer" },
+                    "leaseExpiresInSec": { "type": ["integer", "null"], "description": "proof the lease moved, so a caller can see this worked rather than assume it" },
+                    "resultStillOpen": { "type": "boolean", "const": true }
+                  }
+                },
+                "examples": { "noted": { "value": { "ok": true, "id": "md3x9k-4f2a1c", "at": "2026-09-01T11:09:40.002Z", "note": "running the suites", "progressCount": 3, "leaseExpiresInSec": 900, "resultStillOpen": true } } }
+              }
+            }
+          },
+          "400": { "description": "note too long, not a string, or already damaged (U+FFFD)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "the task is already answered (progress is only for work in flight), or someone else holds it",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/tasks/{id}/result": {
+      "post": {
+        "operationId": "resultTask",
+        "tags": ["tasks"],
+        "summary": "Answer, closing the task. ONE SHOT.",
+        "description": "THE ONE-RESULT RULE IS THE SPINE OF THIS QUEUE. Posting a result sets `status: \"done\"` and there is no second attempt: a task that already has one answers 409 `task already has a result`. If you need to say something afterwards, `POST /messages` into the conversation.\n\n`result` IS REQUIRED AND MUST NOT BE NULL. `{\"result\": null}` is refused 400, because it would produce a `done` task carrying no answer - which the relayed guard then correctly refuses to close, leaving the message permanently unanswerable. It is refused here, where it is still fixable. `result` may be any non-null JSON value; text is what the human reads.\n\nOWNERSHIP, NARROWLY DRAWN. Four tasks in the live log are `done` with `claimedBy: null`, which is what an honour-system claim looks like from the outside.\n\n- No `by` at all -> ALLOWED. Every existing caller keeps working, and a result may be posted straight onto a `pending` task with no claim at all.\n- `by` matching the holder -> allowed.\n- Nothing holds it -> allowed.\n- `by` naming someone OTHER than the holder -> 409, naming the holder and the lease.\n\nSO: TO CLEAR AN ORPHANED CLAIM - a task stuck on `claimedBy: null` from an anonymous claim, or held by an agent that is gone - OMIT `by`. Sending it is the only thing that can be refused.\n\nAFTERWARDS: `POST /tasks/{id}/relayed`, and ONLY after this call returned 200. Never mark relayed on faith.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["result"],
+                "properties": {
+                  "result": { "description": "the answer. Any JSON value except null. Refused 400 if it contains U+FFFD." },
+                  "by": { "type": "string", "description": "must match the current holder if there is one. OMIT IT to answer an orphaned claim." },
+                  "images": { "type": "array", "items": { "type": "string" }, "maxItems": 24, "description": "blob ids; stored under `resultImages` so a reference picture sent WITH the task is not overwritten by renders sent BACK" },
+                  "select": { "type": "string", "enum": ["one", "many", "none"] },
+                  "selected": { "type": "array", "items": { "type": "string" } },
+                  "notify": { "description": "push hint" }
+                }
+              },
+              "examples": {
+                "answer": { "value": { "result": "deploy is green, 0 failures", "by": "iceland" } },
+                "orphaned": { "summary": "clearing a claim held by nobody - note the missing `by`", "value": { "result": "picked this up after the lease expired; done" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "answered. The body is the task record.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "400": {
+            "description": "`result` missing, `result` null, damaged text, or a bad images/select list",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": { "null": { "value": { "error": "result is null: a null answer is not an answer. Send the text the human should read." } } }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "already done, or `by` names someone other than the holder",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "twice": { "value": { "error": "task already has a result", "status": "done", "id": "md3x9k-4f2a1c" } },
+                  "notYours": { "value": { "error": "\"iceland\" holds this task, not \"faroe\"", "id": "md3x9k-4f2a1c", "claimedBy": "iceland", "by": "faroe", "leaseExpiresInSec": 0, "hint": "the lease has expired - POST /tasks/:id/claim to take it over, then post the result" } }
+                }
+              }
+            }
+          },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "/tasks/{id}/relayed": {
+      "post": {
+        "operationId": "relayTask",
+        "tags": ["tasks"],
+        "summary": "Mark an answer as delivered to the human",
+        "description": "NEVER CALL THIS UNTIL THE `result` POST HAS RETURNED 200. `relayed` means \"the human has been shown this\"; flagging it on faith is how an answer disappears from the unread counts without ever having existed.\n\nGuarded in exactly one direction: the false -> true transition on a task with no result is refused 409. Re-flagging an already-relayed task is idempotent and keeps the ORIGINAL `relayedAt`, including for records written before the guard existed. No body.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "responses": {
+          "200": { "description": "relayed (idempotent)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "no result yet - there is nothing to deliver",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": { "empty": { "value": { "error": "cannot mark relayed: this task has no result, so there is nothing to deliver. POST /tasks/:id/result first, and check that it returned 200 before flagging.", "id": "md3x9k-4f2a1c", "status": "claimed", "relayed": false } } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks/{id}/checks": {
+      "get": {
+        "operationId": "getEntryChecklist",
+        "tags": ["checklists"],
+        "summary": "The checkbox list parsed out of ONE thread entry",
+        "description": "NOTE THE ID. This is a THREAD ENTRY id, not only a task id: `<taskId>` for the message, `<taskId>:r` for its result. Items are never stored - they are parsed out of the message text on demand, so what is ON the list (append-only text) and what is TICKED (`check` events) cannot drift apart. The index is the ordinal of the task line within the message, counting exactly as the browser counts it; a checkbox inside a fenced code block is sample text on both sides.",
+        "parameters": [{ "$ref": "#/components/parameters/entryId" }],
+        "responses": {
+          "200": { "description": "the list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EntryChecklist" } } } },
+          "404": { "description": "no such entry, or its text contains no \"- [ ]\" line", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "post": {
+        "operationId": "setEntryCheck",
+        "tags": ["checklists"],
+        "summary": "Tick or untick one box, by index",
+        "description": "IDEMPOTENT BY VALUE: sending `on: true` twice is one state and one event, and the second call answers 200 with `changed: false`. The page retries this after being offline, and a retry must never double-toggle a box he touched once.\n\nUnlike a `pick`, a `check` DOES reach the SSE stream (`appendEvent` maps `check` to the owning task's broadcast).",
+        "parameters": [{ "$ref": "#/components/parameters/entryId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["index", "on"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0, "description": "0..total-1, the ordinal of the task line in the message" },
+                  "on": { "type": "boolean" },
+                  "by": { "type": "string", "description": "alias: `who`. Defaults to \"web\"." }
+                }
+              },
+              "examples": { "tick": { "value": { "index": 2, "on": true, "by": "iceland" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "current state; `changed` says whether anything was written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "changed": { "type": "boolean" }, "checklist": { "$ref": "#/components/schemas/EntryChecklist" } }
+                }
+              }
+            }
+          },
+          "400": { "description": "index out of range, or `on` not a boolean", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "no checklist on that entry", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/tasks/{id}/picks": {
+      "get": {
+        "operationId": "getEntryPicks",
+        "tags": ["picks"],
+        "summary": "The selectable image set on ONE thread entry",
+        "description": "Same id rule as `/checks`: `<taskId>` for the message, `<taskId>:r` for the result. `decided` is true only once he has actually touched it - \"nothing chosen yet\" and \"he chose none of them\" are different answers.",
+        "parameters": [{ "$ref": "#/components/parameters/entryId" }],
+        "responses": {
+          "200": { "description": "the selection", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PickList" } } } },
+          "404": { "description": "the entry carries no images, or was posted with select:\"none\"", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "post": {
+        "operationId": "setEntryPick",
+        "tags": ["picks"],
+        "summary": "Choose or unchoose one picture, by index",
+        "description": "Idempotent by value, like a tick. Single-select is enforced HERE rather than in the page, so his phone, his laptop and an agent all end up with the same one chosen.\n\nTRAP: A `pick` EVENT NEVER REACHES THE SSE STREAM. `appendEvent` handles `check` explicitly but lets `pick` fall through to the task broadcast, which reads `ev.id` - and a pick event carries `entryId`, not `id`, so the lookup misses and nothing is pushed. A client watching `/events` will not learn about a choice; re-read `/picks` or the thread. (The entry's `rev` DOES move, so a `?since=<rev>` poll of `/thread` sees it.)",
+        "parameters": [{ "$ref": "#/components/parameters/entryId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["index", "on"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0 },
+                  "on": { "type": "boolean" },
+                  "by": { "type": "string", "description": "alias: `who`. Defaults to \"web\"." }
+                }
+              },
+              "examples": { "pickOne": { "value": { "index": 3, "on": true, "by": "hypnodroid" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "current selection; `changed` says whether anything was written",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "changed": { "type": "boolean" }, "selection": { "$ref": "#/components/schemas/PickList" } } }
+              }
+            }
+          },
+          "400": { "description": "index out of range, or `on` not a boolean", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "no selectable images on that entry", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/results": {
+      "get": {
+        "operationId": "listResults",
+        "tags": ["tasks"],
+        "summary": "Answers, not merely finished records",
+        "description": "`done` AND carrying a result. An agent's own message (`POST /messages`) is born `done` with no result, so it is deliberately not here. Takes the same filters as `GET /tasks`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "name": "unread", "in": "query", "schema": { "type": "string" }, "description": "anything but \"false\": only answers not yet marked relayed" },
+          { "$ref": "#/components/parameters/since" },
+          { "$ref": "#/components/parameters/limitFirst" }
+        ],
+        "responses": {
+          "200": {
+            "description": "answered tasks",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "count": { "type": "integer" }, "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } } } } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/thread": {
+      "get": {
+        "operationId": "getThread",
+        "tags": ["thread"],
+        "summary": "The chronological human + agent view",
+        "description": "The read a human's page and a resuming agent both want. One task projects to ONE OR TWO entries: the message, and - if it has been answered - a second entry `<taskId>:r` carrying the result.\n\n`since` filters on `rev`, NOT on `ts`: a tick or a pick moves an entry's `rev` without changing when it was posted, which is exactly what makes a `?since=<rev>` poll notice a checkbox. `limit` takes the LAST n - a thread is read from the end.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "name": "since", "in": "query", "schema": { "type": "string" }, "description": "ISO 8601 or epoch ms, compared against `rev`, strictly after" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "the LAST n entries" }
+        ],
+        "responses": {
+          "200": {
+            "description": "entries oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "count": { "type": "integer" }, "now": { "type": "string", "format": "date-time" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ThreadEntry" } } }
+                },
+                "examples": {
+                  "pair": {
+                    "summary": "one answered task, as two entries",
+                    "value": {
+                      "count": 2, "now": "2026-09-01T11:20:00.000Z",
+                      "entries": [
+                        { "id": "md3x9k-4f2a1c", "role": "user", "text": "check the deploy", "ts": "2026-09-01T11:00:00.000Z", "status": "done", "rev": "2026-09-01T11:14:00.000Z", "conversationId": "main", "claimedBy": "iceland" },
+                        { "id": "md3x9k-4f2a1c:r", "role": "agent", "text": "green, 0 failures", "ts": "2026-09-01T11:14:00.000Z", "status": "done", "rev": "2026-09-01T11:14:00.000Z", "replyTo": "md3x9k-4f2a1c", "conversationId": "main" }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/messages": {
+      "get": {
+        "operationId": "listMessages",
+        "tags": ["messages"],
+        "summary": "Read a channel OR a conversation - never both, never neither silently",
+        "description": "THIS ROUTE USED TO ANSWER A DIFFERENT QUESTION THAN THE ONE ASKED. `?conversationId=<tab>` was not understood, so it was dropped, and the reply was byte-for-byte the same as a bare `GET /messages`: the global `agents` channel. On 2026-08-27 an agent used it to confirm its own post had landed, got 33 rows for a tab whose conversation object said 53, none of them its own, and reported the write as failed. The write had succeeded.\n\nSo now: every selector actually filters, a selector that cannot be honoured is REFUSED rather than dropped, and the reply says what it counted. `total` is taken after `scope` and `since` narrow it and before `limit` clips it, so a complete answer is distinguishable from a clipped one. `scope.defaulted` is true when you named nothing and got the default `agents` channel.\n\nChannel messages and conversation messages are DISJOINT STORES - a channel message is filed under the synthetic conversation `#<channel>` and belongs to no tab - so asking for both at once is malformed, not empty.",
+        "parameters": [
+          { "name": "channel", "in": "query", "schema": { "type": "string" }, "description": "an internal agent-to-agent channel. Defaults to `agents` when nothing is named." },
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "$ref": "#/components/parameters/since" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "the LAST n" }
+        ],
+        "responses": {
+          "200": {
+            "description": "messages oldest first, with an explicit scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "total": { "type": "integer", "description": "before `limit` clipped it" },
+                    "truncated": { "type": "boolean" },
+                    "channel": { "type": ["string", "null"] },
+                    "scope": { "type": "object", "description": "kind, what it includes, what it excludes, and whether the channel was defaulted" },
+                    "messages": { "type": "array", "items": { "$ref": "#/components/schemas/Message" } }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "both selectors at once, a `#channel` passed as a conversation, or a bad since/limit",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": { "both": { "value": { "error": "ask for a channel or a conversation, never both", "channel": "agents", "conversationId": "main", "why": "a channel message is filed under \"#agents\" and belongs to no conversation, so this pair can never match anything" } } }
+              }
+            }
+          },
+          "404": { "description": "no conversation with that id (this used to answer 200 with the agents channel)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "post": {
+        "operationId": "createMessage",
+        "tags": ["messages"],
+        "summary": "An agent speaking, rather than answering",
+        "description": "Born `done` and `relayed: true`, with `role: \"agent\"` set by the server. That is the whole point: a statement is not a request, so it must not sit `pending`, must not appear in another agent's work poll, and must not count as backlog.\n\nWHERE IT LANDS. Send `conversationId` (alias `conversation`) for the human's thread; send `channel` (or `internal: true`) for agent-to-agent traffic, which is filed under `#<channel>`, invisible to the thread and to every task query that does not name it, and CANNOT buzz his phone. Omit both and it lands in `main`.\n\nWho is speaking: `agent`, `author` or `by`, in that order of preference.\n\nRefused 400 if the text already contains U+FFFD - unlike `POST /tasks`, nothing the human types arrives here, so this one can afford to refuse.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "text": { "type": "string", "maxLength": 8000, "description": "required, non-empty. Alias: `instruction`." },
+                  "instruction": { "type": "string", "maxLength": 8000 },
+                  "agent": { "type": "string", "maxLength": 200, "description": "who is speaking. Aliases: `author`, `by`." },
+                  "author": { "type": "string" },
+                  "by": { "type": "string" },
+                  "to": { "type": "string", "maxLength": 200, "description": "addressed to a named agent" },
+                  "from": { "type": "string", "description": "defaults to \"agent\"" },
+                  "conversationId": { "type": "string", "description": "must exist, or 400. Alias: `conversation`." },
+                  "conversation": { "type": "string" },
+                  "channel": { "type": "string", "description": "letters, digits, dot, dash, underscore. Presence makes the message INTERNAL." },
+                  "internal": { "type": "boolean", "description": "true with no `channel` means the default `agents` channel" },
+                  "images": { "type": "array", "items": { "type": "string" }, "maxItems": 24 },
+                  "select": { "type": "string", "enum": ["one", "many", "none"] },
+                  "selected": { "type": "array", "items": { "type": "string" } },
+                  "notify": { "description": "push hint; ignored entirely for internal traffic" }
+                }
+              },
+              "examples": {
+                "toTheHuman": { "value": { "conversationId": "mtjoi1b7-wv10cb", "agent": "openapi-worker", "text": "spec written, selftests green" } },
+                "toAgents": { "summary": "internal, never notifies", "value": { "channel": "agents", "agent": "router", "text": "seat 4 free" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "stored", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "400": {
+            "description": "empty text, over 8000 chars, damaged text, unknown conversationId, bad channel name, or a bad images list",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "/channels": {
+      "get": {
+        "operationId": "listChannels",
+        "tags": ["messages"],
+        "summary": "Which internal channels exist",
+        "description": "So a channel is discoverable at all. Newest-active first.",
+        "responses": {
+          "200": {
+            "description": "the channels",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "defaultChannel": { "type": "string", "const": "agents" },
+                    "channels": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": { "channel": { "type": "string" }, "messages": { "type": "integer" }, "lastTs": { "type": ["string", "null"] }, "lastAuthor": { "type": ["string", "null"] }, "lastText": { "type": "string" } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/conversations": {
+      "get": {
+        "operationId": "listConversations",
+        "tags": ["conversations"],
+        "summary": "The tab list, with liveness",
+        "description": "Archived tabs are HIDDEN unless asked for. Each row carries counts, the last message, and the derived liveness the page draws its badges from.",
+        "parameters": [
+          { "name": "archived", "in": "query", "schema": { "type": "string", "enum": ["only", "true", "false", "0"] }, "description": "`only` shows just the archived ones; absent, `false` or `0` hides them; any other value shows all" },
+          { "name": "pending", "in": "query", "schema": { "type": "string" }, "description": "truthy: only tabs with work waiting. The agent side's \"where is there work?\"" },
+          { "name": "unread", "in": "query", "schema": { "type": "string" }, "description": "truthy: only tabs with answers not yet relayed" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the tabs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "count": { "type": "integer" }, "defaultId": { "type": "string", "const": "main" }, "conversations": { "type": "array", "items": { "$ref": "#/components/schemas/Conversation" } } }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createConversation",
+        "tags": ["conversations"],
+        "summary": "Open a tab",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                  "title": { "type": "string", "maxLength": 200, "description": "required, non-empty" },
+                  "agent": { "type": "string", "maxLength": 200, "description": "who is meant to answer here. Alias: `assignee`. relay-queue never acts on this and never spawns anything - it is a passive queue recording routing that something else decides." },
+                  "assignee": { "type": "string" }
+                }
+              },
+              "examples": { "open": { "value": { "title": "OpenAPI spec", "agent": "openapi-worker" } } }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Conversation" } } } },
+          "400": { "description": "missing/empty title, title over 200 chars, or `agent` not a string", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/conversations/{id}": {
+      "get": {
+        "operationId": "getConversation",
+        "tags": ["conversations"],
+        "summary": "One tab, with liveness",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "responses": {
+          "200": { "description": "the tab", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Conversation" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "updateConversation",
+        "tags": ["conversations"],
+        "summary": "Patch a tab: seat an agent, archive it, ask it to stop",
+        "description": "THIS ROUTE TAKES `agent`, AND MEANS IT. That is the asymmetry that catches people: here `agent` is the FIELD - who is seated in this tab - while on `POST /tasks/{id}/claim` the field is `by` and `agent` is only an alias. Send `agent: null` (or `\"\"`) to stand down; `assignee` is an accepted alias.\n\nTRAP 1 - 409 \"applied and then immediately overwritten\". After writing, this route RE-READS the record and compares. If something else wrote to the conversation inside this request - almost always `sweepVacantChairs()` unassigning an agent that has been quiet longer than `CHAIR_VACANT_MS` - it answers 409 with `fields`, `asked`, `stored` and a `likelyCause`. NOTHING YOU ASKED FOR IS IN EFFECT. This is deliberately not a 200: a success status over a record that does not match the request is indistinguishable from the request having worked, and that ambiguity has already produced wrong conclusions. Post a message or a progress note to the tab first, then attach again.\n\nTRAP 2 - `agentLeftReason: \"presumed-gone\"` IS REFUSED 400. That exact string is reserved for the vacant-chair sweep, and its entire value is that exactly one thing writes it. A caller allowed to send it could make a deliberate exit indistinguishable from an eviction. Say why in your own words: \"done\", \"handed off\", \"stopping\".\n\n`agentLeftReason` only describes an agent LEAVING, so it is 400 unless this request is also clearing `agent`.\n\nSTOPPING IS ASKING, NOT KILLING. This queue cannot stop a process and never will. `stopRequested: true` answers 200 with a `stopRequestEffect` block saying so in words a UI can put on screen; the agent answers on `/conversations/{id}/stop-ack`.\n\nARCHIVING NAMES ITS COST. `archived: true` answers with a `ghost` warning when the tab still has a seated agent that never stood down, and with `cancelledDispatch` when a queued request naming this tab was invalidated on the way past. The default conversation `main` cannot be archived (400).",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "requestBody": {
+          "required": true,
+          "description": "At least one field, or 400 `nothing to update`.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": { "type": "string", "maxLength": 200 },
+                  "agent": { "type": ["string", "null"], "maxLength": 200, "description": "who is seated here. null or \"\" stands down. Alias: `assignee`." },
+                  "assignee": { "type": ["string", "null"] },
+                  "agentLeftReason": { "type": ["string", "null"], "maxLength": 120, "description": "why the seat was vacated, in the agent's own words. \"presumed-gone\" is refused. Only valid alongside clearing `agent`." },
+                  "archived": { "type": "boolean", "description": "\"main\" cannot be archived" },
+                  "stopRequested": { "type": "boolean", "description": "asks. Does not kill." },
+                  "spawnedBy": { "type": ["string", "null"], "description": "which top-level session started the agent - the only thing that could actually kill it" },
+                  "contextFrom": { "description": "ISO timestamp, `true` for \"now\", or null. The watermark a freshly seated agent reads from instead of the whole backlog. Cannot be in the future." },
+                  "pendingDispatch": { "type": ["object", "null"], "description": "{ kind, taskId } - a request about this tab currently sitting in someone's queue" }
+                }
+              },
+              "examples": {
+                "seat": { "summary": "sit down in the tab", "value": { "agent": "openapi-worker" } },
+                "standDown": { "summary": "stand up, and say why", "value": { "agent": null, "agentLeftReason": "done" } },
+                "askToStop": { "value": { "stopRequested": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "the updated tab. Carries `seatRelease` when this call vacated a seat, `stopRequestEffect` when it asked for a stop, and `ghost` / `cancelledDispatch` when it archived.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Conversation" } } }
+          },
+          "400": {
+            "description": "nothing to update, a bad field, `agentLeftReason` without an agent leaving, `agentLeftReason: \"presumed-gone\"`, or archiving \"main\"",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": { "reserved": { "value": { "error": "agentLeftReason \"presumed-gone\" is reserved for the vacant-chair sweep, which is what it means: nobody said they were leaving. An agent standing down on purpose should say so in its own words (e.g. \"done\", \"handed off\", \"stopping\")." } } }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "the update was applied and then immediately overwritten inside this request. Nothing is in effect.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "clobbered": {
+                    "value": {
+                      "error": "the update was applied and then immediately overwritten: agent",
+                      "conversationId": "mtjoi1b7-wv10cb",
+                      "fields": ["agent"],
+                      "asked": { "agent": "openapi-worker" },
+                      "stored": { "agent": null },
+                      "likelyCause": "The vacant-chair sweep unassigned \"old-agent\" during this request, because this conversation has had no activity for longer than CHAIR_VACANT_MS. Post a message or a progress note to the conversation first, then attach again.",
+                      "detail": "Nothing you asked for is in effect. This is deliberately not a 200: a success status over a record that does not match the request is indistinguishable from the request having worked, and that ambiguity has already produced wrong conclusions."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/conversations/{id}/stop-ack": {
+      "post": {
+        "operationId": "stopAck",
+        "tags": ["conversations"],
+        "summary": "The agent, and only the agent, answering a stop request",
+        "description": "`stopping` = winding down, `stopped` = finished. A `stopped` conversation cannot go back to `stopping` (409).\n\n`stopped` also stands the agent down in the same write, recording `agentLeft`, `agentLeftAt` and `agentLeftReason: \"stopped\"` - the invariant is that an `agent` going from a name to null ALWAYS records who left, whichever door it went through.\n\n`worktrees` are REPORTED, NEVER VERIFIED: this server does not touch git and cannot know whether they were released. The reply says so with `worktreesAreSelfReported: true`.",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["phase"],
+                "properties": {
+                  "phase": { "type": "string", "enum": ["stopping", "stopped"] },
+                  "note": { "type": "string", "maxLength": 500 },
+                  "worktrees": { "type": "array", "items": { "type": "string" }, "maxItems": 50, "description": "self-reported, never checked" },
+                  "agent": { "type": "string", "description": "echoed back as `releasedBy`" }
+                }
+              },
+              "examples": { "done": { "value": { "phase": "stopped", "note": "handed off to the merge worker", "agent": "openapi-worker" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "recorded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Conversation" } } } },
+          "400": { "description": "phase is neither \"stopping\" nor \"stopped\", or worktrees is not an array", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "already stopped; a stopped agent cannot go back to stopping", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/conversations/{id}/activity": {
+      "get": {
+        "operationId": "getActivity",
+        "tags": ["conversations"],
+        "summary": "What the coordinator in this tab is doing",
+        "description": "NEWEST FIRST - a panel opens on what just happened, not on history. Subagents are folded into a roster here rather than in the browser: one is \"running\" until a `finished` with the same name arrives, and one that never finishes stays visible forever, on purpose. `reporting` carries the difference between \"quiet\" and \"not instrumented\".",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversationId" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "clamped to ACTIVITY_CAP (200)" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the feed",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityEntry" } }, "reporting": { "type": ["boolean", "null"] } }, "additionalProperties": true }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "postActivity",
+        "tags": ["conversations"],
+        "summary": "A coordinator narrating its own work",
+        "description": "THIS ROUTE TAKES `agent` AS A REAL FIELD - here it means WHO IS REPORTING, which is a third meaning of the word (see `POST /tasks/{id}/claim` and `POST /conversations/{id}`). `subagent` is who the entry is ABOUT.\n\nDeliberately tiny and deliberately optional: an agent that reports nothing behaves exactly as it does today.\n\n`spawned` and `finished` are DURABLE (written to the event log and replayed); `tool` and `note` live only in the in-memory ring and are lost on restart.\n\nBACKFILL IS MARKED, NEVER SILENT. Pass `at` to record when a subagent really started - a coordinator resumed mid-flight otherwise reports an hour-old worker as `runningForSec: 10`, which is a plausible number that is wrong. A supplied `at` is validated and REJECTED rather than clamped (more than 5s in the future, or older than the feed keeps), and the entry is flagged `reconstructed: true`.",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {
+                  "kind": { "type": "string", "enum": ["spawned", "finished", "tool", "note"] },
+                  "subagent": { "type": "string", "maxLength": 100, "description": "REQUIRED for `spawned` and `finished`, so the panel can pair the two halves" },
+                  "agent": { "type": "string", "maxLength": 200, "description": "who is reporting" },
+                  "task": { "type": "string", "maxLength": 200, "description": "what the subagent was asked to do" },
+                  "tool": { "type": "string", "maxLength": 80 },
+                  "text": { "type": "string", "maxLength": 300 },
+                  "ok": { "type": "boolean" },
+                  "at": { "type": "string", "format": "date-time", "description": "backfill only. Flags the entry `reconstructed`." }
+                }
+              },
+              "examples": {
+                "spawned": { "value": { "kind": "spawned", "agent": "auto-relay-tts-10cb", "subagent": "openapi-worker", "task": "write the OpenAPI spec" } },
+                "finished": { "value": { "kind": "finished", "agent": "auto-relay-tts-10cb", "subagent": "openapi-worker", "ok": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "recorded",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "entry": { "$ref": "#/components/schemas/ActivityEntry" }, "durable": { "type": "boolean", "description": "false for `tool` and `note`: in-memory only, lost on restart" } } } } }
+          },
+          "400": { "description": "unknown kind, spawned/finished with no subagent, or an unparseable/future/too-old `at`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/conversations/{id}/share": {
+      "get": {
+        "operationId": "getShare",
+        "tags": ["share"],
+        "summary": "Publication state and a preflight of what would go public",
+        "description": "`live: false` is said out loud in the API because it is the whole design: a share COPIES, it does not proxy, so the link works when this machine is off. `preflight` counts the entries, images and bytes that would be published and runs a secret scan over them - read `findings` before you publish.",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "responses": {
+          "200": {
+            "description": "state + preflight",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "conversationId": { "type": "string" },
+                    "shared": { "type": "boolean" },
+                    "share": { "type": ["object", "null"] },
+                    "configured": { "type": "boolean", "description": "false when data/share.json is missing - publishing will 503" },
+                    "endpoint": { "type": ["string", "null"] },
+                    "reason": { "type": ["string", "null"] },
+                    "live": { "type": "boolean", "const": false },
+                    "preflight": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "publishShare",
+        "tags": ["share"],
+        "summary": "Publish or refresh the public snapshot",
+        "description": "RE-POSTING IS HOW YOU REFRESH. It keeps the SAME slug, so a link already sent to someone keeps working and simply shows newer content.\n\nImages are pulled off disk and inlined as data URIs within a byte budget; anything that does not fit is reported as `imagesOmitted`. The reply repeats the secret-scan `findings`.",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "requestBody": {
+          "required": false,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "by": { "type": "string", "maxLength": 200 } } }, "examples": { "publish": { "value": { "by": "hypnodroid" } } } } }
+        },
+        "responses": {
+          "200": {
+            "description": "published",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "conversationId": { "type": "string" }, "slug": { "type": "string" }, "url": { "type": "string" },
+                    "sharedAt": { "type": "string", "format": "date-time" }, "by": { "type": ["string", "null"] },
+                    "messages": { "type": "integer" }, "images": { "type": "integer" }, "imagesOmitted": { "type": "integer" },
+                    "bytes": { "type": "integer" }, "live": { "type": "boolean", "const": false },
+                    "note": { "type": "string" }, "findings": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "description": "sharing is not configured (data/share.json is missing or incomplete)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "operationId": "revokeShare",
+        "tags": ["share"],
+        "summary": "Revoke the public snapshot. DESTRUCTIVE.",
+        "description": "DELETES THE PUBLISHED PAGE AND FORGETS THE SLUG.\n\nAND THE SLUG DOES NOT COME BACK. `publishRoute` reuses the existing slug only while the share RECORD exists; revoking drops it, so the next publish mints a NEW slug at a NEW url, and every copy of the old link - in a text message, in someone's bookmarks - is permanently dead.\n\nSo: to refresh a share, POST again. Only DELETE when you actually want the page gone.",
+        "parameters": [{ "$ref": "#/components/parameters/conversationId" }],
+        "responses": {
+          "200": {
+            "description": "revoked",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "conversationId": { "type": "string" }, "slug": { "type": "string" }, "revoked": { "type": "boolean" } } } } }
+          },
+          "404": { "description": "no such conversation, or it is not shared", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "sharing is not configured, so the remote page cannot be deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/checklist": {
+      "get": {
+        "operationId": "getTabList",
+        "tags": ["checklists"],
+        "summary": "THE ONE STICKY LIST FOR A TAB (singular - read this)",
+        "description": "SINGULAR ON PURPOSE, AND ONE LETTER FROM A COMPLETELY DIFFERENT SYSTEM.\n\n- `/checklist` (THIS ONE): the single editable, pinned list belonging to a conversation. Items have generated IDS, can be added, edited, removed and imported, and are ticked by id via `/checklist/tick`.\n- `/checklists` (PLURAL): a read-only projection of every `- [ ]` list PARSED OUT OF MESSAGE TEXT anywhere in the queue. Items have ORDINALS, not ids, are immutable, and are ticked by index via `POST /tasks/{entryId}/checks`.\n\nThey are genuinely different objects. Nothing written to one appears in the other, except through the explicit `importFrom` on `POST /checklist`.\n\n`list` is `null` rather than an empty list when the tab has none: \"no list here\" and \"a list with nothing left on it\" are different answers and a coordinator acts differently on each.",
+        "parameters": [
+          { "name": "conversation", "in": "query", "required": true, "schema": { "type": "string" }, "description": "REQUIRED (400 without it). Alias: `conversationId`." },
+          { "$ref": "#/components/parameters/conversationIdAlias" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the tab's list, or null",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "conversationId": { "type": "string" }, "list": { "oneOf": [{ "$ref": "#/components/schemas/TabList" }, { "type": "null" }] } } } } }
+          },
+          "400": { "description": "no conversation named", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "writeTabList",
+        "tags": ["checklists"],
+        "summary": "Create or update the tab's list - every operation named explicitly",
+        "description": "The coordinator's write path. NOTHING HERE REPLACES THE LIST WHOLESALE: a coordinator that meant to add one chore and instead cleared fifteen ticks would be worse than the fragmentation this feature fixes. So there is no \"items\" field - only `add`, `edit`, `remove`, `importFrom`, `clearDone` and `title`.\n\nOrder of operations: removals, then edits, then adds, then imports, then `clearDone`. Removing and re-adding an id in one call therefore works.\n\nEDITING KEEPS THE TICK but not the pretence it was earned against the new words: the old wording is kept as `tickedText` and the item reads back `editedSinceTicked: true`.\n\n`importFrom` copies the OPEN items out of a message-parsed checklist (the `/checklists` world) into this one, records the source, and skips duplicates by text - so importing twice does not double the list. Ticked items are deliberately left behind.\n\nMax 200 items, 500 chars each.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["conversationId"],
+                "properties": {
+                  "conversationId": { "type": "string", "description": "must exist. Alias: `conversation`." },
+                  "conversation": { "type": "string" },
+                  "by": { "type": "string", "maxLength": 200, "description": "alias: `agent`" },
+                  "title": { "type": ["string", "null"], "maxLength": 500, "description": "null or \"\" clears it" },
+                  "add": { "description": "a string, an object {text}, or an array of either", "oneOf": [{ "type": "string" }, { "type": "object" }, { "type": "array", "items": {} }] },
+                  "edit": { "description": "{ id, text }, or an array of them. 404 if an id is gone.", "oneOf": [{ "type": "object" }, { "type": "array", "items": { "type": "object" } }] },
+                  "remove": { "description": "an item id, or an array of them. Unknown ids are silently ignored.", "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+                  "importFrom": { "description": "a THREAD ENTRY id (or an array), whose parsed `- [ ]` items are copied in", "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+                  "clearDone": { "type": "boolean", "description": "drop the finished ones" }
+                }
+              },
+              "examples": {
+                "add": { "value": { "conversationId": "main", "by": "coordinator", "add": ["book the ferry", "pack the charger"] } },
+                "tidy": { "value": { "conversationId": "main", "clearDone": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "the whole list, after the change", "content": { "application/json": { "schema": { "type": "object", "properties": { "list": { "$ref": "#/components/schemas/TabList" } } } } } },
+          "400": { "description": "no conversationId, bad text, or more than 200 items", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "unknown conversation, an `edit` id that is gone, or an `importFrom` entry with no checklist", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/checklist/tick": {
+      "post": {
+        "operationId": "tickTabListItem",
+        "tags": ["checklists"],
+        "summary": "Tick one item of the tab list, BY ID",
+        "description": "Its own route because it is the call that happens constantly, and because it must never be able to rewrite item text. Idempotent by value: ticking an already-ticked item answers 200 `changed: false`.\n\nA 404 for an unknown id names the ids that ARE there, because an id that is gone is nearly always an item somebody removed, and a client that only learns \"404\" retries it forever.\n\nThis is the SINGULAR system. To tick a box inside a message, use `POST /tasks/{entryId}/checks` with an INDEX instead.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["conversationId", "id", "on"],
+                "properties": {
+                  "conversationId": { "type": "string", "description": "alias: `conversation`" },
+                  "conversation": { "type": "string" },
+                  "id": { "type": "string", "description": "the item id from GET /checklist. Alias: `itemId`." },
+                  "itemId": { "type": "string" },
+                  "on": { "type": "boolean" },
+                  "by": { "type": "string", "description": "alias: `who`. Defaults to \"web\"." }
+                }
+              },
+              "examples": { "tick": { "value": { "conversationId": "main", "id": "md40aa-91b2c3", "on": true, "by": "hypnodroid" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "the list, after the tick", "content": { "application/json": { "schema": { "type": "object", "properties": { "changed": { "type": "boolean" }, "list": { "$ref": "#/components/schemas/TabList" } } } } } },
+          "400": { "description": "`on` is not a boolean, or a field is not a string", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "no list on that conversation, or no such item id", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/checklists": {
+      "get": {
+        "operationId": "listMessageChecklists",
+        "tags": ["checklists"],
+        "summary": "Every list PARSED OUT OF MESSAGE TEXT (plural - read this too)",
+        "description": "PLURAL, AND NOT THE SAME SYSTEM AS `/checklist`. This is the read-only projection of every `- [ ]` list found in message and result text across the queue: derived from immutable text, addressed by ORDINAL, ticked through `POST /tasks/{entryId}/checks`. The singular `/checklist` is the editable pinned list belonging to a tab, addressed by generated IDS.\n\nAnswers \"what is on his list right now\" in one call, without parsing the thread.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "name": "open", "in": "query", "schema": { "type": "string" }, "description": "truthy: only lists with something left" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the lists",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "count": { "type": "integer" }, "checklists": { "type": "array", "items": { "$ref": "#/components/schemas/EntryChecklist" } } } } } }
+          }
+        }
+      }
+    },
+    "/picks": {
+      "get": {
+        "operationId": "listPicks",
+        "tags": ["picks"],
+        "summary": "Every selectable image set, or those in one conversation",
+        "description": "\"What has he chosen\", answerable in one call without the thread. `decided: false` means he has not touched it yet, which is NOT the same as choosing none.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "name": "undecided", "in": "query", "schema": { "type": "string" }, "description": "truthy: only sets he has not touched" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the sets",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "count": { "type": "integer" }, "picks": { "type": "array", "items": { "$ref": "#/components/schemas/PickList" } } } } } }
+          }
+        }
+      }
+    },
+    "/credits": {
+      "get": {
+        "operationId": "getCredits",
+        "tags": ["credits"],
+        "summary": "Balance and history of the flat one-credit-per-feature economy",
+        "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "history rows; a non-integer or negative value is 400" }],
+        "responses": {
+          "200": { "description": "the ledger", "content": { "application/json": { "schema": { "type": "object", "properties": { "balance": { "type": "integer" } }, "additionalProperties": true } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/credits/award": {
+      "post": {
+        "operationId": "awardCredits",
+        "tags": ["credits"],
+        "summary": "Award credits for chores done",
+        "description": "Atomic by construction: no `await` sits between reading the balance and writing the event that changes it, so no other request can interleave.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["amount", "reason"],
+                "properties": {
+                  "amount": { "type": "integer", "minimum": 1, "description": "positive integer" },
+                  "reason": { "type": "string", "maxLength": 500, "description": "required. Refused if it contains U+FFFD." },
+                  "by": { "type": "string", "maxLength": 200 }
+                }
+              },
+              "examples": { "award": { "value": { "amount": 3, "reason": "dishes, laundry, bins", "by": "hypnodroid" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "the new ledger", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "description": "amount not a positive integer, or reason missing/too long/damaged", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/credits/spend": {
+      "post": {
+        "operationId": "spendCredits",
+        "tags": ["credits"],
+        "summary": "Spend exactly one credit",
+        "description": "The cost is ALWAYS exactly 1 and cannot be read from the body - a caller cannot ask to spend more or less than the one credit a feature costs. 402 when the balance is 0.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "required": ["reason"], "properties": { "reason": { "type": "string", "maxLength": 500 }, "by": { "type": "string", "maxLength": 200 } } },
+              "examples": { "spend": { "value": { "reason": "new nanoleaf scene", "by": "hypnodroid" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "the new ledger", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "description": "reason missing, too long, or damaged", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "402": { "description": "insufficient credits: the balance is 0", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/agents": {
+      "get": {
+        "operationId": "listAgents",
+        "tags": ["agents"],
+        "summary": "The roster, the tree and the graveyard",
+        "description": "`confirmedDead` and `presumedDead` are kept apart in the payload so no client has to invent the split, and so \"confirmed\" and \"presumed\" cannot be summed into one number.",
+        "parameters": [{ "$ref": "#/components/parameters/conversationIdQuery" }],
+        "responses": {
+          "200": {
+            "description": "the roster",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" }, "living": { "type": "integer" },
+                    "confirmedDead": { "type": "integer" }, "presumedDead": { "type": "integer" },
+                    "presumedAfterMin": { "type": "integer" },
+                    "agents": { "type": "array", "items": { "type": "object" } },
+                    "tree": { "type": "array", "items": { "type": "object" } },
+                    "graveyard": { "type": "array", "items": { "type": "object" } }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "registerAgent",
+        "tags": ["agents"],
+        "summary": "Register a name, and get the key that proves you own it",
+        "description": "The reply carries a `key`. KEEP IT: `POST /agents/{name}` refuses without it, and resuming the same name after a restart requires it.\n\nNames are compared FOLDED, so two spellings that cannot be told apart cannot both exist - a 409 names the holder and suggests a free name, because an agent told only \"taken\" tends to try one more variant that folds to the same thing.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "task": { "type": "string", "description": "what it is here to do" },
+                  "parent": { "type": "string", "description": "who spawned it - builds the tree" },
+                  "conversationId": { "type": "string", "description": "must exist. Alias: `conversation`." },
+                  "key": { "type": "string", "description": "required to RESUME an existing name" }
+                }
+              },
+              "examples": { "register": { "value": { "name": "openapi-worker", "parent": "auto-relay-tts-10cb", "task": "write the OpenAPI spec", "conversationId": "mtjoi1b7-wv10cb" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "resumed an existing name with the right key", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "201": { "description": "registered; the body carries the key", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "description": "bad name, bad field, or unknown conversationId", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "that name (or one that folds to it) is held by someone else", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "too many registered agents; nothing is removed automatically", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "the inbox file could not be created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/agents/{name}": {
+      "get": {
+        "operationId": "getAgent",
+        "tags": ["agents"],
+        "summary": "One agent, with its death verdict",
+        "parameters": [{ "$ref": "#/components/parameters/agentName" }],
+        "responses": {
+          "200": { "description": "the agent", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "updateAgent",
+        "tags": ["agents"],
+        "summary": "\"This is what I am doing now\" - requires the key",
+        "description": "The act that proves life, so it also refreshes `lastActedAt`. REQUIRES the `key` from registration (403 without it): a roster where anyone can rewrite what another agent claims to be working on is worse than no roster, because it looks authoritative.",
+        "parameters": [{ "$ref": "#/components/parameters/agentName" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["key"],
+                "properties": {
+                  "key": { "type": "string" },
+                  "task": { "type": "string" },
+                  "note": { "type": "string" },
+                  "conversationId": { "type": "string", "description": "must exist" }
+                }
+              },
+              "examples": { "working": { "value": { "key": "k-...", "task": "writing openapi.json", "note": "half way" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "updated", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "description": "a bad field, or an unknown conversationId", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "wrong key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/agents/{name}/messages": {
+      "get": {
+        "operationId": "getAgentInbox",
+        "tags": ["agents"],
+        "summary": "An agent's addressed inbox",
+        "description": "For a resumed agent catching up. `wake` carries the recipe for how this agent is actually woken, and `file` names the JSONL on disk it is tailing.",
+        "parameters": [
+          { "$ref": "#/components/parameters/agentName" },
+          { "name": "unread", "in": "query", "schema": { "type": "string" }, "description": "truthy: only messages not yet acked" },
+          { "$ref": "#/components/parameters/since" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 }, "description": "the LAST n; defaults to 100, clamped to 500" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the inbox",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "agent": { "type": "string" }, "count": { "type": "integer" },
+                    "waiting": { "type": "integer", "description": "unacked" },
+                    "file": { "type": "string" }, "wake": { "type": ["object", "null"] },
+                    "messages": { "type": "array", "items": { "$ref": "#/components/schemas/InboxMessage" } }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "sendAgentMessage",
+        "tags": ["agents"],
+        "summary": "Write a line into an agent's inbox",
+        "description": "The reply says `acknowledged: false` and NOT \"delivered\", deliberately: the line is in the file, but whether anything is tailing it is not something this server can see, and claiming otherwise would rebuild the lie the ack exists to expose. It counts as picked up only when the agent posts an ack.",
+        "parameters": [{ "$ref": "#/components/parameters/agentName" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                  "text": { "type": "string", "description": "alias: `message`" },
+                  "message": { "type": "string" },
+                  "from": { "type": "string", "description": "aliases: `agent`, `author`. Defaults to \"human\"." }
+                }
+              },
+              "examples": { "poke": { "value": { "text": "stop after the current file", "from": "auto-relay-tts-10cb" } } }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "written to the inbox - NOT confirmed read",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "message": { "$ref": "#/components/schemas/InboxMessage" }, "written": { "type": "string" }, "acknowledged": { "type": "boolean", "const": false }, "note": { "type": "string" } } } } }
+          },
+          "400": { "description": "empty or over-long text", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "description": "the inbox file could not be opened or appended to", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/agents/{name}/messages/{messageId}/ack": {
+      "post": {
+        "operationId": "ackAgentMessage",
+        "tags": ["agents"],
+        "summary": "\"I have this\" - the only report of a read anything can trust",
+        "description": "Written, delivered and READ are three different states, and only the agent can report the third. Acking happens inside a turn, so it also counts as proof of life. Idempotent: a second ack answers 200 with `already: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/agentName" },
+          { "name": "messageId", "in": "path", "required": true, "schema": { "type": "string" }, "description": "the `id` from the inbox" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "note": { "type": "string", "description": "recorded as the act note" } } } } }
+        },
+        "responses": {
+          "200": { "description": "acked", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "already": { "type": "boolean" }, "message": { "$ref": "#/components/schemas/InboxMessage" } } } } } },
+          "404": { "description": "no such agent, or no such message in its inbox", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/agents/{name}/finished": {
+      "post": {
+        "operationId": "agentFinished",
+        "tags": ["agents"],
+        "summary": "Report that an agent is done - confirmed death, not presumed",
+        "description": "Only the agent itself (with its key) or its recorded parent may file this. `lastWords` is what it wanted the record to say.",
+        "parameters": [{ "$ref": "#/components/parameters/agentName" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "properties": { "key": { "type": "string" }, "by": { "type": "string", "description": "the parent, if the parent is reporting" }, "lastWords": { "type": "string" } } },
+              "examples": { "done": { "value": { "key": "k-...", "lastWords": "spec written, suites green" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "recorded", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "agent": { "type": "object" } } } } } },
+          "400": { "description": "a bad field", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "only the agent or its parent may report this", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/agents/{name}/exhume": {
+      "post": {
+        "operationId": "agentExhume",
+        "tags": ["agents"],
+        "summary": "Bring an agent back out of the graveyard",
+        "description": "For the case where an agent was presumed dead and is demonstrably not. Answers 200 with an explanation when there was nothing to exhume.",
+        "parameters": [{ "$ref": "#/components/parameters/agentName" }],
+        "requestBody": {
+          "required": false,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "note": { "type": "string" } } } } }
+        },
+        "responses": {
+          "200": { "description": "exhumed, or already living", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "description": "a bad note", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/images": {
+      "get": {
+        "operationId": "listImages",
+        "tags": ["images"],
+        "summary": "The gallery, newest first",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversationIdQuery" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 }, "description": "defaults to 200, clamped to 500" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the images",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "count": { "type": "integer" }, "total": { "type": "integer" }, "conversationId": { "type": ["string", "null"] }, "images": { "type": "array", "items": { "$ref": "#/components/schemas/Image" } } } } } }
+          }
+        }
+      },
+      "post": {
+        "operationId": "uploadImage",
+        "tags": ["images"],
+        "summary": "Upload image BYTES (not JSON) and get back a blob id",
+        "description": "POST THE RAW BYTES: `curl --data-binary @file.png`. This is not a JSON route and there is no multipart parser.\n\nTHE FORMAT IS READ FROM THE BYTES; the content-type header is IGNORED. Unrecognised bytes are 415, and the refusal says so explicitly, because a caller who set content-type correctly and was still refused will otherwise blame the header.\n\nThe id is the sha256 of the content, so re-posting identical bytes is a no-op and `deduplicated` says it happened. Metadata rides in the QUERY STRING, not the body.",
+        "parameters": [
+          { "name": "alt", "in": "query", "schema": { "type": "string" }, "description": "the label an agent should quote back at him" },
+          { "name": "agent", "in": "query", "schema": { "type": "string" }, "description": "who uploaded it" },
+          { "$ref": "#/components/parameters/conversationIdQuery" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "image/png": { "schema": { "type": "string", "format": "binary" } },
+            "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+            "image/gif": { "schema": { "type": "string", "format": "binary" } },
+            "image/webp": { "schema": { "type": "string", "format": "binary" } },
+            "application/octet-stream": { "schema": { "type": "string", "format": "binary" } }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "stored. `markdown` is a ready-made `![alt](/images/<blob>)`.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "image": { "$ref": "#/components/schemas/Image" }, "deduplicated": { "type": "boolean" }, "markdown": { "type": "string" } } } } }
+          },
+          "400": { "description": "empty body, unknown conversationId, or a bad alt/agent", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "413": { "$ref": "#/components/responses/TooLarge" },
+          "415": { "description": "these bytes are not an image format this server recognises", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "the bytes could not be written to disk", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/images/{blob}": {
+      "get": {
+        "operationId": "getImageBytes",
+        "tags": ["images"],
+        "summary": "The bytes",
+        "description": "Immutable caching is honest here in a way it almost never is: the name IS the hash of the content, so this URL can never mean different bytes. Served with a year-long immutable cache, `nosniff`, `content-disposition: inline` and a `default-src 'none'; sandbox` CSP - nothing served here may act as a document.\n\n410 (not 404) when the log remembers the image but the bytes are gone from disk: a restored DATA_DIR without its images directory is a different problem from a wrong id, and a placeholder would leave him looking at a broken square with no way to tell it from a bug.",
+        "parameters": [{ "$ref": "#/components/parameters/blob" }],
+        "responses": {
+          "200": { "description": "the image", "content": { "image/png": { "schema": { "type": "string", "format": "binary" } }, "image/jpeg": { "schema": { "type": "string", "format": "binary" } } } },
+          "404": { "description": "not a 64-character sha256, or no such image", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "410": { "description": "in the log, but the bytes are no longer on disk", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "head": {
+        "operationId": "headImageBytes",
+        "tags": ["images"],
+        "summary": "Headers only",
+        "description": "Same route, same statuses, no body.",
+        "parameters": [{ "$ref": "#/components/parameters/blob" }],
+        "responses": {
+          "200": { "description": "headers" },
+          "404": { "description": "not an image id, or no such image" },
+          "410": { "description": "bytes gone from disk" }
+        }
+      }
+    },
+    "/damaged": {
+      "get": {
+        "operationId": "getDamaged",
+        "tags": ["thread"],
+        "summary": "Every record carrying a replacement character. A SURVEY, NOT A REPAIR.",
+        "description": "IT NEVER REPAIRS. A U+FFFD could have been an em-dash, an accented letter, a quotation mark or an emoji, and nothing left in the record says which. Guessing one and writing it into an append-only archive would turn a visible gap into an invisible fabrication - a known unknown can be resolved by asking the author, an invention cannot.\n\n`byAuthor` is the useful column: it says whose client is still sending bad bytes.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversationIdQuery" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 }, "description": "defaults to 200, clamped to 1000" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the survey",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" }, "scanned": { "type": "integer" },
+                    "byAuthor": { "type": "array", "items": { "type": "object", "properties": { "author": { "type": "string" }, "damaged": { "type": "integer" } } } },
+                    "rows": { "type": "array", "items": { "type": "object" } }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "operationId": "streamEvents",
+        "tags": ["events"],
+        "summary": "Server-Sent Events. WATCH, DO NOT POLL.",
+        "description": "`text/event-stream`, a `retry:` hint, a `: connected` comment, and a `: ping` comment every few seconds to hold the connection open.\n\nSCOPE IT. With `?conversation=<id>` the server filters to that tab's own events. WITHOUT a query parameter this is the FULL FIREHOSE across every conversation - see `/events/firehose` for the same thing under an unmistakable name. An unscoped connection also receives the `watch` snapshot immediately on connect, so a page opening into an already-stranded state sees it at once; a scoped one does not, because global health has no conversationId to match the filter against.\n\nWHAT NEVER ARRIVES HERE: internal channel traffic (an agent reads its channel by polling); push subscription changes; share/unshare; credits; AND `pick` EVENTS, which fall through the dispatch in `appendEvent` and are silently dropped. `check` events DO arrive.\n\nFrames are `data: {\"now\":..., \"conversationId\":..., \"entries\":[...]}` for thread changes, `{\"conversation\":{...}}` for tab changes, and `{\"watch\":{...}}` for the deadman verdict.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" }
+        ],
+        "responses": {
+          "200": { "description": "an open stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+          "503": { "description": "too many live connections", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/events/firehose": {
+      "get": {
+        "operationId": "streamFirehose",
+        "tags": ["events"],
+        "summary": "The unscoped everything-stream, under a name that cannot be reached for by accident",
+        "description": "Byte-for-byte what bare `GET /events` with no query string already gives. It exists so that reaching for \"the events stream\" does not land a coordinator on the expensive firehose without meaning to. ANY query string here is IGNORED: there is no way to make `/events/firehose` scoped, on purpose.",
+        "responses": {
+          "200": { "description": "an open stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+          "503": { "description": "too many live connections", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/stt": {
+      "post": {
+        "operationId": "transcribe",
+        "tags": ["voice"],
+        "summary": "Raw PCM in, transcript out",
+        "description": "POST the raw audio bytes (not JSON, not a WAV): signed 16-bit little-endian PCM, mono. The body must be a whole number of frames.\n\nThe transcript is repaired against the `/terms` dictionary HERE rather than in the page, so every caller of `/stt` gets it - and `raw` comes back alongside `text` so a composer can offer one-tap undo. `corrections` lists what was changed.",
+        "parameters": [
+          { "name": "rate", "in": "query", "schema": { "type": "integer", "minimum": 8000, "maximum": 48000, "default": 16000 } },
+          { "name": "width", "in": "query", "schema": { "type": "integer", "const": 2, "default": 2 }, "description": "int16 only" },
+          { "name": "channels", "in": "query", "schema": { "type": "integer", "const": 1, "default": 1 }, "description": "mono only" }
+        ],
+        "requestBody": { "required": true, "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+        "responses": {
+          "200": {
+            "description": "the transcript",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "text": { "type": "string", "description": "repaired" },
+                    "raw": { "type": "string", "description": "what the engine actually said" },
+                    "corrections": { "type": "array", "items": { "type": "object" } },
+                    "audioMs": { "type": "integer" }, "tookMs": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "no audio, a partial frame, or a bad rate/width/channels", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "413": { "$ref": "#/components/responses/TooLarge" },
+          "502": { "description": "the speech engine could not be reached or returned nothing", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/tts": {
+      "post": {
+        "operationId": "synthesize",
+        "tags": ["voice"],
+        "summary": "Text in, a spoken WAV out",
+        "description": "A dumb primitive, exactly like `/stt`: it speaks what it is given and knows nothing about the conversation. Deciding WHAT is worth listening to (stripping URLs, collapsing code blocks) belongs to the page, where it can be seen and tuned.\n\nWAV rather than raw PCM because the browser has to decode it: a 44-byte header is the difference between `decodeAudioData` working everywhere and hand-rolling a PCM reader. `x-audio-ms` and `x-took-ms` ride in the headers, since a binary body cannot carry them.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } } }, "examples": { "speak": { "value": { "text": "the deploy is green" } } } } }
+        },
+        "responses": {
+          "200": {
+            "description": "the audio",
+            "headers": {
+              "x-audio-ms": { "schema": { "type": "string" }, "description": "duration of the synthesised audio" },
+              "x-took-ms": { "schema": { "type": "string" }, "description": "how long synthesis took" }
+            },
+            "content": { "audio/wav": { "schema": { "type": "string", "format": "binary" } } }
+          },
+          "400": { "description": "empty text, or text too long to speak", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "the text-to-speech engine returned no audio", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/terms": {
+      "get": {
+        "operationId": "getTerms",
+        "tags": ["voice"],
+        "summary": "The vocabulary dictionary /stt repairs transcripts against",
+        "description": "Two files merged: the curated `stt-terms.json` in the read-only checkout, and the overlay in DATA_DIR that `POST /terms` appends to. The reply reports `overlay` separately so \"did my POST land\" is one read rather than a diff against twenty other terms.\n\nWhen the curated file is missing or invalid, repair is DISABLED entirely and this answers 200 with `repair: \"disabled\"` and empty lists - not an error, because a broken dictionary must never take the transcript with it.",
+        "responses": {
+          "200": {
+            "description": "the dictionary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "file": { "type": "string" }, "overlayFile": { "type": "string" },
+                    "readmeLines": { "type": "integer" },
+                    "counts": { "type": "object" },
+                    "minPhoneticLength": { "type": "integer" }, "maxSpanWords": { "type": "integer" },
+                    "terms": { "type": "array", "items": { "$ref": "#/components/schemas/Term" } },
+                    "protect": { "type": "array", "items": { "type": "string" }, "description": "ordinary language that must never be rewritten" },
+                    "overlay": { "type": "object", "description": "just what POST /terms has added" },
+                    "repair": { "type": "string", "enum": ["disabled"], "description": "present ONLY when the dictionary is unusable" },
+                    "reason": { "type": "string" }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "addTerm",
+        "tags": ["voice"],
+        "summary": "Teach the dictionary a word, or a mishearing of one",
+        "description": "The channel a coordinator actually has. \"Add a term, save, done\" assumes an editor on this machine; the coordinator guard denies every write but markdown, and denies node/python/sed -i - so this route is the way in. Writes to the DATA_DIR overlay, never to the curated file, which sits inside a read-only bind mount.\n\nTHE MERGE IS ADDITIVE ONLY. Nothing posted here can delete a `heard` form, unprotect a word, or overwrite a note a human deliberately wrote down - a `note` is APPENDED, and only if the merged note does not already contain it, so a retry is a no-op rather than a second copy.\n\nEVERY 400 HERE IS A FORM THAT WOULD BE STORED AND THEN SILENTLY IGNORED, which is worse than a rejection: the caller believes the mishearing is fixed and it keeps happening. Refused: a `heard` form with no `term` to belong to; a form that normalises to its own term (`loadTerms` drops those); a form longer than `maxSpanWords`; a form already in `protect` (listed forms bypass protect, so this would quietly start rewriting ordinary language); a form already owned by a different term; a `protect` entry that is already canonical or already a listed mishearing.\n\nRead `changed` in the reply: an add that merged into nothing must not read the same as one that changed the dictionary. `dictionary` counts come from the RELOADED index, so the reply proves repair is actually using the write rather than that a file was written.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "term": { "type": "string", "description": "the canonical spelling. Required if `heard` is present." },
+                  "heard": { "type": "array", "items": { "type": "string" }, "description": "mishearings that should be corrected TO `term`" },
+                  "protect": { "type": "array", "items": { "type": "string" }, "description": "ordinary words repair must never rewrite" },
+                  "note": { "type": "string", "description": "appended to the existing note, never replacing it" },
+                  "by": { "type": "string" }
+                }
+              },
+              "examples": {
+                "mishearing": { "value": { "term": "Vikunja", "heard": ["koenja", "vacuna"], "by": "openapi-worker" } },
+                "protect": { "value": { "protect": ["called"] } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "processed. `changed: false` means it merged into nothing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" }, "changed": { "type": "boolean" },
+                    "term": { "type": ["string", "null"] }, "created": { "type": "boolean", "description": "new to the DICTIONARY, not merely to the overlay file" },
+                    "added": { "type": "array", "items": { "type": "string" } },
+                    "alreadyPresent": { "type": "array", "items": { "type": "string" } },
+                    "note": { "type": "string", "enum": ["appended", "unchanged"] },
+                    "protect": { "type": "object" },
+                    "file": { "type": "string" },
+                    "dictionary": { "type": "object", "description": "counts from the RELOADED index" },
+                    "repair": { "type": "string", "enum": ["enabled", "disabled"] }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "nothing to add, or a form that would be stored and then ignored - the message says which", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "the overlay file is not valid JSON, or could not be written", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "the curated dictionary is missing or invalid, so there is nothing to add to", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/client-log": {
+      "post": {
+        "operationId": "clientLog",
+        "tags": ["meta"],
+        "summary": "One diagnostic line from the browser into the container log",
+        "description": "The UI's real home is a phone, where nobody can open a devtools console, so \"the mic did nothing\" is otherwise undebuggable. DIAGNOSTICS ONLY: nothing is stored, nothing enters the event log, and it cannot affect the queue. Newlines and control characters are flattened so untrusted text cannot forge extra log lines. Rate limited to 60 lines a minute; over that it answers HTTP 429 with `{ ok: false }`.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true }, "examples": { "log": { "value": { "level": "error", "msg": "getUserMedia failed", "ua": "iPhone" } } } } }
+        },
+        "responses": {
+          "200": { "description": "logged", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "429": { "description": "rate limited (60 lines per minute)", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean", "const": false }, "error": { "type": "string" } } } } } }
+        }
+      }
+    },
+    "/push/config": {
+      "get": {
+        "operationId": "getPushConfig",
+        "tags": ["push"],
+        "summary": "Quiet hours, subscribed devices and the VAPID public key",
+        "parameters": [{ "name": "deviceId", "in": "query", "schema": { "type": "string" }, "description": "scopes the snapshot to one device" }],
+        "responses": {
+          "200": { "description": "the config", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }
+        }
+      },
+      "post": {
+        "operationId": "setPushConfig",
+        "tags": ["push"],
+        "summary": "Change quiet hours",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "tz": { "type": "string", "description": "an IANA zone this machine knows" },
+                  "quietFrom": { "type": "string", "pattern": "^\\d{2}:\\d{2}$", "description": "\"HH:MM\", 24-hour" },
+                  "quietTo": { "type": "string", "pattern": "^\\d{2}:\\d{2}$" },
+                  "deviceId": { "type": "string" }
+                },
+                "additionalProperties": true
+              },
+              "examples": { "quiet": { "value": { "tz": "America/Denver", "quietFrom": "22:30", "quietTo": "07:00" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "the new config", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "description": "unknown timezone, a time that is not \"HH:MM\", or nothing to change", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/push/subscribe": {
+      "post": {
+        "operationId": "pushSubscribe",
+        "tags": ["push"],
+        "summary": "Arm this browser for web push",
+        "description": "Takes a standard PushSubscription. A second subscription with the same endpoint replaces the first rather than doubling it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["endpoint", "keys"],
+                "properties": {
+                  "endpoint": { "type": "string", "format": "uri", "description": "must be https" },
+                  "keys": { "type": "object", "required": ["p256dh", "auth"], "properties": { "p256dh": { "type": "string" }, "auth": { "type": "string" } } },
+                  "ua": { "type": "string", "description": "used only to label the device" },
+                  "deviceId": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "armed", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" }, "label": { "type": "string" }, "devices": { "type": "integer" } } } } } },
+          "400": { "description": "missing/insecure endpoint, or unusable keys", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "too many devices subscribed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "push is disabled on this server (no VAPID keys)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/push/unsubscribe": {
+      "post": {
+        "operationId": "pushUnsubscribe",
+        "tags": ["push"],
+        "summary": "Disarm a device",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "endpoint": { "type": "string" }, "id": { "type": "string" } } } } }
+        },
+        "responses": {
+          "200": { "description": "removed (idempotent)", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "removed": { "type": "integer" }, "devices": { "type": "integer" } } } } } }
+        }
+      }
+    },
+    "/push/test": {
+      "post": {
+        "operationId": "pushTest",
+        "tags": ["push"],
+        "summary": "Send a test notification to every armed device",
+        "requestBody": {
+          "required": false,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "text": { "type": "string" } } } } }
+        },
+        "responses": {
+          "200": { "description": "sent, with per-device results", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "409": { "description": "no browser is subscribed yet", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "push is disabled on this server", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v2": {
+      "get": {
+        "operationId": "v2Index",
+        "tags": ["v2"],
+        "summary": "What the proof-of-concept covers",
+        "description": "A BOUNDED, ADDITIVE experiment, not a migration: a second app (Hono + @hono/zod-openapi) mounted under `/v2`, covering exactly 5 routes. Everything under `/v2` is checked first and unconditionally - nothing below it in the router ever sees a `/v2` request - and every v1 route is untouched.\n\nThe v2 routes do NOT reimplement anything: they validate and document the request, then hand off to the SAME `claimTask`/`resultTask`/`progressTask`/`relayTask`/`applyFilters` functions through a `res` shim, so the mutation logic cannot drift. See HONO-POC.md.",
+        "responses": {
+          "200": { "description": "the scope note", "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "scope": { "type": "string" }, "openapi": { "type": "string" }, "docs": { "type": "string" } } } } } }
+        }
+      }
+    },
+    "/v2/openapi.json": {
+      "get": {
+        "operationId": "v2Openapi",
+        "tags": ["v2"],
+        "summary": "The GENERATED spec for the 5 POC routes only",
+        "description": "OpenAPI 3.0.0, generated from the zod route definitions. Do not confuse it with `/openapi.json`, which is this hand-written document and covers the whole server.",
+        "responses": {
+          "200": { "description": "the generated document", "content": { "application/json": { "schema": { "type": "object" } } } }
+        }
+      }
+    },
+    "/v2/docs": {
+      "get": {
+        "operationId": "v2Docs",
+        "tags": ["v2"],
+        "summary": "Swagger UI over /v2/openapi.json",
+        "responses": {
+          "200": { "description": "the page", "content": { "text/html": { "schema": { "type": "string" } } } }
+        }
+      }
+    },
+    "/v2/tasks": {
+      "get": {
+        "operationId": "v2ListTasks",
+        "tags": ["v2"],
+        "summary": "POC mirror of GET /tasks",
+        "description": "Only `conversation`/`conversationId` and `status` are wired up here; channel/unread/expired/since/limit exist on v1 and are intentionally out of scope. Served by the same `applyFilters()` v1 uses.",
+        "parameters": [
+          { "$ref": "#/components/parameters/conversation" },
+          { "$ref": "#/components/parameters/conversationIdAlias" },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["pending", "claimed", "done"] } }
+        ],
+        "responses": {
+          "200": { "description": "matching tasks", "content": { "application/json": { "schema": { "type": "object", "properties": { "count": { "type": "integer" }, "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/v2/tasks/{id}/claim": {
+      "post": {
+        "operationId": "v2ClaimTask",
+        "tags": ["v2"],
+        "summary": "POC mirror of POST /tasks/{id}/claim",
+        "description": "Delegates to the same `claimTask()`, so every trap on the v1 route applies here unchanged. The body is parsed by hand rather than by Hono's validator, because that validator treats an EMPTY body as malformed JSON and a bare claim must stay valid.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": { "by": { "type": "string" } } }, "examples": { "claim": { "value": { "by": "iceland" } } } } } },
+        "responses": {
+          "200": { "description": "claimed, renewed, or taken over", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "already claimed (lease not expired) or already done", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v2/tasks/{id}/result": {
+      "post": {
+        "operationId": "v2ResultTask",
+        "tags": ["v2"],
+        "summary": "POC mirror of POST /tasks/{id}/result",
+        "description": "Delegates to the same `resultTask()`, including the \"result is required\" / \"result is null\" distinction from a malformed-JSON 400.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["result"], "properties": { "result": {}, "by": { "type": "string" } } }, "examples": { "answer": { "value": { "result": "done", "by": "iceland" } } } } } },
+        "responses": {
+          "200": { "description": "answered", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "400": { "description": "result missing or null, or bad images/select", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "already done, or held by a different claimant", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v2/tasks/{id}/relayed": {
+      "post": {
+        "operationId": "v2RelayTask",
+        "tags": ["v2"],
+        "summary": "POC mirror of POST /tasks/{id}/relayed",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "responses": {
+          "200": { "description": "relayed (idempotent)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "no result yet - nothing to deliver", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v2/tasks/{id}/progress": {
+      "post": {
+        "operationId": "v2ProgressTask",
+        "tags": ["v2"],
+        "summary": "POC mirror of POST /tasks/{id}/progress",
+        "description": "A bare POST with no body is a valid \"still here\", exactly as on v1.",
+        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": { "note": { "type": "string", "maxLength": 500 }, "by": { "type": "string" } } }, "examples": { "note": { "value": { "note": "running the suites" } } } } } },
+        "responses": {
+          "200": {
+            "description": "noted; lease renewed; result still open",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" }, "at": { "type": "string" }, "note": { "type": ["string", "null"] }, "progressCount": { "type": "integer" }, "leaseExpiresInSec": { "type": ["integer", "null"] }, "resultStillOpen": { "type": "boolean" } } } } }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "already answered, or held by a different claimant", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "taskId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "the task id", "example": "md3x9k-4f2a1c" },
+      "entryId": {
+        "name": "id", "in": "path", "required": true, "schema": { "type": "string" },
+        "description": "a THREAD ENTRY id: `<taskId>` for the message, `<taskId>:r` for its result",
+        "example": "md3x9k-4f2a1c:r"
+      },
+      "conversationId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "the conversation id", "example": "main" },
+      "agentName": { "name": "name", "in": "path", "required": true, "schema": { "type": "string" }, "description": "the agent's registered name; matched folded, so spellings that cannot be told apart resolve to the same agent" },
+      "blob": { "name": "blob", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "description": "the 64-character sha256 returned by POST /images" },
+      "conversation": { "name": "conversation", "in": "query", "required": false, "schema": { "type": "string" }, "description": "filter to one conversation. Canonical spelling." },
+      "conversationIdAlias": { "name": "conversationId", "in": "query", "required": false, "schema": { "type": "string" }, "description": "accepted alias for `conversation`" },
+      "conversationIdQuery": { "name": "conversationId", "in": "query", "required": false, "schema": { "type": "string" }, "description": "filter to one conversation. Alias: `conversation`." },
+      "since": { "name": "since", "in": "query", "required": false, "schema": { "type": "string" }, "description": "ISO 8601 or epoch milliseconds. STRICTLY after. A value this server cannot parse is a 400, never a silent no-op." },
+      "limitFirst": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0 }, "description": "non-negative integer; anything else is 400" }
+    },
+    "responses": {
+      "NotFound": {
+        "description": "no such record",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "examples": { "gone": { "value": { "error": "no task with id \"md3x9k-4f2a1c\"" } } } } }
+      },
+      "BadRequest": {
+        "description": "a malformed request. The message names the field.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "TooLarge": {
+        "description": "body over 1 MiB",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "Every refusal on this server. `error` is always a sentence a human can act on; the extra keys vary by route and are documented on the operation that returns them - a 409 from `/claim` carries `leaseExpiresInSec`, a 409 from `POST /conversations/{id}` carries `asked` and `stored`, and a UTF-8 refusal carries `detail` naming the first bad byte.",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" },
+          "detail": { "type": "object", "description": "on a UTF-8 refusal: where the bytes went wrong, so the caller does not retry the identical body" },
+          "hint": { "type": "string" }
+        },
+        "additionalProperties": true,
+        "examples": [{ "error": "the request body is not valid UTF-8, so nothing was stored", "detail": { "atByte": 41 } }]
+      },
+      "Counts": {
+        "type": "object",
+        "description": "Queue depth. Internal channel traffic is never counted - agent chatter is not backlog.",
+        "properties": {
+          "pending": { "type": "integer" },
+          "claimed": { "type": "integer" },
+          "done": { "type": "integer" },
+          "unrelayed": { "type": "integer", "description": "answered but not yet marked delivered" }
+        }
+      },
+      "Task": {
+        "type": "object",
+        "description": "THE RECORD EVERY WRITE PATH PRODUCES. A human's request (`POST /tasks`, `role: \"user\"`, born `pending`) and an agent's statement (`POST /messages`, `role: \"agent\"`, born `done` and `relayed`) are the same shape in the same log - which is why the thread projection, the replay and the live stream handle both with no special case.\n\nOptional fields appear only when something has touched them, so a plain record is byte-for-byte the shape every client was written against. Additional properties are expected.",
+        "required": ["id", "instruction", "ts", "status", "claimedBy", "claimedAt", "result", "resultTs", "relayed", "relayedAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "conversationId": { "type": "string", "description": "absent on the oldest records, which read as \"main\"" },
+          "role": { "type": "string", "enum": ["user", "agent"], "description": "SERVER-SET from the route used, never taken from the client" },
+          "instruction": { "type": "string", "description": "what was said" },
+          "author": { "type": "string", "description": "on agent messages: who spoke" },
+          "to": { "type": "string", "description": "on agent messages: who it is addressed to" },
+          "from": { "type": ["string", "null"] },
+          "ts": { "type": "string", "format": "date-time" },
+          "status": { "type": "string", "enum": ["pending", "claimed", "done"] },
+          "claimedBy": { "type": ["string", "null"], "description": "NULL ON A CLAIMED TASK MEANS AN ANONYMOUS CLAIM - a seat that reads occupied with nobody in it. See POST /tasks/{id}/claim." },
+          "claimedAt": { "type": ["string", "null"], "format": "date-time" },
+          "takenOverFrom": { "type": ["string", "null"], "description": "who held it before an expired-lease takeover" },
+          "takenOverAt": { "type": ["string", "null"], "format": "date-time" },
+          "result": { "description": "any JSON value. Null means unanswered; it can never be SET to null." },
+          "resultTs": { "type": ["string", "null"], "format": "date-time" },
+          "relayed": { "type": "boolean", "description": "the human has been shown the answer" },
+          "relayedAt": { "type": ["string", "null"], "format": "date-time" },
+          "progress": { "type": "array", "items": { "type": "object" }, "description": "the newest 20 progress notes; the event log keeps them all" },
+          "progressCount": { "type": "integer" },
+          "lastProgressAt": { "type": ["string", "null"], "format": "date-time", "description": "feeds the claim lease alongside claimedAt" },
+          "images": { "type": "array", "items": { "type": "string" }, "description": "blob ids attached to the MESSAGE" },
+          "resultImages": { "type": "array", "items": { "type": "string" }, "description": "blob ids attached to the ANSWER - deliberately a separate set" },
+          "imageSelect": { "type": "string", "enum": ["one", "many", "none"] },
+          "imageSelected": { "type": "array", "items": { "type": "string" } },
+          "visibility": { "type": "string", "enum": ["conversation", "internal"] },
+          "channel": { "type": "string", "description": "on internal messages only" },
+          "warning": { "type": "object", "description": "only from POST /tasks: the text contains U+FFFD and was stored anyway" }
+        },
+        "additionalProperties": true,
+        "examples": [
+          { "id": "md3x9k-4f2a1c", "conversationId": "main", "role": "user", "instruction": "check the deploy", "from": null, "ts": "2026-09-01T11:00:00.000Z", "status": "done", "claimedBy": "iceland", "claimedAt": "2026-09-01T11:04:02.118Z", "result": "green, 0 failures", "resultTs": "2026-09-01T11:14:00.000Z", "relayed": true, "relayedAt": "2026-09-01T11:14:03.900Z" }
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "description": "A message as `GET /messages` returns it - the channel's own view, with no queue machinery. `role`, `status` and `answered` are here for the CONVERSATION read, where a human's message is a real task that may still be waiting: rendering it identically to a statement is how a reader concludes nobody has said anything.",
+        "properties": {
+          "id": { "type": "string" },
+          "channel": { "type": ["string", "null"], "description": "set on internal traffic, null in a conversation" },
+          "conversationId": { "type": ["string", "null"], "description": "null on internal traffic" },
+          "role": { "type": "string", "enum": ["user", "agent"] },
+          "from": { "type": ["string", "null"] },
+          "author": { "type": ["string", "null"] },
+          "to": { "type": ["string", "null"] },
+          "text": { "type": "string" },
+          "ts": { "type": "string", "format": "date-time" },
+          "status": { "type": "string", "enum": ["pending", "claimed", "done"] },
+          "answered": { "type": "boolean" }
+        },
+        "examples": [
+          { "id": "mtjp0w58-jthpek", "channel": null, "conversationId": "mtjoi1b7-wv10cb", "role": "agent", "from": "agent", "author": "openapi-worker", "to": null, "text": "spec written, suites green", "ts": "2026-09-01T12:06:27.260Z", "status": "done", "answered": false }
+        ]
+      },
+      "ThreadEntry": {
+        "type": "object",
+        "description": "ONE TASK PROJECTS TO ONE OR TWO OF THESE: the message, and - once answered - a reply entry whose id is `<taskId>:r`. Nothing is stored in this shape; it is derived, which is why flags like `damaged` light up retroactively on records written years before the flag existed.\n\n`rev` IS THE FIELD TO POLL ON. It is the newest of the entry's own timestamps AND of every tick and pick on it, so `?since=<rev>` notices a checkbox that changed nothing else. `ts` does not move.",
+        "required": ["id", "role", "text", "ts", "status", "rev", "conversationId"],
+        "properties": {
+          "id": { "type": "string", "description": "`<taskId>` or `<taskId>:r`" },
+          "role": { "type": "string", "enum": ["user", "agent"] },
+          "text": { "type": "string", "description": "a non-string result is JSON-stringified into this" },
+          "ts": { "type": "string", "format": "date-time" },
+          "status": { "type": "string", "enum": ["pending", "claimed", "done"] },
+          "rev": { "type": "string", "format": "date-time", "description": "poll on this, not on `ts`" },
+          "conversationId": { "type": "string" },
+          "replyTo": { "type": "string", "description": "present on a `:r` entry" },
+          "author": { "type": "string", "description": "added only when there is one" },
+          "claimedBy": { "type": "string", "description": "added only when something holds it" },
+          "damaged": { "type": "boolean", "description": "derived: the text contains U+FFFD" },
+          "images": { "type": "array", "items": { "$ref": "#/components/schemas/ImageRef" } },
+          "checklist": { "type": "object", "description": "{ total, done, items } when the text contains a task list" },
+          "selection": { "type": "object", "description": "{ mode, total, picked, decided, items } when the entry carries selectable images" }
+        },
+        "additionalProperties": true
+      },
+      "Conversation": {
+        "type": "object",
+        "description": "A TAB. Every task belongs to exactly one; records written before conversations existed replay into `main`.\n\nThe stop fields are the honest half of a control this server cannot actually perform: relay-queue can ASK an agent to stop and can record that it answered, but it cannot kill a process and never will. `spawnedBy` names the only session that could, and is null unless something told us - never inferred, because a guess here puts a confident button in front of a process nobody can reach.",
+        "required": ["id", "title", "agent", "createdAt", "archived"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "agent": { "type": ["string", "null"], "description": "who is SEATED here. Set with `agent` on POST /conversations/{id} - note that the claim route calls this same idea `by`." },
+          "agentSince": { "type": ["string", "null"], "format": "date-time", "description": "when the chair was filled. NOT evidence of life; only the vacant-chair sweep should read it." },
+          "agentLeft": { "type": ["string", "null"], "description": "who vacated" },
+          "agentLeftAt": { "type": ["string", "null"], "format": "date-time" },
+          "agentLeftReason": { "type": ["string", "null"], "description": "in the agent's own words. `presumed-gone` is written ONLY by the sweep and is refused from callers." },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "archived": { "type": "boolean" },
+          "archivedAt": { "type": ["string", "null"], "format": "date-time" },
+          "stopRequested": { "type": "boolean", "description": "asking, not stopping" },
+          "stopRequestedAt": { "type": ["string", "null"], "format": "date-time" },
+          "stopRequestedBy": { "type": ["string", "null"] },
+          "stopAck": { "type": ["string", "null"], "enum": ["stopping", "stopped", null], "description": "written by the agent from inside a turn. null = not heard from since the request, which is normal, not an error." },
+          "stopAckAt": { "type": ["string", "null"], "format": "date-time" },
+          "stoppedAt": { "type": ["string", "null"], "format": "date-time" },
+          "stopNote": { "type": ["string", "null"] },
+          "worktrees": { "type": ["array", "null"], "items": { "type": "string" }, "description": "SELF-REPORTED. This server does not touch git." },
+          "spawnedBy": { "type": ["string", "null"] },
+          "contextFrom": { "type": ["string", "null"], "format": "date-time", "description": "the watermark a freshly seated agent reads from. null = never cleared, which is NOT the same as cleared at the beginning." },
+          "contextMarks": { "type": "array", "items": { "type": "object" }, "description": "every watermark ever set, so a tab cleared five times draws five session dividers instead of losing four" },
+          "pendingDispatch": { "type": ["object", "null"], "description": "{ kind, at, taskId } - a request about this tab sitting in someone's queue. Archiving cancels it in the same write." },
+          "counts": { "$ref": "#/components/schemas/Counts" },
+          "messages": { "type": "integer" },
+          "lastTs": { "type": ["string", "null"], "format": "date-time" },
+          "lastRole": { "type": ["string", "null"] },
+          "lastText": { "type": "string" },
+          "missing": { "type": "boolean", "description": "the tab was inferred from tasks that name it, and was never created" }
+        },
+        "additionalProperties": true,
+        "examples": [
+          { "id": "mtjoi1b7-wv10cb", "title": "OpenAPI spec", "agent": "openapi-worker", "agentSince": "2026-09-01T12:00:00.000Z", "createdAt": "2026-09-01T11:58:00.000Z", "archived": false, "stopRequested": false, "stopAck": null, "counts": { "pending": 0, "claimed": 1, "done": 12, "unrelayed": 0 }, "messages": 13 }
+        ]
+      },
+      "Term": {
+        "type": "object",
+        "description": "One entry in the speech dictionary: a canonical spelling and the mishearings that should be corrected to it. Matching is phonetic (a trimmed Metaphone), which is why short terms are never matched by sound - \"cold\", \"called\" and \"clot\" are all phonetically identical to \"Claude\".",
+        "required": ["term"],
+        "properties": {
+          "term": { "type": "string", "description": "the canonical spelling" },
+          "heard": { "type": "array", "items": { "type": "string" }, "description": "forms the engine produces instead. A form equal to its own term is dropped at load." },
+          "note": { "type": "string", "description": "why. APPENDED to, never replaced - the reasoning for a decision is how a term stays explainable." },
+          "by": { "type": "string" },
+          "at": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": true,
+        "examples": [{ "term": "Vikunja", "heard": ["koenja", "vacuna"], "note": "the task tracker", "by": "openapi-worker" }]
+      },
+      "EntryChecklist": {
+        "type": "object",
+        "description": "A checklist PARSED OUT OF MESSAGE TEXT (the `/checklists` plural world). Items are addressed by INDEX and cannot be edited: a corrected list is a new message, which correctly starts with fresh ticks. `source` tells \"he ticked it\" apart from \"it was written already ticked\".",
+        "properties": {
+          "entryId": { "type": "string" },
+          "taskId": { "type": "string" },
+          "conversationId": { "type": "string" },
+          "role": { "type": "string" },
+          "total": { "type": "integer" },
+          "done": { "type": "integer" },
+          "remaining": { "type": "integer" },
+          "supersededBy": { "type": ["string", "null"], "description": "the tab list that imported these items, if any" },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer" },
+                "label": { "type": "string" },
+                "depth": { "type": "integer" },
+                "checked": { "type": "boolean" },
+                "source": { "type": "string", "enum": ["checked", "text"] },
+                "by": { "type": ["string", "null"] },
+                "at": { "type": ["string", "null"], "format": "date-time" }
+              }
+            }
+          }
+        }
+      },
+      "TabList": {
+        "type": "object",
+        "description": "THE ONE STICKY LIST for a conversation (the `/checklist` singular world). Items have generated IDS and are ticked by id. `editedSinceTicked` is true when an item was reworded after it was ticked - the tick survives, but not the pretence it was earned against these words.",
+        "properties": {
+          "conversationId": { "type": "string" },
+          "title": { "type": ["string", "null"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "updatedBy": { "type": ["string", "null"] },
+          "importedFrom": { "type": "array", "items": { "type": "string" }, "description": "thread entry ids whose open items were copied in" },
+          "total": { "type": "integer" },
+          "done": { "type": "integer" },
+          "remaining": { "type": "integer" },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "text": { "type": "string" },
+                "done": { "type": "boolean" },
+                "by": { "type": ["string", "null"] },
+                "at": { "type": ["string", "null"], "format": "date-time" },
+                "editedAt": { "type": ["string", "null"], "format": "date-time" },
+                "tickedText": { "type": "string", "description": "the wording that was actually ticked" },
+                "editedSinceTicked": { "type": "boolean" }
+              }
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "PickList": {
+        "type": "object",
+        "description": "A selectable image set hanging off one thread entry. `mode: \"one\"` is enforced SERVER-SIDE, so his phone, his laptop and an agent all end up with the same single choice.",
+        "properties": {
+          "entryId": { "type": "string" },
+          "taskId": { "type": "string" },
+          "conversationId": { "type": "string" },
+          "role": { "type": "string" },
+          "mode": { "type": "string", "enum": ["one", "many"] },
+          "total": { "type": "integer" },
+          "picked": { "type": "integer" },
+          "decided": { "type": "boolean", "description": "true only once he has actually touched it. \"nothing chosen yet\" is not \"he chose none\"." },
+          "selected": { "type": "array", "items": { "type": "object", "properties": { "index": { "type": "integer" }, "id": { "type": "string" }, "label": { "type": "string" } } } },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer" },
+                "id": { "type": "string" },
+                "label": { "type": "string" },
+                "url": { "type": "string" },
+                "path": { "type": ["string", "null"] },
+                "width": { "type": ["integer", "null"] },
+                "height": { "type": ["integer", "null"] },
+                "selected": { "type": "boolean" },
+                "source": { "type": "string", "enum": ["picked", "declared"], "description": "`declared` is the poster's own suggestion, NOT his decision" },
+                "by": { "type": ["string", "null"] },
+                "at": { "type": ["string", "null"], "format": "date-time" }
+              }
+            }
+          }
+        }
+      },
+      "ImageRef": {
+        "type": "object",
+        "description": "An image as it appears inside a thread entry.",
+        "properties": {
+          "id": { "type": "string" },
+          "url": { "type": "string" },
+          "path": { "type": ["string", "null"], "description": "where the bytes are on the host, for tools that read the disk" },
+          "type": { "type": ["string", "null"] },
+          "width": { "type": ["integer", "null"] },
+          "height": { "type": ["integer", "null"] },
+          "alt": { "type": ["string", "null"] }
+        }
+      },
+      "Image": {
+        "type": "object",
+        "description": "A gallery record. `blob` is the sha256 of the bytes and is what `/images/{blob}` serves; `id` identifies this POST of them, so the same bytes uploaded twice are one blob and two records.",
+        "properties": {
+          "id": { "type": "string" },
+          "blob": { "type": "string" },
+          "type": { "type": "string" },
+          "bytes": { "type": "integer" },
+          "width": { "type": ["integer", "null"] },
+          "height": { "type": ["integer", "null"] },
+          "alt": { "type": ["string", "null"] },
+          "agent": { "type": ["string", "null"] },
+          "conversationId": { "type": "string" },
+          "ts": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": true
+      },
+      "ActivityEntry": {
+        "type": "object",
+        "description": "One line of a coordinator narrating its own work. `reconstructed` is the honest flag: true = the caller supplied `at` (backfill), false = server-stamped, null = the record predates the field.",
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "conversationId": { "type": "string" },
+          "kind": { "type": "string", "enum": ["spawned", "finished", "tool", "note"] },
+          "agent": { "type": ["string", "null"], "description": "who is reporting" },
+          "subagent": { "type": ["string", "null"], "description": "who it is about" },
+          "task": { "type": ["string", "null"] },
+          "tool": { "type": ["string", "null"] },
+          "text": { "type": ["string", "null"] },
+          "ok": { "type": ["boolean", "null"] },
+          "reconstructed": { "type": ["boolean", "null"] }
+        }
+      },
+      "InboxMessage": {
+        "type": "object",
+        "description": "A line in an agent's addressed inbox. `ackedAt` is the only trustworthy report of a read, because only the agent can write it.",
+        "properties": {
+          "id": { "type": "string" },
+          "to": { "type": "string" },
+          "from": { "type": "string" },
+          "text": { "type": "string" },
+          "ts": { "type": "string", "format": "date-time" },
+          "ackedAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      }
+    }
+  }
+}

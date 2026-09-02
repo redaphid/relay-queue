@@ -3530,6 +3530,31 @@ const TERMS_FILE = process.env.STT_TERMS_FILE || path.join(__dirname, 'stt-terms
 const MAX_SPAN_WORDS = 4; // longest multi-word misfire we will try to match
 
 /*
+ * Where POST /terms writes, and why it is not TERMS_FILE.
+ *
+ * "Add a term, save, done" assumes you can open an editor on this machine. A
+ * coordinator cannot: the guard denies every write except markdown, and denies
+ * node/python/sed -i, so its only channel into this process is a curl. Hence
+ * POST /terms — and hence this file, because the obvious target is not writable.
+ *
+ * The checkout is bind-mounted into the container READ-ONLY (`:ro` in
+ * docker-compose.yml), on purpose: the code this process runs must not be
+ * rewritable by this process. `stt-terms.json` sits inside that mount, so it
+ * cannot be appended to in place and will not be while that line stands.
+ * DATA_DIR is the one writable path, so additions land in an overlay there and
+ * are MERGED over the curated file at load time.
+ *
+ * That split earns its keep independently of the mount: stt-terms.json stays
+ * the reviewed, documented, human-edited artifact, and whatever an agent added
+ * at 3am is visibly separate from it rather than interleaved into his file —
+ * beside the rest of relay's mutable state, and easy to read back and bless
+ * into the curated list later. The merge is additive only (see mergeTerms), so
+ * nothing an agent POSTs can delete or rewrite a decision he made.
+ */
+const TERMS_OVERLAY_FILE = process.env.STT_TERMS_OVERLAY_FILE
+  || path.join(DATA_DIR, 'stt-terms.local.json');
+
+/*
  * Metaphone, trimmed to what this needs. Maps a word to how it SOUNDS, so
  * "a Lexus" and "Alexa" collide on ALKS and "coordinate or" lands on the same
  * key as "coordinator". Edit distance alone cannot see either of those, because
@@ -3601,23 +3626,135 @@ const normTerm = (s) => String(s).toLowerCase().replace(/[^a-z0-9\s']/g, ' ').re
 const joinLetters = (s) => s.replace(/\b(?:[a-z]\s+){2,}[a-z]\b/g, (m) => m.replace(/\s+/g, ''));
 const phoneticOf = (s) => metaphone(joinLetters(normTerm(s)).replace(/\s+/g, ''));
 
-let termsCache = { mtimeMs: -1, index: null };
+let termsCache = { key: '', index: null, raw: null };
+
+/*
+ * A cache key that changes whenever either file does, including when one
+ * appears or disappears. Size is in it as well as mtime because DATA_DIR is a
+ * bind mount off NTFS, where mtime granularity is not something to bet the
+ * whole feature on: a stale index here means a POST returns "reloaded, 21
+ * terms" while repair keeps using the old dictionary, i.e. it lies.
+ */
+function termsStamp(file) {
+  try { const s = fs.statSync(file); return `${s.mtimeMs}:${s.size}`; } catch { return 'none'; }
+}
+
+/**
+ * Reads one dictionary file. Returns null ONLY for ENOENT — normal for the
+ * overlay, and the reason absence and corruption are not collapsed into one
+ * answer here: a missing overlay is the default state, a corrupt one is a bug.
+ *
+ * EVERY OTHER ERROR IS RETHROWN, and that distinction is the whole safety of
+ * the read-modify-write in termsAddRoute. Swallowing EACCES/EIO/EISDIR would
+ * hand that route an empty `{}` for a file that is PRESENT AND FULL, and the
+ * atomic rename would then replace a curated overlay with a one-entry one and
+ * answer `ok:true, changed:true`. A permissions blip must cost the write, not
+ * the vocabulary: absent is soft, unreadable is loud.
+ */
+function readTermsFile(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  const raw = JSON.parse(text);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('not a JSON object');
+  return raw;
+}
+
+/**
+ * Folds the agent-written overlay into the human-curated dictionary.
+ *
+ * ADDITIVE ONLY, and that is the whole safety argument for letting an HTTP
+ * route feed this. An overlay entry can introduce a term, add `heard` forms to
+ * one, add a note or protect a word. It has no way to remove a form, unprotect
+ * a word, or overwrite a note — so every "NOT listed, deliberately" decision in
+ * stt-terms.json survives anything posted at the API, and the worst a bad POST
+ * can do is add a correction, which the composer already shows and can undo.
+ */
+function mergeTerms(base, overlay) {
+  const terms = [];
+  const at = new Map(); // normalised canonical spelling -> index in `terms`
+  const addEntry = (entry) => {
+    if (!entry || typeof entry.term !== 'string' || !entry.term.trim()) return;
+    const key = normTerm(entry.term);
+    if (!key) return;
+    const heard = (Array.isArray(entry.heard) ? entry.heard : [])
+      .filter((h) => typeof h === 'string' && h.trim())
+      .map((h) => h.trim());
+    const note = typeof entry.note === 'string' && entry.note.trim() ? entry.note.trim() : null;
+    if (!at.has(key)) {
+      at.set(key, terms.length);
+      const made = { term: entry.term.trim(), heard };
+      if (note) made.note = note;
+      terms.push(made);
+      return;
+    }
+    // Same canonical spelling seen twice: one entry, not two. Two entries would
+    // both reach `exact`, where the later one silently wins.
+    const cur = terms[at.get(key)];
+    for (const h of heard) if (!cur.heard.some((x) => normTerm(x) === normTerm(h))) cur.heard.push(h);
+    if (note) cur.note = cur.note ? `${cur.note} ${note}` : note;
+  };
+  for (const e of Array.isArray(base.terms) ? base.terms : []) addEntry(e);
+  for (const e of overlay && Array.isArray(overlay.terms) ? overlay.terms : []) addEntry(e);
+
+  const protect = [];
+  const seen = new Set();
+  for (const src of [base.protect, overlay && overlay.protect]) {
+    for (const p of Array.isArray(src) ? src : []) {
+      if (typeof p !== 'string' || !p.trim()) continue;
+      const n = normTerm(p);
+      if (!n || seen.has(n)) continue;
+      seen.add(n);
+      protect.push(p.trim());
+    }
+  }
+
+  const overlayMin = overlay && Number(overlay.minPhoneticLength);
+  return {
+    _readme: base._readme,
+    terms,
+    protect,
+    minPhoneticLength: overlayMin > 0 ? overlayMin : base.minPhoneticLength,
+  };
+}
 
 function loadTerms() {
-  let stat = null;
-  try { stat = fs.statSync(TERMS_FILE); } catch { /* no dictionary: repair is a no-op */ }
-  if (!stat) return null;
-  if (termsCache.mtimeMs === stat.mtimeMs) return termsCache.index;
+  const key = `${termsStamp(TERMS_FILE)}|${termsStamp(TERMS_OVERLAY_FILE)}`;
+  if (termsCache.key === key) return termsCache.index;
 
-  let raw;
+  let base;
   try {
-    raw = JSON.parse(fs.readFileSync(TERMS_FILE, 'utf8'));
+    base = readTermsFile(TERMS_FILE);
   } catch (err) {
-    // A typo in the dictionary must never take transcription down with it.
-    console.log(`[terms] ${TERMS_FILE} is not valid JSON — transcript repair disabled: ${err.message}`);
-    termsCache = { mtimeMs: stat.mtimeMs, index: null };
+    // A typo in the dictionary — or a file that is there but unreadable — must
+    // never take transcription down with it.
+    console.log(`[terms] ${TERMS_FILE} could not be read — transcript repair disabled: ${err.message}`);
+    termsCache = { key, index: null, raw: null };
     return null;
   }
+  if (!base) { // no dictionary: repair is a no-op
+    termsCache = { key, index: null, raw: null };
+    return null;
+  }
+
+  let overlay = null;
+  try {
+    overlay = readTermsFile(TERMS_OVERLAY_FILE);
+  } catch (err) {
+    /*
+     * A broken overlay costs only the additions in it. Letting it disable
+     * repair outright would mean one bad write took the curated dictionary
+     * down with it — the exact failure the atomic rename in writeTermsOverlay
+     * exists to prevent, so it must not be reachable by a second route either.
+     */
+    console.log(`[terms] ${TERMS_OVERLAY_FILE} could not be read — ignoring it: ${err.message}`);
+  }
+
+  const raw = mergeTerms(base, overlay);
 
   const exact = new Map(); // normalised heard phrase -> canonical
   const phonetic = new Map(); // distinctive sound -> canonical
@@ -3645,10 +3782,13 @@ function loadTerms() {
   }
 
   const index = { exact, phonetic, canonical, protect, minLen, maxWords: Math.min(maxWords, MAX_SPAN_WORDS) };
-  termsCache = { mtimeMs: stat.mtimeMs, index };
+  termsCache = { key, index, raw };
   console.log(`[terms] ${raw.terms ? raw.terms.length : 0} terms, ${exact.size} known mishearings`);
   return index;
 }
+
+/** The merged dictionary as data, for GET /terms. Shares loadTerms' cache. */
+function termsRaw() { loadTerms(); return termsCache.raw; }
 
 /** Splits into words, keeping the punctuation around each so it can be rebuilt. */
 function splitWords(text) {
@@ -3723,6 +3863,362 @@ function repairTranscript(text) {
   }
 
   return { text: out.join(' '), corrections };
+}
+
+// ------------------------------------------------------- the dictionary over HTTP
+/*
+ * GET /terms, POST /terms — read the vocabulary dictionary, and append to it.
+ *
+ * Written because the people best placed to notice a mishearing are the ones
+ * who cannot fix it. A coordinator watches the engine turn "Vikunja" into
+ * "Koenja" in the very sentence asking for it to be fixed, and then has no way
+ * to act: the coordinator guard denies every write but markdown, denies
+ * node/python/sed -i, and leaves exactly one channel open — a curl at this
+ * server. So the dictionary needs a door on that channel or it stays a file
+ * only the human can edit, which is the bottleneck he asked to remove.
+ *
+ * Deliberately NOT in the event log. This is configuration, not queue state:
+ * one line per vocabulary tweak would bury the thread history it shares a log
+ * with, and nothing about a term needs replaying to reconstruct the queue.
+ */
+const TERMS_OVERLAY_README = [
+  'Vocabulary added over HTTP - POST /terms on relay-queue. Machine-written.',
+  '',
+  'This file is MERGED OVER stt-terms.json in the checkout, which stays the',
+  'curated, documented, human-edited dictionary. Additions land here instead of',
+  'there because the checkout is bind-mounted read-only into the container, and',
+  'because a decision he wrote down should not be edited by an agent at 3am.',
+  '',
+  'The merge is ADDITIVE ONLY: an entry here can introduce a term, add `heard`',
+  'forms to one, add a note, or protect a word. It cannot delete a form,',
+  'unprotect a word or overwrite a note, so every "NOT listed, deliberately"',
+  'note in stt-terms.json survives whatever is posted at the API.',
+  '',
+  'Safe to hand-edit, and safe to empty: promoting an entry into stt-terms.json',
+  'and deleting it from here is a no-op, because the merge would produce the',
+  'same dictionary either way. The server notices the mtime and re-reads.',
+];
+
+/**
+ * Writes the overlay atomically: a temp file beside it, then a rename over it.
+ *
+ * A torn write is not a partial loss here, it is a total one — half a JSON
+ * document does not parse, loadTerms would drop the whole overlay, and every
+ * term ever added through this route would vanish at once with nothing but a
+ * log line to say so. The rename is the only step that is visible to a reader.
+ *
+ * `file` is the overlay AS IT WAS JUST READ, and it is spread first so that
+ * every key it carries survives a write that was not about that key. The README
+ * calls this file "safe to hand-edit", and mergeTerms honours a hand-set
+ * `minPhoneticLength` from it — enumerating the keys we happen to know about
+ * would silently delete that on the next unrelated POST, and would do it again
+ * for whatever key is added next. Round-tripping the unknown is the only shape
+ * of this function that stays correct without being maintained.
+ */
+function writeTermsOverlay(file, terms, protect) {
+  const body = JSON.stringify({ ...file, _readme: TERMS_OVERLAY_README, terms, protect }, null, 2) + '\n';
+  fs.mkdirSync(path.dirname(TERMS_OVERLAY_FILE), { recursive: true });
+  const tmp = `${TERMS_OVERLAY_FILE}.${process.pid}.part`;
+  fs.writeFileSync(tmp, body);
+  fs.renameSync(tmp, TERMS_OVERLAY_FILE); // atomic within the directory
+}
+
+/** What repair is actually using right now, for a caller that just wrote to it. */
+function termsCounts() {
+  const idx = loadTerms();
+  const raw = termsCache.raw;
+  if (!idx || !raw) return null;
+  return {
+    terms: raw.terms.length,
+    mishearings: idx.exact.size,
+    protect: idx.protect.size,
+    minPhoneticLength: idx.minLen,
+    maxSpanWords: idx.maxWords,
+  };
+}
+
+function termsReadRoute(res) {
+  const idx = loadTerms();
+  const raw = termsRaw();
+  if (!idx || !raw) {
+    return send(res, 200, {
+      repair: 'disabled',
+      reason: `${TERMS_FILE} is missing or is not valid JSON`,
+      file: TERMS_FILE,
+      overlayFile: TERMS_OVERLAY_FILE,
+      terms: [],
+      protect: [],
+    });
+  }
+  let overlay = null;
+  let overlayError = null;
+  try { overlay = readTermsFile(TERMS_OVERLAY_FILE); } catch (err) { overlayError = err.message; }
+  send(res, 200, {
+    file: TERMS_FILE,
+    overlayFile: TERMS_OVERLAY_FILE,
+    // `_readme` is ~20 lines of prose that never changes; a caller that wants
+    // it can read the file. Counting it is enough to prove it is still there.
+    readmeLines: Array.isArray(raw._readme) ? raw._readme.length : 0,
+    counts: termsCounts(),
+    minPhoneticLength: idx.minLen,
+    maxSpanWords: idx.maxWords,
+    terms: raw.terms,
+    protect: raw.protect,
+    // What came from the overlay specifically, so "did my POST land" is one
+    // read rather than a diff against a dictionary of twenty other terms.
+    overlay: overlayError ? { error: overlayError }
+      : overlay ? { terms: overlay.terms || [], protect: overlay.protect || [] }
+        : { terms: [], protect: [] },
+  });
+}
+
+function termsAddRoute(res, body) {
+  const idx = loadTerms();
+  if (!idx) {
+    return fail(res, 503, `the dictionary at ${TERMS_FILE} is missing or invalid, so there is nothing to add to`,
+      { file: TERMS_FILE });
+  }
+
+  const hasTerm = body.term !== undefined && body.term !== null;
+  const hasProtect = body.protect !== undefined && body.protect !== null;
+  const hasHeard = body.heard !== undefined && body.heard !== null;
+  if (!hasTerm && !hasProtect && !hasHeard) {
+    return fail(res, 400, 'nothing to add: send {"term":"Vikunja","heard":["koenja"]} or {"protect":["word"]}');
+  }
+  // Checked before `heard` is validated at all: "a mishearing of WHAT" is the
+  // question a bare `heard` cannot answer, and complaining about the array's
+  // shape instead would send the caller looking in the wrong place entirely.
+  if (hasHeard && !hasTerm) {
+    return fail(res, 400, 'heard needs a term to belong to: send {"term":"...","heard":[...]}');
+  }
+  if (body.note !== undefined && body.note !== null && typeof body.note !== 'string') {
+    return fail(res, 400, 'note must be a string');
+  }
+  if (body.by !== undefined && body.by !== null && typeof body.by !== 'string') {
+    return fail(res, 400, 'by must be a string');
+  }
+  const note = typeof body.note === 'string' && body.note.trim() ? body.note.trim() : null;
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : null;
+
+  let term = null;
+  if (hasTerm) {
+    if (typeof body.term !== 'string' || !body.term.trim()) {
+      return fail(res, 400, 'term must be a non-empty string');
+    }
+    term = body.term.trim();
+    if (!normTerm(term)) {
+      return fail(res, 400, `term "${term}" has no letters or digits, so nothing could ever match it`);
+    }
+  }
+
+  let heard = [];
+  if (hasHeard) {
+    if (!Array.isArray(body.heard)) return fail(res, 400, 'heard must be an array of non-empty strings');
+    for (const h of body.heard) {
+      if (typeof h !== 'string' || !h.trim()) {
+        return fail(res, 400, 'heard must be an array of non-empty strings', { offending: h === undefined ? null : h });
+      }
+    }
+    heard = body.heard.map((h) => h.trim());
+  }
+  /*
+   * Every refusal below is a form that would be STORED AND THEN IGNORED. Those
+   * are the expensive ones: the caller is told it worked, the mishearing keeps
+   * happening, and the dictionary grows an entry nobody can explain later. A
+   * 400 that names the reason is the whole value this route adds over an editor.
+   */
+  const selfNorm = term ? normTerm(term) : '';
+  const selfWords = selfNorm ? selfNorm.split(' ') : [];
+  /*
+   * Does the term appear inside these words as a whole word-span, with words
+   * left over? Word-boundary aware on purpose: "open api" is a perfectly good
+   * mishearing of "OpenAPI" even though every letter of the term is in there,
+   * because no span of it is ever equal to the term. Only a form that contains
+   * the term outright is dangerous.
+   */
+  const wrapsTerm = (words) => {
+    if (!selfWords.length || words.length <= selfWords.length) return false;
+    for (let i = 0; i + selfWords.length <= words.length; i++) {
+      if (selfWords.every((w, j) => words[i + j] === w)) return true;
+    }
+    return false;
+  };
+  for (const h of heard) {
+    const n = normTerm(h);
+    if (!n) return fail(res, 400, `heard form "${h}" has no letters or digits, so nothing could ever match it`);
+    if (n === selfNorm) {
+      return fail(res, 400, `heard form "${h}" normalises to "${term}" itself; loadTerms drops a form equal to its own `
+        + 'term, so this would be stored and never fire', { term });
+    }
+    // The mirror image of the check above, and the worse of the two. That form
+    // is stored and never fires; this one fires and eats words. Repair replaces
+    // the WHOLE span it matched, so a form that is just the term with company
+    // rewrites CORRECT speech into a shorter, wrong sentence.
+    if (wrapsTerm(n.split(' '))) {
+      return fail(res, 400, `heard form "${h}" already contains "${term}" as a whole word span; repair replaces the `
+        + `entire span it matches, so a correctly transcribed "${h}" would come back as just "${term}" with the `
+        + 'other words silently eaten. List only the part that is actually misheard.', { term });
+    }
+    const words = n.split(' ').length;
+    if (words > MAX_SPAN_WORDS) {
+      return fail(res, 400, `heard form "${h}" is ${words} words; repair never tests a span longer than `
+        + `${MAX_SPAN_WORDS}, so it could never match`, { maxSpanWords: MAX_SPAN_WORDS });
+    }
+    if (idx.protect.has(n)) {
+      return fail(res, 400, `heard form "${h}" is in the protect list - ordinary language that must never be `
+        + 'rewritten. Listed forms bypass protect, so accepting this would silently start rewriting it. If it '
+        + 'really should be corrected, that is a decision for stt-terms.json, not for this route.',
+      { protectedForm: h });
+    }
+    const owner = idx.exact.get(n);
+    if (owner && normTerm(owner) !== selfNorm) {
+      return fail(res, 400, `heard form "${h}" is already a listed mishearing of "${owner}"; a form can only map `
+        + 'to one term, and adding it here would quietly steal it', { alreadyMapsTo: owner });
+    }
+  }
+
+  let protect = [];
+  if (hasProtect) {
+    if (!Array.isArray(body.protect)) return fail(res, 400, 'protect must be an array of non-empty strings');
+    for (const p of body.protect) {
+      if (typeof p !== 'string' || !p.trim()) {
+        return fail(res, 400, 'protect must be an array of non-empty strings', { offending: p === undefined ? null : p });
+      }
+    }
+    protect = body.protect.map((p) => p.trim());
+    for (const p of protect) {
+      const n = normTerm(p);
+      if (!n) return fail(res, 400, `protect entry "${p}" has no letters or digits, so nothing could ever match it`);
+      if (n.split(' ').length > MAX_SPAN_WORDS) {
+        return fail(res, 400, `protect entry "${p}" is longer than ${MAX_SPAN_WORDS} words; no span that long is `
+          + 'ever tested, so it could never be consulted', { maxSpanWords: MAX_SPAN_WORDS });
+      }
+      if (idx.canonical.has(n)) {
+        return fail(res, 400, `"${p}" is already a canonical term, which repair never rewrites anyway, so `
+          + 'protecting it would change nothing');
+      }
+      const owner = idx.exact.get(n);
+      if (owner) {
+        return fail(res, 400, `"${p}" is a listed mishearing of "${owner}", and listed forms bypass protect, so `
+          + 'protecting it would change nothing. Remove it from stt-terms.json instead.', { alreadyMapsTo: owner });
+      }
+    }
+  }
+
+  /*
+   * Read-modify-write, with no `await` between the read and the rename. That is
+   * the entire concurrency story and it is deliberate: node runs one request at
+   * a time between awaits, so two coordinators adding terms in the same second
+   * are serialised here and neither can clobber the other. Re-reading rather
+   * than reusing the copy loaded above is what makes it true — the index came
+   * from a cache that may predate the other coordinator's write by minutes.
+   */
+  let file;
+  try {
+    /*
+     * `|| {}` is reachable ONLY for ENOENT — readTermsFile rethrows every other
+     * error — so an overlay that exists but will not open lands in the catch
+     * below and costs this one write. It must never become an empty object
+     * here: the rename downstream is a REPLACE, so treating an unreadable file
+     * as an empty one deletes every term the route has ever accepted.
+     */
+    file = readTermsFile(TERMS_OVERLAY_FILE) || {};
+  } catch (err) {
+    return fail(res, 500, `${TERMS_OVERLAY_FILE} could not be read, so it cannot be appended to safely without `
+      + `discarding what is already in it: ${err.message}`, { file: TERMS_OVERLAY_FILE });
+  }
+  const list = Array.isArray(file.terms) ? file.terms.slice() : [];
+  const prot = Array.isArray(file.protect) ? file.protect.slice() : [];
+
+  const added = [];
+  const alreadyPresent = [];
+  // `created` is about the DICTIONARY, not about this file: a term already in
+  // the curated stt-terms.json is not created just because the overlay grew its
+  // first entry for it. The caller asked "is this term new?", not "which file?".
+  const created = term ? !idx.canonical.has(selfNorm) : false;
+  let noteAdded = false;
+
+  if (term) {
+    let entry = list.find((e) => e && typeof e.term === 'string' && normTerm(e.term) === selfNorm);
+    const fresh = !entry;
+    if (fresh) entry = { term, heard: [] };
+    if (!Array.isArray(entry.heard)) entry.heard = [];
+    for (const h of heard) {
+      const n = normTerm(h);
+      const known = idx.exact.has(n) || entry.heard.some((x) => normTerm(x) === n);
+      if (known) { alreadyPresent.push(h); continue; }
+      entry.heard.push(h);
+      added.push(h);
+    }
+    if (note) {
+      /*
+       * Appended, never replaced. The existing note is usually the reasoning
+       * for a decision - which forms were tried and deliberately removed - and
+       * losing it is how a term becomes unexplainable. Checked against the
+       * MERGED note, so a retry of the same POST is a no-op rather than a
+       * second copy, and so a note already written in stt-terms.json is not
+       * echoed back into the overlay.
+       */
+      const merged = (termsRaw().terms || []).find((e) => normTerm(e.term) === selfNorm);
+      const said = (merged && merged.note) || entry.note || '';
+      if (!said.includes(note)) {
+        entry.note = entry.note ? `${entry.note} ${note}` : note;
+        noteAdded = true;
+      }
+    }
+    if (by) entry.by = by;
+    if (fresh) {
+      entry.at = nowIso();
+      list.push(entry);
+    } else if (added.length || noteAdded) {
+      entry.at = nowIso();
+    }
+  }
+
+  const protectAdded = [];
+  const protectAlready = [];
+  for (const p of protect) {
+    const n = normTerm(p);
+    if (idx.protect.has(n) || prot.some((x) => normTerm(x) === n)) { protectAlready.push(p); continue; }
+    prot.push(p);
+    protectAdded.push(p);
+  }
+
+  const changed = created || added.length > 0 || noteAdded || protectAdded.length > 0;
+  if (changed) {
+    try {
+      writeTermsOverlay(file, list, prot);
+    } catch (err) {
+      return fail(res, 500, `could not write ${TERMS_OVERLAY_FILE}: ${err.message}`, { file: TERMS_OVERLAY_FILE });
+    }
+    console.log(`[terms] ${by || 'someone'} added ${term ? `${term} (+${added.length} heard)` : ''}`
+      + `${protectAdded.length ? ` protect +${protectAdded.length}` : ''}`);
+  }
+
+  /*
+   * Reload before answering, and report the counts from the LIVE index rather
+   * than from what we just intended to write. "The file was written" and
+   * "repair is using it" are two claims, and only the second one is worth
+   * anything to the caller — the mtime cache makes it automatic, so proving it
+   * costs one stat and closes the gap where a write lands somewhere the running
+   * process never looks.
+   */
+  const dictionary = termsCounts();
+  send(res, 200, {
+    ok: true,
+    // The honest headline. An add that merged into nothing must not read the
+    // same as one that changed the dictionary.
+    changed,
+    term,
+    created,
+    added,
+    alreadyPresent,
+    note: noteAdded ? 'appended' : 'unchanged',
+    protect: { added: protectAdded, alreadyPresent: protectAlready },
+    file: TERMS_OVERLAY_FILE,
+    dictionary,
+    repair: dictionary ? 'enabled' : 'disabled',
+  });
 }
 
 // ---------------------------------------------------------------- client log
@@ -4266,6 +4762,81 @@ function sendServiceWorker(res) {
     'service-worker-allowed': '/',
   });
   res.end(swCache.buf);
+}
+
+// ---------------------------------------------------------------- the API description
+/*
+ * GET /openapi.json and GET /openapi.yaml — what this server says it is.
+ *
+ * SERVED FROM DISK, READ-ONLY, ONE SOURCE. `openapi.json` beside this file is
+ * the authored document; the YAML is RENDERED from it on every request by
+ * openapi-yaml.js rather than read from `openapi.yaml`, so the two cannot
+ * disagree no matter how stale the checked-in copy gets. The checkout is
+ * bind-mounted `:ro` into the container, which is exactly right here: this
+ * process describes itself, it does not get to rewrite the description.
+ *
+ * The spec is hand-written rather than generated because the routes are
+ * hand-written — see the /v2 proof-of-concept for the generated alternative,
+ * which covers 5 of them. What keeps a hand-written document honest is not
+ * discipline, it is `tools/openapi-selftest.js`: it boots a real server, proves
+ * every documented path+method actually routes, and scans this file for route
+ * segments the document has never heard of.
+ *
+ * Cached on mtime like the service worker, so a running container that gets a
+ * fresh mount picks the new document up without a restart.
+ */
+/*
+ * REQUIRED DEFENSIVELY, and that is not decoration. A top-level `require` of an
+ * optional artifact makes describing the server a precondition for BEING the
+ * server: one missing convenience file and the process dies before it binds a
+ * port, taking the queue — and every self-test that requires this file — with
+ * it. A missing `openapi.json` already degrades to a 503 that names the file;
+ * a missing renderer must degrade exactly the same way, not louder.
+ */
+const OPENAPI_YAML_FILE = path.join(__dirname, 'openapi-yaml.js');
+let openapiYaml = null;
+try {
+  openapiYaml = require('./openapi-yaml.js');
+} catch (err) {
+  console.log(`[openapi] ${OPENAPI_YAML_FILE} is unavailable — /openapi.json and /openapi.yaml will answer `
+    + `503 and everything else is unaffected: ${err.message}`);
+}
+const OPENAPI_FILE = openapiYaml ? openapiYaml.SPEC_JSON : path.join(__dirname, 'openapi.json');
+let openapiCache = null; // { mtimeMs, json, yaml }
+
+function openapiDoc() {
+  if (!openapiYaml) {
+    const err = new Error(`${OPENAPI_YAML_FILE} is missing, so the document cannot be rendered`);
+    err.file = OPENAPI_YAML_FILE;
+    throw err;
+  }
+  const stat = fs.statSync(OPENAPI_FILE); // throws; the caller answers 503
+  if (!openapiCache || openapiCache.mtimeMs !== stat.mtimeMs) {
+    const json = fs.readFileSync(OPENAPI_FILE);
+    // Parsed before it is cached: a malformed spec must fail here, where the
+    // 503 names the file, rather than be served as valid-looking bytes.
+    const doc = JSON.parse(json.toString('utf8'));
+    openapiCache = { mtimeMs: stat.mtimeMs, json, yaml: Buffer.from(openapiYaml.toYaml(doc)) };
+  }
+  return openapiCache;
+}
+
+function sendOpenapi(res, format) {
+  let doc;
+  try {
+    doc = openapiDoc();
+  } catch (err) {
+    return fail(res, 503, `the API description is unreadable: ${err.message}`, { file: err.file || OPENAPI_FILE });
+  }
+  const buf = format === 'yaml' ? doc.yaml : doc.json;
+  res.writeHead(200, {
+    'content-type': format === 'yaml' ? 'application/yaml; charset=utf-8' : 'application/json; charset=utf-8',
+    'content-length': buf.length,
+    // It describes THIS process, which can be redeployed under the same URL.
+    'cache-control': 'no-cache',
+    'x-content-type-options': 'nosniff',
+  });
+  res.end(buf);
 }
 
 /*
@@ -7689,6 +8260,17 @@ async function route(req, res) {
     return sendServiceWorker(res);
   }
 
+  /*
+   * /openapi.json and /openapi.yaml — the machine-readable description of
+   * every route below. Two top-level names that shadow nothing: no route, icon
+   * or static path begins with either. The YAML is rendered from the JSON, so
+   * asking for one or the other can never get two different answers.
+   */
+  if (seg.length === 1 && (seg[0] === 'openapi.json' || seg[0] === 'openapi.yaml')) {
+    if (!need('GET')) return;
+    return sendOpenapi(res, seg[0] === 'openapi.yaml' ? 'yaml' : 'json');
+  }
+
   // /manifest.webmanifest and the icons — the installable-app metadata
   if (seg.length === 1 && seg[0] === 'manifest.webmanifest') {
     if (!need('GET')) return;
@@ -7815,6 +8397,20 @@ async function route(req, res) {
   if (seg.length === 1 && seg[0] === 'tts') {
     if (!need('POST')) return;
     return ttsRoute(req, res);
+  }
+
+  /*
+   * /terms — the vocabulary dictionary /stt repairs against, readable and
+   * appendable over HTTP. Here rather than under /stt because it is neither
+   * audio nor a transcript: it is the data both of those depend on, and the
+   * callers that need it (coordinators with only curl) never touch /stt at all.
+   * A new top-level segment that shadows nothing — no route, icon or static
+   * path begins with it.
+   */
+  if (seg.length === 1 && seg[0] === 'terms') {
+    if (m === 'GET') return termsReadRoute(res);
+    if (m === 'POST') return termsAddRoute(res, await readBody(req));
+    return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST' });
   }
 
   // /messages — an agent speaking for itself, and the agent-to-agent channel
