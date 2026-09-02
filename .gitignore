@@ -45,6 +45,13 @@ docker-compose.override.yml
 .claude/**/*.local.json
 .claude/.guard-mainthread-seen
 
+# Build output of the API description. `openapi.json` is the AUTHORED source of
+# truth and stays committed; `openapi.yaml` is derived from it by openapi-yaml.js,
+# which server.js renders per request rather than reading this file (see the
+# comment at server.js:4743) - so nothing at runtime ever opens it. Committing it
+# would be committing build output that can only drift from the JSON.
+/openapi.yaml
+
 # Scratch mutant copies of server.js, written next to it (not in the OS temp
 # dir) so its relative requires (./icons.js, ./push.js, ./share.js) resolve.
 # tools/seat-unwatched-selftest.js cleans these up itself; ignored here too in
