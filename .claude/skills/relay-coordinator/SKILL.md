@@ -33,7 +33,7 @@ this file.
 
 | If you are about to... | read |
 |---|---|
-| deploy, merge, bisect, do git archaeology, delete a worktree, or touch `node_modules` in relay-queue | `references/briefing-deploy-hazards.md` **(brief a subagent; you cannot run it)** |
+| **edit any non-markdown file in relay-queue**, deploy, merge, bisect, do git archaeology, delete a worktree, or touch `node_modules` | `references/briefing-deploy-hazards.md` **(brief a subagent; you cannot run it)** |
 | hit a Windows-only mechanic - mangled body bytes, a `.ps1`, the `relay-autoseat` Scheduled Task, an NTFS junction, a CRLF no-op | `references/windows-legacy.md` **(LEGACY - Windows only)** |
 | edit `tools/autoseat.js`, add a UI surface he types or speaks from, or work out why a tab was or was not seated | `references/autoseat.md` |
 | need the unscoped firehose on purpose, cut 4x duplicate wakeups on a busy tab, work on a build with no `?conversation=`, or read container logs | `references/events-sse.md` |
@@ -123,6 +123,15 @@ On 2026-08-27 a router gave every coordinator that night its own tab — Configu
 - **Name the tab for the work, not for the agent's cleverness.** The human scans this list on a phone.
 - **Prefer spawning a fresh agent over resuming one when a tab moves to new work.** Resuming replays the entire transcript — several coordinators ran past **300k tokens** on 2026-08-26/27, and a resumed agent carries all of it. Resume only when continuity genuinely matters. **Measured 2026-09-01: cost is quadratic in turns.** One 219-turn agent burned 39.9M context tokens; the same work as three fresh agents is 18.2M, a **54.5% saving**. The crossover is roughly **84k tokens per additional turn** — resume only when the transcript is worth more than that, which is rarer than it feels. Hand the fresh agent a watermark (`GET /thread?conversationId=<id>&since=<ts>`) and the few facts it needs, rather than its predecessor's whole history.
 - **The server cannot enforce any of this.** It does not spawn, resume, or terminate anything (see **Conversations** on `stopRequested`). Whoever dispatches agents chooses fresh-spawn over resume; relay can only record the intent.
+
+## The checkout is the deployment
+
+**Never write code or a served asset in `/home/hypnodroid/Projects/relay-queue`** — `server.js`, anything it `require`s, `public/`, `tools/`. That path is bind-mounted into the `relay-queue` container as `/app`, and the server restarts the instant its source changes — so a save there is an unreviewed, uncommitted production deploy. Work in a worktree; one per branch already exists at `/home/hypnodroid/Projects/relay-<topic>` (`git worktree list`). Brief a subagent to do it, since the guard denies you `git` regardless.
+
+On 2026-09-02 coordinators built two features straight into the main checkout. `server.js` reached **+557 lines uncommitted**, the live server restarted at least twice mid-edit, and a planned seven-branch merge was blocked by the dirty tree it landed on. One edit added a top-level `require` of a file that was never `git add`ed; a fresh clone would not have booted, invisible locally precisely because the container mounts the working tree. It took someone building a clone and running it to find that. Two silent data-loss bugs shipped live in the same change. **Neither agent was deploying or merging, so neither ever hit the trigger for `references/briefing-deploy-hazards.md`, where this rule already lived.**
+
+- **Markdown is exempt.** Docs do not deploy — that is why the guard lets you write them.
+- **A file you `require` must be committed with the file that requires it.** The bind mount hides a missing dependency until someone clones.
 
 ## Auto-seat — a tab with a message and no agent seats itself
 

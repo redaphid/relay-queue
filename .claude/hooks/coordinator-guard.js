@@ -931,8 +931,115 @@ if (!input || typeof input !== 'object') {
     'The guard could not read the tool call, so it cannot confirm this is coordination.');
 }
 
+/*
+ * THE ONE HOLE IN THE SUBAGENT EXEMPTION: writing the LIVE CHECKOUT.
+ *
+ * This checkout is bind-mounted into the relay-queue container as /app, and the
+ * server restarts the instant its source changes. There is no build, no review
+ * window, no deploy step to forget: writing a file here IS the deploy, and it
+ * has already happened by the time anyone reads the diff.
+ *
+ * On 2026-09-02 that ran to its conclusion. server.js reached +607 lines
+ * uncommitted in the main checkout and the container restarted 19 times in one
+ * night while agents edited it live. Nobody decided to deploy 19 times; nobody
+ * decided to deploy at all. Every one of those restarts was a side effect of an
+ * ordinary Edit call.
+ *
+ * The rule was not missing. `references/briefing-deploy-hazards.md` has said
+ * "never edit the main checkout directly - git worktree add ../probe -b <branch>
+ * main, work there, merge" for as long as there have been worktrees. The insight
+ * is that a rule written into a deploy briefing only ever reaches someone who
+ * already knows they are deploying. An agent told "fix the seat timeout" does
+ * not think it is deploying, so it never goes looking for the deploy rules. The
+ * fence has to be where the write is, not where the deploy is documented.
+ *
+ * And the exemption below aimed the existing fence at exactly the wrong party.
+ * The coordinator, which only routes, was fenced; the subagents, which do all
+ * the actual editing, were waved through unconditionally. So the guard was
+ * strictest with the one participant that never writes code.
+ *
+ * WHAT THIS DOES NOT DO, deliberately: subagents remain exempt from everything
+ * else, exactly as before. This is a single carve-out - a Write/Edit family call
+ * at a non-markdown path inside this one directory - and the ordering below
+ * keeps it that way: the check runs, and then the unconditional exemption still
+ * runs for every call the check does not match.
+ *
+ * ROOT IS HARDCODED, NOT DERIVED FROM __dirname, and that is the point. The
+ * worktrees are SIBLINGS of this directory (../relay-integration,
+ * ../relay-token-diet, ...), and each one carries its own copy of this guard.
+ * Deriving the root from __dirname would make every worktree fence itself, which
+ * is precisely backwards: the worktrees are the answer, not the problem. For the
+ * same reason the containment test is `=== ROOT || startsWith(ROOT + sep)` and
+ * never a bare startsWith(ROOT) - "/home/hypnodroid/Projects/relay-integration"
+ * starts with "/home/hypnodroid/Projects/relay-queue" nowhere, but the class of
+ * bug is one typo away and it would block every worktree in the repo.
+ *
+ * <ROOT>/.claude/ IS EXEMPT, and skipping that would be a bootstrapping trap.
+ * The running server does not load that directory, so nothing under it can
+ * deploy anything. If it were fenced, this guard could not be fixed from inside
+ * a session - the only way to repair a bad rule would be to already have a way
+ * around it.
+ *
+ * ESCAPE HATCH: RELAY_GUARD_ALLOW_LIVE_WRITE=1, for the human landing the
+ * pending merges, which legitimately must write the main checkout. It is
+ * deliberately an env var on the HOOK PROCESS: an agent's own `export` inside a
+ * Bash tool call sets it in that call's shell and cannot reach this process, so
+ * the hatch is available to whoever launched the session and to nobody the
+ * session then spawns.
+ */
+try {
+  const LIVE_ROOT = '/home/hypnodroid/Projects/relay-queue';
+  const LIVE_CLAUDE = LIVE_ROOT + path.sep + '.claude';
+  const isSubagentCall = typeof input.agent_id === 'string' && input.agent_id.trim() !== '';
+
+  if (isSubagentCall && process.env.RELAY_GUARD_ALLOW_LIVE_WRITE !== '1') {
+    const liveTool = String(input.tool_name || '');
+    if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(liveTool)) {
+      const lti = (input.tool_input && typeof input.tool_input === 'object') ? input.tool_input : {};
+      const rawPath = String(lti.file_path || lti.notebook_path || lti.path || '').trim();
+
+      // No path, or a markdown path, is not this rule's business. Markdown reuses
+      // MARKDOWN_PATH so there is exactly one definition of "markdown" in here.
+      if (rawPath && !MARKDOWN_PATH.test(rawPath)) {
+        const base = (typeof input.cwd === 'string' && input.cwd.trim() !== '')
+          ? input.cwd
+          : process.cwd();
+        const resolved = path.resolve(base, rawPath);
+        const inLiveRoot = resolved === LIVE_ROOT || resolved.startsWith(LIVE_ROOT + path.sep);
+        const inClaudeDir = resolved === LIVE_CLAUDE || resolved.startsWith(LIVE_CLAUDE + path.sep);
+
+        if (inLiveRoot && !inClaudeDir) {
+          deny('live-checkout-write', liveTool, resolved,
+            'That opening line is aimed at the coordinator; this one rule is the exception that also applies to you, a subagent. ' +
+            '`' + resolved + '` is inside the LIVE checkout at ' + LIVE_ROOT + ', which is bind-mounted into the relay-queue container as /app. ' +
+            'The server restarts the moment its source changes, so this write is not an edit that gets deployed later - it IS the deploy, unreviewed, the instant the file lands. ' +
+            'On 2026-09-02 that left server.js +607 lines uncommitted and restarted the container 19 times in one night, with nobody having decided to deploy even once.\n' +
+            '\n' +
+            'WHAT TO DO INSTEAD - work in a worktree, then merge:\n' +
+            'a. `git worktree list` shows nine, one per branch. If one already matches your topic, edit the same file under THAT path and it will be allowed.\n' +
+            'b. Otherwise make one: `git worktree add ../relay-<topic> -b <branch> main`, then redo this edit at ../relay-<topic>/<same relative path>.\n' +
+            'c. Merging to main is the deploy, and it is a separate, deliberate step. Leave it to the human landing the merges.\n' +
+            'Still permitted here without a worktree: markdown anywhere, and anything under ' + LIVE_CLAUDE + path.sep + ' (which the running server does not load).\n' +
+            'Note that steps 1-3 below are written for the coordinator. For you, the answer is the worktree, not a further subagent - spawning one changes nothing, because it would be blocked by this same rule.');
+        }
+      }
+    }
+  }
+} catch (_) {
+  /*
+   * This rule fails OPEN, alone among the rules in this file, and the choice is
+   * considered. Everything below it fails closed because a coordinator that
+   * cannot act is merely inconvenienced. This block runs on EVERY subagent tool
+   * call; an uncaught throw here would crash the hook process, and a crashed
+   * PreToolUse hook is a non-blocking error, which fails open for ALL rules at
+   * once. Swallowing here limits a bug in this block to this block.
+   */
+}
+
 // Subagents are the hands. Let them through first, unconditionally.
 // Subagent call: exempt by design, handled exactly as before this rewrite.
+// (Except for the live-checkout carve-out immediately above, which has already
+// returned a decision if it applied.)
 if (typeof input.agent_id === 'string' && input.agent_id.trim() !== '') silent();
 
 /*
