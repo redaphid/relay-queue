@@ -137,6 +137,11 @@ Everything already in `NAMED` stays denied: node/python/perl/ruby, docker,
 npm/pnpm/yarn/npx, make/cargo/go, package managers, systemctl, kill, ssh/rsync, the
 file-mutation set, sudo, shells, eval.
 
+- **`python3` was raised and REFUSED by the owner on 2026-09-02**, after a coordinator
+  reported hitting it. Settled, not open. It stays in `NAMED` under rule `python`.
+  The guard's blocks and their reasons are now stated in `CLAUDE.md` at the repo root,
+  which every session rooted here loads.
+
 ## 9. Do NOT change
 
 The subagent exemption; the markdown-only rule for `Write`/`Edit`/`MultiEdit`/

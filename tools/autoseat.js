@@ -171,7 +171,7 @@ function selectSeats(opts) {
     const cid = t.conversationId || 'main';
     const conv = byId.get(cid);
     const row = { taskId: t.id, conversationId: cid, title: (conv && conv.title) || cid };
-    const no = (why) => { row.seat = false; row.why = why; considered.push(row); };
+    const no = (why, code) => { row.seat = false; row.why = why; row.code = code || 'other'; considered.push(row); };
 
     if (dispatched.has(t.id)) { no('a coordinator was already dispatched for this message'); continue; }
     if (t.role !== 'user') { no(`role is ${JSON.stringify(t.role)}, so this is not the human speaking`); continue; }
@@ -204,9 +204,9 @@ function selectSeats(opts) {
       no(`only ${Math.round(ageMs / 1000)}s old; grace is ${Math.round(graceMs / 1000)}s`);
       continue;
     }
-    if (inFlight.has(cid)) { no('a dispatch for this tab is still running'); continue; }
+    if (inFlight.has(cid)) { no('a dispatch for this tab is still running', 'in-flight'); continue; }
     if (takenThisPass.has(cid)) { no('another message in this same tab was already chosen this pass'); continue; }
-    if (inFlight.size + chosen.length >= maxConcurrent) { no(`at the concurrency cap of ${maxConcurrent}`); continue; }
+    if (inFlight.size + chosen.length >= maxConcurrent) { no(`at the concurrency cap of ${maxConcurrent}`, 'cap'); continue; }
 
     takenThisPass.add(cid);
     row.seat = true;
@@ -434,9 +434,31 @@ async function tick(cfg, runtime) {
      * that makes a real signal unfindable. Repeating only on CHANGE keeps the
      * log a record of events rather than of time passing.
      */
-    const quiet = `nothing to seat (${considered.length} pending message(s) considered)`;
+    /*
+     * SATURATION IS NOT IDLENESS, AND SAYING SO COST ~14 MINUTES ON 2026-09-02.
+     *
+     * `nothing to seat` used to be printed for both "no message was eligible"
+     * and "eligible messages exist and the concurrency cap refused every one
+     * of them" - a starved tab and an empty queue produced byte-identical
+     * output. Meanwhile relay-watchdog, which can only infer this process's
+     * health from whether tabs get staffed, was correctly alarming
+     * `AUTOSEAT IS NOT SEATING` and reporting `autoseat still down` about a
+     * process that was up, beating, and deliberately refusing. Two observers
+     * disagreeing about a dispatcher is worse than either one being wrong.
+     *
+     * The cap itself is working as designed. What was broken was that its
+     * decision was invisible in the only log anyone reads.
+     */
+    const blocked = considered.filter((r) => r.code === 'cap' || r.code === 'in-flight');
+    const quiet = blocked.length
+      ? `SATURATED - ${blocked.length} eligible message(s) refused; `
+        + `${runtime.inFlight.size}/${cfg.maxConcurrent} coordinators in flight `
+        + `[${[...runtime.inFlight].join(', ')}]. Nothing is wrong with autoseat; it has no free slot.`
+      : `nothing to seat (${considered.length} pending message(s) considered)`;
     if (!cfg.explain && quiet !== runtime.lastQuiet) { log(quiet); runtime.lastQuiet = quiet; }
-    runtime.lastOutcome = `idle, ${considered.length} considered`;
+    runtime.lastOutcome = blocked.length
+      ? `saturated, ${blocked.length} waiting on ${runtime.inFlight.size}/${cfg.maxConcurrent} slots`
+      : `idle, ${considered.length} considered`;
     return;
   }
   runtime.lastQuiet = null;
@@ -528,7 +550,22 @@ function parseArgs(argv) {
     queue: DEFAULT_QUEUE,
     intervalMs: 10000,
     graceMs: 20000,
-    maxConcurrent: 3,
+    /*
+     * WAS 3 UNTIL 2026-09-02, AND THREE WAS THE STALL.
+     *
+     * The supervisor passes no --max-concurrent, so this default is the live
+     * value. It was chosen when a coordinator answered a tab in a couple of
+     * minutes. It no longer does: under the default-deny guard an auto-seated
+     * coordinator usually cannot do the machine work it was sent for, so it
+     * spends 20-30 minutes writing a spec and then releases. Three such tabs
+     * hold every slot, and every other tab is starved for as long as they run
+     * - not slowly served, NOT SERVED AT ALL. Observed: tab "Relay" empty
+     * seat, five human messages, 10+ minutes, autoseat healthy and beating.
+     *
+     * Raising this is a mitigation, not the cure. The cure is that a
+     * coordinator which cannot act should not burn a slot for half an hour.
+     */
+    maxConcurrent: 6,
     stateFile: DEFAULT_STATE,
     heartbeatFile: DEFAULT_HEARTBEAT,
     logDir: path.join(path.dirname(DEFAULT_STATE), 'logs'),
