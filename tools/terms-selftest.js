@@ -61,6 +61,22 @@ fixes('the coordinate or should pick this up', 'the coordinator should pick this
 fixes('the worst recognition is terrible today', 'the voice recognition is terrible today');
 fixes('ask the communicate or to relay it', 'ask the communicator to relay it');
 
+// Ground truth from the 09-01 voice session. He said "Vikunja" four times and the
+// engine produced a different non-word every time, including in the very sentence
+// asking for this to be fixed. The leading v- is lost in all of them, so sound-alike
+// matching cannot reach these and the exact list is the only thing that catches them.
+fixes('you always need to be making real tasks in Bacunya',
+      'you always need to be making real tasks in Vikunja');
+fixes('set a reminder in Bacunia for that dryer task',
+      'set a reminder in Vikunja for that dryer task');
+fixes('catch that buckoonia thing and make it Koenja',
+      'catch that Vikunja thing and make it Vikunja');
+// NOT asserted: bare lowercase 'vikunja' -> 'Vikunja'. It does not work, and it
+// cannot: loadTerms drops any `heard` form equal to its own term, and `canonical`
+// then claims the span before anything can rewrite it. The same is true of the
+// 'docker', 'mcp' and 'github' entries, whose notes claim a capitalisation-only
+// correction that has never actually fired. Tracked in Vikunja Inbox #147.
+
 console.log('\npunctuation and capitalisation survive');
 fixes('Ask cloud, then wait.', 'Ask Claude, then wait.');
 fixes('is cloud there?', 'is Claude there?');

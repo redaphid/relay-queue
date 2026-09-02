@@ -47,7 +47,11 @@
     },
     {
       "term": "Vikunja",
-      "heard": ["vikunya", "vicuna", "vic una", "vikuna", "the kunja", "vi kunja", "become ya"]
+      "heard": [
+        "vikunya", "vicuna", "vic una", "vikuna", "the kunja", "vi kunja", "become ya",
+        "bacunya", "bacunia", "bakunya", "buckoonia", "buccoonia", "koenja"
+      ],
+      "note": "The b- and k- initial variants are all from the 09-01 voice session, in which he said 'Vikunja' four times and the engine produced a different word every time: 'Bacunya', 'Bacunia', 'buckoonia' and - in the very sentence asking for this fix - 'Koenja'. None of them are English words, so listing them costs nothing. Sound-alike matching will not save this one: the engine loses the leading v- entirely, so the phonetic distance is too great and the exact list is the only thing that catches it."
     },
     {
       "term": "MetaMCP",
