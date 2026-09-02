@@ -6,9 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "D:\\tools\\node\\node.exe",
+            "command": "/home/hypnodroid/.local/share/fnm/aliases/default/bin/node",
             "args": [
-              "D:\\projects\\relay-queue\\.claude\\hooks\\coordinator-guard.js"
+              "/home/hypnodroid/Projects/relay-queue/.claude/hooks/coordinator-guard.js"
             ],
             "timeout": 15,
             "statusMessage": "Coordinator guard"
