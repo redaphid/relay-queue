@@ -2078,16 +2078,40 @@ function payloadConvId(payload) {
   return null;
 }
 
-function push(payload) {
+/*
+ * `meta.taskPending` is the broadcast task's pending-ness at push time, for the
+ * `?pending=1` filter below. It is deliberately a SEPARATE argument rather than
+ * a field on the payload: the wire format every existing client already parses
+ * stays byte-for-byte what it was, so this filter cannot change what a page or
+ * an older agent sees.
+ */
+function push(payload, meta) {
   if (streams.size === 0) return;
   const frame = `data: ${JSON.stringify(payload)}\n\n`;
   const pconv = payloadConvId(payload);
+  const isTaskFrame = !!meta && typeof meta.taskPending === 'boolean';
   for (const conn of streams) {
     // A scoped connection (conn.conv set) only receives events belonging to
     // that conversation. An unscoped connection (conn.conv === null) still
     // gets everything, unchanged — that is what lets a full-firehose watcher
     // (e.g. relay-watchdog) see every conversation over one connection.
     if (conn.conv !== null && conn.conv !== pconv) continue;
+    /*
+     * `?pending=1` — opt-in, and measured rather than aesthetic. A subscriber
+     * otherwise receives every mutation of every task in scope: over the
+     * durable record that is 5,703 task broadcasts for 2,125 tasks, i.e. 2.68
+     * frames each — create, then claim, then result, then relayed. A
+     * coordinator watching its own tab therefore WAKES ON ITS OWN WRITES, and
+     * a wakeup costs it a full re-read of its context (measured across the
+     * 2026-08-31 transcripts: median 84,009 tokens, p90 202,458).
+     *
+     * Only TASK frames are filtered, and only on a connection that asked.
+     * Conversation patches (seat changes, stopRequested) and the global watch
+     * snapshot carry no task status and are ALWAYS delivered: dropping a seat
+     * change to save tokens would trade correctness for cost, which is not the
+     * trade being made here.
+     */
+    if (conn.pendingOnly && isTaskFrame && !meta.taskPending) continue;
     try { conn.res.write(frame); } catch { /* socket already going away; 'close' will evict it */ }
   }
 }
@@ -2108,7 +2132,10 @@ function broadcast(taskId) {
   // The stream feeds open pages, so internal traffic must never enter it. An
   // agent reads its channel by polling; it does not get a push.
   if (isInternal(task)) return;
-  push({ now: nowIso(), conversationId: convIdOf(task), entries: entriesOf(task) });
+  push(
+    { now: nowIso(), conversationId: convIdOf(task), entries: entriesOf(task) },
+    { taskPending: task.status === 'pending' },
+  );
 }
 
 function broadcastConv(id) {
@@ -2132,6 +2159,18 @@ function sseRoute(req, res, q, opts) {
     ? null
     : (q.get('conversation') !== null ? q.get('conversation') : q.get('conversationId'));
   const conv = raw !== null && raw !== '' ? raw : null;
+  /*
+   * `?pending=1` — deliver only task frames whose task is still PENDING, i.e.
+   * work that needs doing, and drop the claim/result/relayed echoes. Opt-in and
+   * additive: absent, the stream behaves exactly as it always has.
+   *
+   * `/events/firehose` honours it (unlike `?conversation=`, which that route
+   * deliberately ignores) because quietness and scope are different questions:
+   * the firehose's contract is "every conversation", not "every frame", and a
+   * watchdog that only cares about unanswered work should not have to be woken
+   * by every completion system-wide to find out there is none.
+   */
+  const pendingOnly = ['1', 'true', 'yes'].includes(String(q.get('pending') || '').toLowerCase());
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store',
@@ -2141,7 +2180,7 @@ function sseRoute(req, res, q, opts) {
   if (res.socket) { res.socket.setNoDelay(true); res.socket.setTimeout(0); }
   res.write(`retry: ${SSE_RETRY_MS}\n\n`);
   res.write(`: connected ${nowIso()}\n\n`);
-  const conn = { res, conv };
+  const conn = { res, conv, pendingOnly };
   streams.add(conn);
   // Scoped connections only — see the comment on convListeners above for why a
   // firehose connection (conv === null) must never bump a specific
