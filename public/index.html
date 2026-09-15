@@ -6980,6 +6980,7 @@
     IDLE_RECALIB_MS: 10000,  // re-measure the room after this long hearing nothing
     MAX_QUEUE: 4,            // utterances allowed to pile up behind transcription
     MAX_SPEAK: 900,          // characters sent to /tts; the rest stays on screen
+    SAME_TEXT_MS: 300000,    // one answer is read once inside this window, however many records carry it
     /*
      * A trailing-edge debounce on the MESSAGE, not the audio. Even with a long
      * silence window, one train of thought still arrives as several utterances —
@@ -7027,6 +7028,7 @@
   var lastSpokenText = '';   // defence 5
   var lastSpokenAt = 0;
   var spoken = Object.create(null); // entry id -> already spoken (or suppressed)
+  var saidRecently = [];     // { key, at } of what has actually been read out, oldest first
   var audioWarned = false;
 
   // Runs on the audio thread; batches 128-sample quanta into FRAME-sized frames.
@@ -7947,6 +7949,50 @@
   }
 
   /*
+   * DEDUPE ON WHAT IS HEARD, NOT ON WHICH RECORD CARRIED IT.
+   *
+   * Reported 2026-08-31: "Chores is reading out loud each message twice." It was
+   * not two speakers and not two streams. An agent answering a task posts the
+   * answer as a MESSAGE and again as the task RESULT, and the server emits those
+   * as two entries — `<id>` and `<taskId>:r` — with identical text and the same
+   * `role:"agent"`. `spoken[e.id]` is a true statement about records, and every
+   * one of them was spoken exactly once; there were simply two of them. One tab
+   * held fifteen such pairs and one answer that existed three times over.
+   *
+   * The id guard stays: it is what stops a re-merged entry (a poll re-delivering
+   * something SSE already brought, a `rev` bump from a checkbox tick) speaking
+   * again, and it costs nothing. This is the second guard, on the axis a
+   * listener actually experiences — the speakable text.
+   *
+   * Deliberately time-bounded rather than "never say the same thing twice": an
+   * agent genuinely saying "Done." twice an hour apart is two events, and
+   * silencing the second would be a worse bug than the one being fixed. The
+   * window only has to outlive the gap between a message and its result, which
+   * is seconds.
+   */
+  function speechKey(t) {
+    return String(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+  function saidWithinWindow(text) {
+    var key = speechKey(text);
+    if (!key) return false;
+    var cut = Date.now() - C.SAME_TEXT_MS;
+    // Pushed in time order, so the first entry older than the window ends it.
+    for (var i = saidRecently.length - 1; i >= 0; i--) {
+      if (saidRecently[i].at < cut) return false;
+      if (saidRecently[i].key === key) return true;
+    }
+    return false;
+  }
+  function noteSaid(text) {
+    var key = speechKey(text);
+    if (!key) return;
+    saidRecently.push({ key: key, at: Date.now() });
+    // Bounded: a long-lived tab must not grow a list of every sentence ever read.
+    if (saidRecently.length > 64) saidRecently.splice(0, saidRecently.length - 64);
+  }
+
+  /*
    * Decide which merged entries get read out. Called after every merge, from
    * both the SSE path and the poll path, so it does not matter which delivered
    * the reply. Everything present at boot is marked spoken without speaking it:
@@ -7970,7 +8016,10 @@
       // menu already flags that it arrived.
       if (e.conversationId && e.conversationId !== activeConv) continue;
       var text = speakable(e.text);
-      if (text) speakQueue.push(text);
+      if (!text) continue;
+      if (saidWithinWindow(text)) { logClient('speech-duplicate', { id: e.id, chars: text.length }); continue; }
+      noteSaid(text);
+      speakQueue.push(text);
     }
     speakPump();
   }

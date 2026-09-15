@@ -498,6 +498,19 @@ function check(name, cond, detail) {
 }
 const settle = () => new Promise((r) => setTimeout(r, 25));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+/*
+ * Let every queued reply finish. `speakPump` is serialised on purpose — one
+ * reply is synthesised and played before the next is even asked for — so a bare
+ * `settle()` can only ever see the FIRST /tts call and would report a doubled
+ * readout as clean. Ending playback is what lets the queue advance.
+ */
+async function drainSpeech(env) {
+  for (let i = 0; i < 8; i++) {
+    await settle();
+    if (!env.endPlayback()) return;
+  }
+  await settle();
+}
 
 /** A conversation summary as GET /conversations returns one. */
 const conv2 = (id, title, extra) => Object.assign({
@@ -981,6 +994,85 @@ async function main() {
     await settle();
     check('an empty push speaks nothing', env.tts().length === before);
     check('history present at boot was marked spoken, not queued', before === 0, `${before} /tts calls at boot`);
+  }
+
+  /*
+   * THE DOUBLED READOUT. Reported 2026-08-31: "Chores is reading out loud each
+   * message twice."
+   *
+   * It was never two speakers or two streams. `GET /thread` on that tab returns
+   * fifteen pairs of byte-identical `role:"agent"` entries, because the agent
+   * posted each answer BOTH as a message and as the result of the task it was
+   * answering. The server emits a message as `<id>` and a result as `<taskId>:r`
+   * — two different ids carrying the same words — and the page only ever deduped
+   * by id (`spoken[e.id]`), so it faithfully read the same answer out twice.
+   *
+   * The id guard is still right and still here; it is just not sufficient. What
+   * a listener hears is the SPEAKABLE text, so that is what must be unique.
+   */
+  console.log('\nspoken replies — one answer read once, however many records carry it');
+  {
+    const env = liveEnv();
+    env.els.spk.dispatch('click'); // speaker on
+    await settle();
+    const answer = 'Fountain Hills is closer, and it is on the way. This flips the plan.';
+    const ts = new Date().toISOString();
+    // Exactly the shape /thread and /events emit for one answer posted twice.
+    env.store.es.onmessage({ data: JSON.stringify({ entries: [
+      { id: 'mti9m19k-bl9yo5', role: 'agent', text: answer, ts, rev: ts, status: 'done' },
+      { id: 'mti9kift-mi2x9w:r', role: 'agent', text: answer, ts, rev: ts, status: 'done', replyTo: 'mti9kift-mi2x9w' },
+    ] }) });
+    await drainSpeech(env);
+    check('a message and its identical task result are spoken once, not twice',
+      env.tts().length === 1, `${env.tts().length} /tts calls`);
+
+    // The worst real case in the Chores tab: one answer posted as a message and
+    // as the result of TWO different tasks. Three records, one thing said.
+    const env3 = liveEnv();
+    env3.els.spk.dispatch('click');
+    await settle();
+    const t3 = new Date().toISOString();
+    const said = 'All yours - hands off the browser.';
+    env3.store.es.onmessage({ data: JSON.stringify({ entries: [
+      { id: 'mti9x71g-il5tn4', role: 'agent', text: said, ts: t3, rev: t3, status: 'done' },
+      { id: 'mti9sfhg-ps1w3o:r', role: 'agent', text: said, ts: t3, rev: t3, status: 'done', replyTo: 'mti9sfhg-ps1w3o' },
+      { id: 'mti9wf4y-f6fupw:r', role: 'agent', text: said, ts: t3, rev: t3, status: 'done', replyTo: 'mti9wf4y-f6fupw' },
+    ] }) });
+    await drainSpeech(env3);
+    check('three records carrying one answer are still spoken once',
+      env3.tts().length === 1, `${env3.tts().length} /tts calls`);
+
+    // The pair does not always arrive in one frame: the agent posts the message,
+    // then posts the result a beat later. Same bug, later.
+    const envL = liveEnv();
+    envL.els.spk.dispatch('click');
+    await settle();
+    const tL = new Date().toISOString();
+    const late = 'Confirmed - 45 min matches the map. Nothing to change.';
+    envL.store.es.onmessage({ data: JSON.stringify({ entries: [
+      { id: 'msg-late', role: 'agent', text: late, ts: tL, rev: tL, status: 'done' },
+    ] }) });
+    await drainSpeech(envL);
+    envL.store.es.onmessage({ data: JSON.stringify({ entries: [
+      { id: 'task-late:r', role: 'agent', text: late, ts: tL, rev: tL, status: 'done', replyTo: 'task-late' },
+    ] }) });
+    await drainSpeech(envL);
+    check('a result arriving after its message is not read out again',
+      envL.tts().length === 1, `${envL.tts().length} /tts calls`);
+
+    // ...and the guard must not turn into "only ever say one thing". Two genuine
+    // replies are two readouts, and near-identical is not identical.
+    const envN = liveEnv();
+    envN.els.spk.dispatch('click');
+    await settle();
+    envN.agentReply('The first genuine answer.', 'g-1');
+    await drainSpeech(envN);
+    envN.agentReply('A second, different answer.', 'g-2');
+    await drainSpeech(envN);
+    envN.agentReply('A second, different answer, with more on the end.', 'g-3');
+    await drainSpeech(envN);
+    check('two different replies are still two readouts',
+      envN.tts().length === 3, `${envN.tts().length} /tts calls`);
   }
 
   console.log('\nspoken replies — what is worth listening to');
