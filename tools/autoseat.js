@@ -60,11 +60,46 @@
  *
  * The grace period is not politeness either: it is the window in which a human
  * who is already opening the tab gets to seat it himself without a race.
+ *
+ * ONE LONG-LIVED COORDINATOR PER TAB, AND AUTOSEAT IS ITS REVIVER (2026-09-17).
+ *
+ * Until this date every human message into an empty tab cold-started a
+ * ONE-SHOT `claude -p <brief>`: it re-read COORDINATOR.md, rebuilt its context
+ * from nothing, answered, released the seat and exited. The Nanoleaf tab was
+ * seated 7 times in 67 minutes on 2026-09-02 that way, each seat paying the full
+ * boot. The 2026-08-07 design had been the opposite - one coordinator per tab
+ * that stayed - and on 08-08 a dedicated coordinator with its own watcher
+ * answered in a 44s median against 1m27s for a router. It was abandoned for one
+ * reason only: nothing revived a coordinator that died. This file is now that
+ * reviver, so the long-lived shape comes back:
+ *
+ *   - The coordinator is `claude -p --input-format stream-json` with stdin held
+ *     OPEN. Each later human message in its tab is written to stdin as a new
+ *     user turn. Waiting costs zero tokens, and context plus prompt cache
+ *     survive between messages.
+ *   - AUTOSEAT HOLDS THE SSE WATCH, not the coordinator. A headless `-p`
+ *     session cannot sit on a stream between turns, so without this the server
+ *     would read a busy-but-quiet coordinator as dead (seatUnwatched). Autoseat
+ *     subscribes to /events?conversation=<id> for exactly as long as that
+ *     process lives, which makes `listeners > 0` a true statement again, and it
+ *     doubles as the prompt-delivery path instead of waiting on the 10s poll.
+ *   - The session id is chosen HERE (`--session-id <uuid>`) and persisted per
+ *     tab with the pid BEFORE the spawn. A dead process, or a restarted
+ *     autoseat, is revived with `--resume <sessionId>` on the next human
+ *     message - falling back, logged, to a fresh session if resume fails.
+ *   - The persisted record plus a pid-alive check is the per-tab dedupe. The
+ *     old in-memory `inFlight` Set died with the process, and on 2026-09-17 an
+ *     autoseat restart put a second coordinator into the Sporefall tab.
+ *   - Idle coordinators are released after `--idle` minutes, and are the ones
+ *     evicted (least recently active first, never one mid-turn) when the cap
+ *     is reached. Their session id is kept, so eviction costs a resume, not a
+ *     cold start.
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 
 const DEFAULT_QUEUE = 'http://127.0.0.1:3901';
@@ -147,11 +182,32 @@ const STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  * only reports what it accepted cannot be audited: "it picked nothing" and "it
  * looked at nothing" produce identical output.
  */
+/*
+ * `coordinators` is every coordinator PROCESS this autoseat knows to be alive,
+ * keyed by conversation id: { agent, pid, attached, busy, closing, lastActiveAt }.
+ *
+ *   attached  we hold its stdin, so a new message can be handed to it as a turn.
+ *             A survivor adopted from an earlier autoseat is alive but NOT
+ *             attached - its stdin pipe died with its parent, so it is finishing
+ *             its last turn and will exit by itself.
+ *   busy      a turn has been written and its `result` has not come back.
+ *   closing   stdin has been closed on purpose (idle, evicted, seat taken); it
+ *             is on its way out and no longer counts against the cap.
+ *
+ * `records` is state.json's per-tab memory ({ agent, sessionId, pid }) for tabs
+ * whose process is NOT alive - what makes a revive a resume rather than a cold
+ * start, and what lets autoseat recognise its own dead coordinator's name still
+ * sitting on a seat.
+ *
+ * Returns `deliveries` alongside `chosen`: a message in a tab whose coordinator
+ * is live does not need a seat, it needs a turn.
+ */
 function selectSeats(opts) {
   const tasks = opts.tasks || [];
   const conversations = opts.conversations || [];
   const dispatched = opts.dispatched || new Set();
-  const inFlight = opts.inFlight || new Set();
+  const coordinators = opts.coordinators || new Map();
+  const records = opts.records || {};
   const ignore = opts.ignore || new Set();
   const now = opts.now;
   const graceMs = opts.graceMs;
@@ -159,8 +215,13 @@ function selectSeats(opts) {
 
   const byId = new Map(conversations.map((c) => [c.id, c]));
   const chosen = [];
+  const deliveries = [];
   const considered = [];
   const takenThisPass = new Set();
+  const evicting = new Set();
+  /* A closing coordinator is leaving on its own; counting it would make the
+   * cap refuse the very tab its departure was meant to make room for. */
+  const occupied = () => [...coordinators.values()].filter((c) => !c.closing).length - evicting.size;
 
   /* Oldest first. If the cap bites, the message that has waited longest is the
    * one that gets answered - the opposite order would starve exactly the tab
@@ -197,29 +258,91 @@ function selectSeats(opts) {
      * GET /conversations poll this file was already making.
      */
     const unwatched = !!(conv.agentState && conv.agentState.seatUnwatched);
-    if (conv.agent && !unwatched) { no(`the seat is filled by ${conv.agent}`); continue; }
+
+    /*
+     * A LIVE COORDINATOR ALREADY OWNS THIS TAB. The message becomes its next
+     * turn: no second seat, no grace window (the grace exists so a human can
+     * seat the tab himself, and it is already seated by ours), and no cap slot
+     * (the slot is already spent). Busy means the message waits for the turn
+     * in progress to end - writing a second turn into a running one would make
+     * "mid-turn" unknowable here, and eviction depends on knowing it.
+     */
+    const coord = coordinators.get(cid);
+    if (coord && coord.attached && !coord.closing) {
+      if (conv.agent && conv.agent !== coord.agent && !unwatched) {
+        no(`the seat was taken by ${conv.agent} from our live ${coord.agent}`, 'seat-taken');
+        continue;
+      }
+      if (coord.busy) { no(`${coord.agent} (pid ${coord.pid}) is mid-turn; this is its next turn`, 'busy'); continue; }
+      row.seat = false;
+      row.deliver = true;
+      row.code = 'deliver';
+      row.agent = coord.agent;
+      row.why = `${coord.agent} (pid ${coord.pid}) is live and idle in this tab; delivered as its next turn`;
+      considered.push(row);
+      deliveries.push(row);
+      continue;
+    }
+    /*
+     * THE PERSISTED DEDUPE. Alive but not attached (a survivor of an earlier
+     * autoseat, finishing its last turn) or closing: its process still holds
+     * the tab, so seating now is the double coordinator. It exits on its own;
+     * the next tick after that resumes its session.
+     */
+    if (coord) {
+      no(`${coord.agent} (pid ${coord.pid}) still holds this tab and is finishing its last turn`, 'in-flight');
+      continue;
+    }
+
+    /*
+     * OUR OWN DEAD COORDINATOR'S NAME IS NOT AN OCCUPANT. The record says this
+     * name is ours and no process of ours is alive behind it, which is a
+     * stronger answer than seatUnwatched can give, and a faster one: the
+     * server needs 2 minutes of silence to say it, this file knows at once.
+     */
+    const rec = records[cid];
+    const ownDeadSeat = !!(conv.agent && rec && rec.agent === conv.agent);
+    if (conv.agent && !unwatched && !ownDeadSeat) { no(`the seat is filled by ${conv.agent}`); continue; }
 
     const ageMs = now - Date.parse(t.ts);
     if (!(ageMs >= graceMs)) {
       no(`only ${Math.round(ageMs / 1000)}s old; grace is ${Math.round(graceMs / 1000)}s`);
       continue;
     }
-    if (inFlight.has(cid)) { no('a dispatch for this tab is still running', 'in-flight'); continue; }
     if (takenThisPass.has(cid)) { no('another message in this same tab was already chosen this pass'); continue; }
-    if (inFlight.size + chosen.length >= maxConcurrent) { no(`at the concurrency cap of ${maxConcurrent}`, 'cap'); continue; }
+    /*
+     * THE CAP, WITH EVICTION. At the cap, the least recently active IDLE
+     * coordinator in some other tab is closed to make room - it costs that tab
+     * a resume later, not an answer now. Never one mid-turn: killing a turn
+     * loses an answer he is already waiting on. If every slot is mid-turn, the
+     * message waits, exactly as before, and the tick logs SATURATED.
+     */
+    if (occupied() + chosen.length >= maxConcurrent) {
+      const victim = [...coordinators.entries()]
+        .filter(([id, c]) => id !== cid && c.attached && !c.busy && !c.closing && !evicting.has(id))
+        .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))[0];
+      if (!victim) { no(`at the concurrency cap of ${maxConcurrent}, every coordinator mid-turn`, 'cap'); continue; }
+      evicting.add(victim[0]);
+      row.evict = victim[0];
+      row.evictAgent = victim[1].agent;
+    }
 
     takenThisPass.add(cid);
     row.seat = true;
-    row.staleSeat = unwatched ? conv.agent : null;
-    row.why = unwatched
-      ? `${conv.agent} is seated but unwatched ${conv.agentState.unwatchedForSec}s (no live SSE subscriber) `
-        + `while a message waited ${Math.round(ageMs / 1000)}s`
-      : `human message waiting ${Math.round(ageMs / 1000)}s in an empty seat`;
+    row.staleSeat = (unwatched || ownDeadSeat) ? conv.agent : null;
+    row.resumeSessionId = rec && rec.sessionId ? rec.sessionId : null;
+    row.why = ownDeadSeat
+      ? `our own ${conv.agent} still sits on the seat but its process is gone, while a message waited ${Math.round(ageMs / 1000)}s`
+      : unwatched
+        ? `${conv.agent} is seated but unwatched ${conv.agentState.unwatchedForSec}s (no live SSE subscriber) `
+          + `while a message waited ${Math.round(ageMs / 1000)}s`
+        : `human message waiting ${Math.round(ageMs / 1000)}s in an empty seat`;
+    if (row.evict) row.why += `; evicting idle ${row.evictAgent} to make room`;
     row.ageSec = Math.round(ageMs / 1000);
     considered.push(row);
     chosen.push(row);
   }
-  return { chosen, considered };
+  return { chosen, deliveries, considered };
 }
 
 /*
@@ -228,8 +351,8 @@ function selectSeats(opts) {
  * All of them are recorded as dispatched, not just the one that triggered it,
  * because one coordinator answers the whole tab. Without this, a tab holding
  * three unanswered messages would be a standing order for three coordinators -
- * the in-flight guard hides it while this process lives, and a restart would
- * uncover it.
+ * the live-coordinator guard hides it while that process lives, and its exit
+ * would uncover it as two more turns nobody needs.
  */
 function coveredBy(tasks, conversationId) {
   return tasks
@@ -256,11 +379,19 @@ function brief(o) {
     'You were dispatched AUTOMATICALLY because a message arrived in this tab and nobody was seated in it.',
     'The human did not ask for you by hand and is not watching a terminal. The tab is your only channel.',
     '',
+    'YOU ARE LONG-LIVED. You are this tab\'s coordinator for as long as the tab is active, not for one message.',
+    'Your process stays up between messages. When a new message arrives in this tab, autoseat hands it to you',
+    'as a NEW USER TURN in this same session - treat every later user turn as new messages arriving in the tab.',
+    'Waiting between turns costs nothing, and you keep everything you have already read.',
+    'Autoseat holds the SSE watch on this tab for you, so do NOT arm a Monitor, an SSE watcher, a poll loop or',
+    'a sleep to wait for messages. Ending your turn IS how you wait.',
+    '',
     'FIRST, read `/home/hypnodroid/Projects/relay-queue/COORDINATOR.md`. It is the mechanical reference for this API',
     'and it documents several traps that fail silently. Then, in this order:',
     '',
-    `1. Take the seat: POST /conversations/${o.conversationId} with {"agent":"${o.agent}"}.`,
-    '   If that returns 409, someone else took it while you were starting - STOP and exit. Do not race.',
+    `1. Take the seat ONCE: POST /conversations/${o.conversationId} with {"agent":"${o.agent}"}. Keep that same`,
+    '   name for the life of the tab. If that returns 409, someone else took it while you were starting - say',
+    '   nothing more and END YOUR TURN. Do not race.',
     '2. Post an ack into the tab straight away: POST /messages with',
     `   {"conversationId":"${o.conversationId}","agent":"${o.agent}","text":"..."}.`,
     '   A silent agent is indistinguishable from a dead one.',
@@ -272,9 +403,13 @@ function brief(o) {
     `4. Before concluding the tab is clear, also check GET /checklist?conversation=${o.conversationId}`,
     `   and GET /checklists?conversation=${o.conversationId}. A tab with no pending task can still`,
     '   have real outstanding work sitting in a checklist.',
-    `5. When you are genuinely finished, RELEASE THE SEAT: POST /conversations/${o.conversationId}`,
-    '   with {"agent":null}. Relay records who took a tab but never who left, so an agent that keeps',
-    '   the chair after finishing makes the tab look staffed while new messages pile up behind it.',
+    '5. When the messages in hand are answered, END YOUR TURN. Do NOT release the seat and do NOT exit:',
+    '   autoseat keeps you seated while you are alive, releases the seat itself when it retires you after',
+    '   an idle spell, and resumes this same session when the tab gets a message after that.',
+    '',
+    'On every LATER turn: confirm you still hold the seat (GET /conversations/<id>; if `agent` is not your',
+    'name, take it back with the same POST as step 1 - on 409 end the turn), then repeat steps 2-4 for the',
+    'new messages, then end the turn.',
     '',
     'Rules:',
     `- Work ONLY conversation ${o.conversationId}. Claiming a task in another conversation silently`,
@@ -288,10 +423,38 @@ function brief(o) {
     '  note and relay treats you as dead. Re-claiming does not reset that clock.',
     '- Do NOT speak aloud, and do not send push notifications.',
     '- Do NOT archive, share or publish any conversation. Sharing is the decision of the human, from the UI.',
-    '- If the work needs a decision only the human can make, ask ONE short question, then release the',
-    '  seat and exit rather than sitting on it.',
-    '- If you conclude the message needs no action, say so in the tab, close the task, release the seat.',
+    '- If the work needs a decision only the human can make, ask ONE short question, then END YOUR TURN and',
+    '  wait. His answer arrives as a later user turn.',
+    '- If you conclude the message needs no action, say so in the tab, close the task, end your turn.',
+    '- Never release the seat, exit, or stop yourself. Autoseat owns your lifecycle.',
   ].join('\n');
+}
+
+/*
+ * The text of one delivered turn. The message bodies ride along so a turn can
+ * start answering without a round-trip, but the coordinator is still told to
+ * re-read pending: the bodies are a snapshot, and claiming is what makes an
+ * answer count. Deliberately repeats the seat check and "end the turn, do not
+ * release" on every turn - a resumed session may have lost the seat while no
+ * process was holding it, and the one-shot habit of releasing at the end is
+ * exactly the behavior this design must not regress to.
+ */
+const TURN_TEXT_MAX = 4000;
+function turnText(o) {
+  const lines = [
+    `[autoseat] ${o.messages.length} new message(s) from the human in tab "${o.title}" (conversationId \`${o.conversationId}\`).`,
+  ];
+  for (const m of o.messages) {
+    const body = String(m.instruction == null ? '' : m.instruction);
+    lines.push(`- task ${m.id} (from ${m.from}, ${m.ts}):`);
+    lines.push(body.length > TURN_TEXT_MAX ? `${body.slice(0, TURN_TEXT_MAX)} [...truncated; read the task]` : body);
+  }
+  lines.push('');
+  lines.push(`Handle them now under your standing instructions as \`${o.agent}\`: confirm you still hold the seat`
+    + ` (retake it with the same name if not; on 409 end the turn), ack, claim with "by", answer, POST the result,`
+    + ` mark relayed. Re-check GET /tasks?conversation=${o.conversationId}&status=pending first - more may be waiting.`);
+  lines.push('Then END YOUR TURN. Do not release the seat and do not exit - autoseat does both.');
+  return lines.join('\n');
 }
 
 // --------------------------------------------------------------------- io
@@ -334,10 +497,36 @@ function loadState(file) {
     for (const [k, v] of Object.entries(raw.dispatched || {})) {
       if (Date.parse(v && v.at) >= cutoff) out[k] = v;
     }
-    return { dispatched: out };
+    /* Per-tab coordinator memory: { agent, sessionId, pid, title, lastActiveAt }.
+     * Same TTL as the message memory - a session untouched for a month is not
+     * worth resuming, and keeping it would only grow the file. */
+    const tabs = {};
+    for (const [k, v] of Object.entries(raw.tabs || {})) {
+      if (v && v.sessionId && Date.parse(v.lastActiveAt || v.startedAt) >= cutoff) tabs[k] = v;
+    }
+    return { dispatched: out, tabs };
   } catch {
-    return { dispatched: {} };
+    return { dispatched: {}, tabs: {} };
   }
+}
+
+/*
+ * IS THIS PID STILL OUR COORDINATOR? `kill -0` alone answers "is some process
+ * using this number", and pids are recycled - a record surviving a reboot
+ * would otherwise hold a tab hostage to whatever unrelated process inherited
+ * the number. The session id is on the coordinator's own command line
+ * (`--session-id` or `--resume`), so /proc/<pid>/cmdline proves identity, not
+ * just occupancy. Where /proc cannot be read, fall back to kill -0: refusing
+ * to seat for one extra tick is the safe direction; a double seat is not.
+ */
+function pidAlive(pid, sessionId) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  let cmd;
+  try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { return true; }
+  /* A zombie has an empty cmdline: exited, not yet reaped. Not alive. */
+  if (!cmd) return false;
+  return sessionId ? cmd.includes(sessionId) : true;
 }
 
 /*
@@ -385,8 +574,461 @@ function stamp() { return new Date().toISOString().replace('T', ' ').slice(0, 19
 
 // -------------------------------------------------------------------- run
 
+async function postJson(base, route, body) {
+  const r = await fetch(base + route, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!r.ok) throw new Error(`POST ${route} -> ${r.status}`);
+  return r.json().catch(() => ({}));
+}
+
+const delay = (ms) => new Promise((resolve) => { const t = setTimeout(resolve, ms); if (t.unref) t.unref(); });
+
+/*
+ * THE CLOCKS OF A LONG-LIVED COORDINATOR, each chosen against a named cost.
+ *
+ *   TAIL_MS            how often a coordinator's stream-json log is read. Its
+ *                      `result` event is the only way to know a turn ended, and
+ *                      "ended" is what makes a message deliverable and a
+ *                      coordinator evictable. Half a second is invisible next to
+ *                      a turn that takes tens of seconds, and a stat per tick.
+ *   WATCH_STALE_MS     the server pings every 25s (SSE_PING_MS). 70s with no
+ *                      byte is almost three missed pings: a half-open socket,
+ *                      not a quiet tab. Without this the watch can look held
+ *                      while the server counts zero listeners.
+ *   WATCH_RETRY_MS     a relay restart drops every stream on purpose; 2s is the
+ *                      same reconnect cadence SKILL.md tells coordinators to use.
+ *   POKE_DEBOUNCE_MS   one human message produces several SSE frames (create,
+ *                      then the coordinator's own claim/progress/result). One
+ *                      tick per burst is enough.
+ *   CLOSE_GRACE_MS     an IDLE coordinator whose stdin was closed exits in about
+ *                      a second. One still there after 60s is wedged, and it is
+ *                      idle by construction, so SIGTERM costs no answer.
+ *   MAX_ATTEMPTS       a message whose coordinator died mid-turn is handed out
+ *                      once more (by resume). Twice is the bound: a message that
+ *                      reliably kills its coordinator must not respawn forever -
+ *                      the same repetition-bounding argument as the header.
+ */
+const TAIL_MS = 500;
+const WATCH_STALE_MS = 70000;
+const WATCH_RETRY_MS = 2000;
+const POKE_DEBOUNCE_MS = 1000;
+const CLOSE_GRACE_MS = 60000;
+const PID_POLL_MS = 5000;
+const SHUTDOWN_WAIT_MS = 8000;
+const MAX_ATTEMPTS = 2;
+
+function createRuntime(cfg, log) {
+  return {
+    cfg,
+    log,
+    state: loadState(cfg.stateFile),
+    coords: new Map(),
+    lastOutcome: 'starting',
+    lastQuiet: null,
+    ticking: false,
+    again: false,
+    pokeTimer: null,
+    pokeFn: null,
+    stopping: false,
+  };
+}
+
+function save(runtime) { saveState(runtime.cfg.stateFile, runtime.state); }
+
+/* The shape selectSeats() reads - data only, no handles. */
+function coordView(runtime) {
+  return new Map([...runtime.coords].map(([cid, c]) => [cid, {
+    agent: c.agent, pid: c.pid, attached: c.attached, busy: c.busy, closing: c.closing, lastActiveAt: c.lastActiveAt,
+  }]));
+}
+
+/* Remembered tabs with no live process behind them: the resumable ones. */
+function deadRecords(runtime) {
+  const out = {};
+  for (const [cid, rec] of Object.entries(runtime.state.tabs)) if (!runtime.coords.has(cid)) out[cid] = rec;
+  return out;
+}
+
+function poke(runtime) {
+  if (!runtime.pokeFn || runtime.pokeTimer || runtime.stopping) return;
+  runtime.pokeTimer = setTimeout(() => { runtime.pokeTimer = null; runtime.pokeFn(); }, POKE_DEBOUNCE_MS);
+}
+
+/*
+ * Recorded BEFORE the turn is written, for the same reason a dispatch is: a
+ * crash in between loses a turn (visible, bounded), never repeats one forever.
+ * `attempts` survives a requeue so MAX_ATTEMPTS can bound it.
+ */
+function recordDelivered(runtime, messages, cid, agent) {
+  const at = new Date().toISOString();
+  for (const m of messages) {
+    const prev = runtime.state.dispatched[m.id];
+    runtime.state.dispatched[m.id] = { at, conversationId: cid, agent, attempts: ((prev && prev.attempts) || 0) + 1 };
+  }
+}
+
+function writeTurn(coord, text, messages) {
+  coord.busy = true;
+  coord.turnStartedAt = Date.now();
+  coord.lastActiveAt = Date.now();
+  coord.lastTurn = { messages };
+  try {
+    coord.child.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`);
+  } catch { /* the exit handler reports a dead pipe; nothing useful to add here */ }
+}
+
+async function releaseIfOurs(runtime, cid, agent, reason) {
+  const { cfg, log } = runtime;
+  try {
+    const live = await getJson(cfg.queue, `/conversations/${cid}`);
+    if (live.agent !== agent) return false;
+    await postJson(cfg.queue, `/conversations/${cid}`, { agent: null, agentLeftReason: reason });
+    log(`RELEASED ${agent} from ${live.title || cid} (${cid}): ${reason}`);
+    return true;
+  } catch (e) {
+    log(`RELEASE FAILED ${agent} (${cid}): ${e.message}`);
+    return false;
+  }
+}
+
+/*
+ * THE COORDINATOR'S OUTPUT GOES TO A FILE, AND AUTOSEAT TAILS THE FILE.
+ *
+ * Piping stdout back into this process would be simpler and wrong: when
+ * autoseat restarts (deploy, supervisor kill, crash), a pipe's read end dies
+ * with it, and the coordinator's next write mid-turn is EPIPE - the turn the
+ * human is waiting on dies because the DISPATCHER restarted. A file has no
+ * reader to lose. stdin is still a pipe, deliberately: its EOF when autoseat
+ * dies is exactly the signal that makes a coordinator finish the turn in
+ * progress and exit, instead of idling forever with nobody able to feed it.
+ */
+function readTail(runtime, coord) {
+  let fd;
+  try { fd = fs.openSync(coord.logFile, 'r'); } catch { return; }
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size <= coord.offset) return;
+    const buf = Buffer.alloc(size - coord.offset);
+    fs.readSync(fd, buf, 0, buf.length, coord.offset);
+    /* Consume whole lines only, so a multi-byte character or a JSON event
+     * split across two reads is never parsed in halves. */
+    const end = buf.lastIndexOf(0x0a);
+    if (end < 0) return;
+    coord.offset += end + 1;
+    for (const line of buf.subarray(0, end).toString('utf8').split('\n')) {
+      if (!line.startsWith('{')) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      onEvent(runtime, coord, e);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function onEvent(runtime, coord, e) {
+  const { log } = runtime;
+  if (e.type === 'system' && e.subtype === 'init' && !coord.sawInit) {
+    coord.sawInit = true;
+    if (e.session_id && e.session_id !== coord.sessionId) {
+      log(`SESSION ${coord.agent} pid ${coord.pid} reports session ${e.session_id}, expected ${coord.sessionId}; recording the reported one`);
+      coord.sessionId = e.session_id;
+      const rec = runtime.state.tabs[coord.cid];
+      if (rec) { rec.sessionId = e.session_id; save(runtime); }
+    }
+    return;
+  }
+  if (e.type !== 'result') return;
+  coord.busy = false;
+  coord.turns++;
+  if (!e.is_error) coord.okTurns++;
+  coord.lastActiveAt = Date.now();
+  const rec = runtime.state.tabs[coord.cid];
+  if (rec) { rec.lastActiveAt = new Date().toISOString(); save(runtime); }
+  const secs = coord.turnStartedAt ? Math.round((Date.now() - coord.turnStartedAt) / 1000) : '?';
+  log(`TURN DONE ${coord.agent} pid ${coord.pid} turn #${coord.turns} ${e.subtype || ''}${e.is_error ? ' ERROR' : ''} `
+    + `in ${secs}s, session ${e.session_id || coord.sessionId} (${coord.cid})`);
+  poke(runtime);
+}
+
+/*
+ * AUTOSEAT HOLDS THE WATCH. One scoped SSE subscription per live coordinator,
+ * reconnecting, for exactly as long as that process lives. Two jobs:
+ *
+ *   - It is what the server counts. seatWatchInfo() calls a seat unwatched when
+ *     work is pending and nobody is subscribed; a headless coordinator mid-way
+ *     through a long quiet turn subscribes to nothing, so without this it reads
+ *     as dead and gets a second coordinator seated on top of it. Held here, the
+ *     count is true: listener present iff process alive.
+ *   - It is the doorbell. Any frame on the tab pokes a tick, so a new message
+ *     becomes a turn in about a second instead of on the next 10s poll. The
+ *     frame's content is NOT trusted to decide anything - the tick re-reads
+ *     /tasks and applies the same human-origin allowlist, so an agent,
+ *     watchdog or checklist frame costs one idle tick and can never be a turn.
+ */
+function startWatch(runtime, coord) {
+  const { cfg, log } = runtime;
+  const w = { stop: false, ctl: null, connected: false, everConnected: false, lostLogged: false };
+  coord.watch = w;
+  (async () => {
+    while (!w.stop) {
+      w.ctl = new AbortController();
+      let lastByte = Date.now();
+      const stale = setInterval(() => { if (Date.now() - lastByte > WATCH_STALE_MS) w.ctl.abort(new Error('no bytes for 70s')); }, 5000);
+      if (stale.unref) stale.unref();
+      try {
+        const r = await fetch(`${cfg.queue}/events?conversation=${encodeURIComponent(coord.cid)}`, {
+          headers: { accept: 'text/event-stream' }, signal: w.ctl.signal,
+        });
+        if (!r.ok) throw new Error(`GET /events -> ${r.status}`);
+        if (w.lostLogged) log(`WATCH restored for ${coord.agent} (${coord.cid})`);
+        w.connected = true; w.everConnected = true; w.lostLogged = false;
+        const dec = new TextDecoder();
+        let buf = '';
+        for await (const chunk of r.body) {
+          lastByte = Date.now();
+          buf += dec.decode(chunk, { stream: true });
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const frame = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            if (/^data:/m.test(frame)) poke(runtime);
+          }
+        }
+        throw new Error('stream ended');
+      } catch (e) {
+        if (w.stop) break;
+        /* Logged on the transition only; a relay outage must not write a line
+         * every 2 seconds for every coordinator. */
+        if (!w.lostLogged) { log(`WATCH lost for ${coord.agent} (${coord.cid}): ${e.message}; reconnecting every ${WATCH_RETRY_MS / 1000}s`); w.lostLogged = true; }
+        w.connected = false;
+      } finally {
+        clearInterval(stale);
+      }
+      if (!w.stop) await delay(WATCH_RETRY_MS);
+    }
+  })();
+}
+
+function stopWatch(coord) {
+  if (!coord.watch) return;
+  coord.watch.stop = true;
+  try { if (coord.watch.ctl) coord.watch.ctl.abort(); } catch { /* already closed */ }
+}
+
+function spawnCoordinator(runtime, o) {
+  const { cfg, log } = runtime;
+  const cid = o.conversationId;
+  const resume = !!o.resumeSessionId;
+  const sessionId = o.resumeSessionId || crypto.randomUUID();
+  const nowIso = new Date().toISOString();
+
+  /*
+   * RECORD BEFORE SPAWNING. If this process dies between the write and the
+   * spawn, the outcome is a message nobody was sent to answer - which the
+   * watchdog already alarms on. If it were the other way round, the outcome
+   * would be a message that dispatches a coordinator on every restart,
+   * forever. The first failure is visible and bounded; the second is the
+   * backlog this system has already drowned in once.
+   *
+   * The tab record (session id first, pid right after the spawn) is the other
+   * half of that write: it is what the next autoseat reads to know a process
+   * of ours still holds this tab, and which session to resume when none does.
+   */
+  runtime.state.tabs[cid] = {
+    ...(runtime.state.tabs[cid] || {}),
+    agent: o.agent, sessionId, title: o.title, pid: null, startedAt: nowIso, lastActiveAt: nowIso,
+  };
+  if (!o.skipRecord) recordDelivered(runtime, o.messages, cid, o.agent);
+  save(runtime);
+
+  fs.mkdirSync(cfg.logDir, { recursive: true });
+  const logFile = path.join(cfg.logDir, `${o.agent}-${nowIso.replace(/[:.]/g, '-')}.log`);
+  const fd = fs.openSync(logFile, 'a');
+  const offset = fs.fstatSync(fd).size;
+
+  const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
+  if (resume) args.push('--resume', sessionId); else args.push('--session-id', sessionId);
+  if (cfg.model) args.push('--model', cfg.model);
+
+  let child;
+  try {
+    /*
+     * detached: its own process group, so a signal aimed at autoseat's group
+     * (a Ctrl-C, a supervisor teardown) does not kill a turn in progress. It
+     * still cannot outlive autoseat by more than one turn - see shutdown().
+     */
+    child = spawn(cfg.claude, args, { cwd: cfg.cwd, stdio: ['pipe', fd, fd], detached: true, windowsHide: true });
+  } catch (e) {
+    fs.closeSync(fd);
+    log(`DISPATCH FAILED ${o.agent} -> ${o.conversationId}: ${e.message}`);
+    return null;
+  }
+  fs.closeSync(fd); /* the child holds its own copy */
+
+  const coord = {
+    cid, agent: o.agent, title: o.title, sessionId, child, pid: child.pid,
+    attached: true, busy: false, closing: null, lastActiveAt: Date.now(),
+    logFile, offset, resumed: resume, sawInit: false, turns: 0, okTurns: 0, lastTurn: null,
+  };
+  runtime.state.tabs[cid].pid = child.pid;
+  save(runtime);
+  runtime.coords.set(cid, coord);
+
+  child.stdin.on('error', () => { /* EPIPE after the child died; the exit handler reports it */ });
+  child.on('exit', (code, signal) => { onExit(runtime, coord, code, signal); });
+  child.on('error', (e) => {
+    log(`DISPATCH ERROR ${o.agent}: ${e.message}`);
+    onExit(runtime, coord, null, null);
+  });
+
+  coord.tailTimer = setInterval(() => readTail(runtime, coord), TAIL_MS);
+  startWatch(runtime, coord);
+
+  log(`DISPATCH ${o.agent} -> ${o.title} (${cid}) pid ${child.pid} session ${sessionId} `
+    + `${resume ? 'RESUMED' : 'fresh'}, covering ${o.messages.length} message(s), log ${path.basename(logFile)}`);
+
+  const turn = turnText({ ...o, conversationId: cid });
+  writeTurn(coord, resume ? turn : `${brief({ ...o, queue: cfg.queue })}\n\n---\n\n${turn}`, o.messages);
+  return coord;
+}
+
+function deliverTurn(runtime, coord, messages) {
+  recordDelivered(runtime, messages, coord.cid, coord.agent);
+  save(runtime);
+  writeTurn(coord, turnText({ conversationId: coord.cid, title: coord.title, agent: coord.agent, messages }), messages);
+  runtime.log(`TURN ${coord.agent} pid ${coord.pid} <- ${coord.title} (${coord.cid}) covering ${messages.length} message(s), `
+    + `turn #${coord.turns + 1} of session ${coord.sessionId}`);
+}
+
+function closeCoordinator(runtime, coord, kind, detail) {
+  coord.closing = kind;
+  runtime.log(`CLOSING ${coord.agent} pid ${coord.pid} (${coord.cid}): ${detail}; stdin closed, session ${coord.sessionId} kept for resume`);
+  try { coord.child.stdin.end(); } catch { /* already gone */ }
+  coord.killTimer = setTimeout(() => {
+    if (coord.exited) return;
+    runtime.log(`KILL ${coord.agent} pid ${coord.pid}: still running ${CLOSE_GRACE_MS / 1000}s after stdin closed while idle`);
+    try { coord.child.kill('SIGTERM'); } catch { /* gone */ }
+  }, CLOSE_GRACE_MS);
+  if (coord.killTimer.unref) coord.killTimer.unref();
+}
+
+const LEFT_REASONS = {
+  idle: 'autoseat: idle, retired; session kept for resume',
+  evicted: 'autoseat: idle, evicted to free a slot; session kept for resume',
+  shutdown: 'autoseat: stopping; session kept for resume',
+};
+
+async function onExit(runtime, coord, code, signal) {
+  if (coord.exited) return;
+  coord.exited = true;
+  const { log } = runtime;
+  clearInterval(coord.tailTimer);
+  clearInterval(coord.pidTimer);
+  clearTimeout(coord.killTimer);
+  if (coord.logFile) readTail(runtime, coord);
+  stopWatch(coord);
+  if (runtime.coords.get(coord.cid) === coord) runtime.coords.delete(coord.cid);
+
+  const how = signal ? `signal=${signal}` : `exit=${code}`;
+  const rec = runtime.state.tabs[coord.cid];
+  if (rec && rec.sessionId === coord.sessionId) { rec.pid = null; rec.lastExitAt = new Date().toISOString(); }
+  log(`FINISHED ${coord.agent} pid ${coord.pid} ${how} after ${coord.turns} turn(s)`
+    + `${coord.closing ? ` (${coord.closing})` : ''}, session ${coord.sessionId} kept (${coord.cid})`);
+
+  /*
+   * RESUME FELL THROUGH. A resumed process that never finished a turn cleanly
+   * did not get its session back (deleted transcript, a different project
+   * dir, a CLI that no longer knows the id: "No conversation found with
+   * session ID"). The message still needs answering, so start a FRESH session
+   * and hand it the same messages - once. A fresh session is not a resume, so
+   * this cannot recurse.
+   */
+  if (coord.resumed && coord.okTurns === 0 && !coord.closing && !runtime.stopping && coord.lastTurn) {
+    let why = how;
+    try {
+      const m = /No conversation found[^\n"]*/.exec(fs.readFileSync(coord.logFile, 'utf8').slice(-20000));
+      if (m) why = m[0];
+    } catch { /* keep `how` */ }
+    log(`RESUME FAILED ${coord.agent} session ${coord.sessionId} (${why}); starting a FRESH session for ${coord.title} (${coord.cid})`);
+    save(runtime);
+    spawnCoordinator(runtime, {
+      conversationId: coord.cid, title: coord.title, agent: coord.agent,
+      messages: coord.lastTurn.messages, resumeSessionId: null, skipRecord: true,
+    });
+    coord.finalized = true;
+    return;
+  }
+
+  /*
+   * DIED MID-TURN (killed, crashed, OOM). The messages of that turn were
+   * recorded as delivered, and left that way they would never be answered.
+   * Mark them for one more delivery; the tick re-checks they are still
+   * pending, so anything the coordinator did finish is not repeated.
+   */
+  if (coord.busy && coord.lastTurn && !runtime.stopping) {
+    const again = coord.lastTurn.messages
+      .filter((m) => runtime.state.dispatched[m.id] && runtime.state.dispatched[m.id].attempts < MAX_ATTEMPTS);
+    for (const m of again) runtime.state.dispatched[m.id].requeue = true;
+    if (again.length) log(`REQUEUE ${again.length} message(s) from ${coord.agent}, which died mid-turn; next delivery resumes session ${coord.sessionId}`);
+  }
+  save(runtime);
+
+  if (coord.closing !== 'seat-taken') {
+    await releaseIfOurs(runtime, coord.cid, coord.agent,
+      LEFT_REASONS[coord.closing] || `autoseat: coordinator process ended (${how}); session kept for resume`);
+  }
+  coord.finalized = true;
+  poke(runtime);
+}
+
+/*
+ * SURVIVORS OF AN EARLIER AUTOSEAT. A record whose pid is still our
+ * coordinator (identity-checked, see pidAlive) is a process that lost its
+ * stdin when the previous autoseat died: it is finishing its last turn and
+ * will exit by itself. Seating the tab now is the Sporefall double seat, so it
+ * is adopted instead - counted, watched (so the server keeps seeing a
+ * listener), polled until it exits, and its seat released after. A record
+ * whose pid is gone gets its seat released now, so the tab reads honestly
+ * empty rather than falsely staffed; the session id stays for resume.
+ */
+async function adoptSurvivors(runtime) {
+  const { log } = runtime;
+  let changed = false;
+  for (const [cid, rec] of Object.entries(runtime.state.tabs)) {
+    if (!rec.pid) continue;
+    if (pidAlive(rec.pid, rec.sessionId)) {
+      const coord = {
+        cid, agent: rec.agent, title: rec.title || cid, sessionId: rec.sessionId, child: null, pid: rec.pid,
+        attached: false, busy: true, closing: null, lastActiveAt: Date.parse(rec.lastActiveAt) || Date.now(),
+        adopted: true, turns: 0, okTurns: 0, lastTurn: null,
+      };
+      runtime.coords.set(cid, coord);
+      startWatch(runtime, coord);
+      coord.pidTimer = setInterval(() => {
+        if (!pidAlive(coord.pid, coord.sessionId)) onExit(runtime, coord, null, null);
+      }, PID_POLL_MS);
+      log(`ADOPTED ${rec.agent} pid ${rec.pid} session ${rec.sessionId} (${cid}): alive from an earlier autoseat, `
+        + 'finishing its last turn; this tab gets no second coordinator until it exits');
+    } else {
+      rec.pid = null;
+      changed = true;
+      await releaseIfOurs(runtime, cid, rec.agent, 'autoseat: coordinator process gone after an autoseat restart; session kept for resume');
+    }
+  }
+  if (changed) save(runtime);
+}
+
 async function tick(cfg, runtime) {
   const log = runtime.log;
+  /* A stopping autoseat must never seat anything: a debounced poke armed just
+   * before SIGTERM would otherwise dispatch a coordinator that nobody will
+   * ever feed. Found by the lifecycle selftest, not by reasoning. */
+  if (runtime.stopping) return;
   let tasks; let convs;
   try {
     tasks = (await getJson(cfg.queue, '/tasks?status=pending')).tasks || [];
@@ -405,12 +1047,32 @@ async function tick(cfg, runtime) {
     runtime.lastOutcome = `queue unreachable: ${e.message}`;
     return;
   }
+  const convById = new Map(convs.map((c) => [c.id, c]));
 
-  const { chosen, considered } = selectSeats({
+  /*
+   * RETIRE BEFORE DECIDING. An idle coordinator past --idle is closed here,
+   * and one whose seat somebody else now holds is closed too (never released:
+   * the seat is not ours any more). Both only ever touch IDLE coordinators - a
+   * turn in progress is never cut short by housekeeping.
+   */
+  for (const coord of [...runtime.coords.values()]) {
+    if (!coord.attached || coord.busy || coord.closing || cfg.dry) continue;
+    const conv = convById.get(coord.cid);
+    if (conv && coord.turns > 0 && conv.agent && conv.agent !== coord.agent) {
+      closeCoordinator(runtime, coord, 'seat-taken', `the seat now belongs to ${conv.agent}`);
+    } else if (conv && (conv.archived || conv.stopAck === 'stopped')) {
+      closeCoordinator(runtime, coord, 'idle', 'the tab was archived or stopped');
+    } else if (Date.now() - coord.lastActiveAt >= cfg.idleMs) {
+      closeCoordinator(runtime, coord, 'idle', `idle ${Math.round((Date.now() - coord.lastActiveAt) / 60000)}m (limit ${cfg.idleMs / 60000}m)`);
+    }
+  }
+
+  const { chosen, deliveries, considered } = selectSeats({
     tasks,
     conversations: convs,
-    dispatched: new Set(Object.keys(runtime.state.dispatched)),
-    inFlight: runtime.inFlight,
+    dispatched: new Set(Object.entries(runtime.state.dispatched).filter(([, v]) => !(v && v.requeue)).map(([k]) => k)),
+    coordinators: coordView(runtime),
+    records: deadRecords(runtime),
     ignore: cfg.ignore,
     now: Date.now(),
     graceMs: cfg.graceMs,
@@ -419,10 +1081,25 @@ async function tick(cfg, runtime) {
 
   if (cfg.explain) {
     for (const row of considered) {
-      log(`${row.seat ? 'SEAT  ' : 'skip  '}${row.title} (${row.conversationId}) task ${row.taskId}: ${row.why}`);
+      const tag = row.seat ? 'SEAT  ' : row.deliver ? 'TURN  ' : 'skip  ';
+      log(`${tag}${row.title} (${row.conversationId}) task ${row.taskId}: ${row.why}`);
     }
     if (!considered.length) log('nothing pending to consider');
   }
+
+  const taskById = new Map(tasks.map((t) => [t.id, t]));
+  const byConv = new Map();
+  for (const row of deliveries) {
+    if (!byConv.has(row.conversationId)) byConv.set(row.conversationId, []);
+    byConv.get(row.conversationId).push(taskById.get(row.taskId));
+  }
+  for (const [cid, messages] of byConv) {
+    const coord = runtime.coords.get(cid);
+    if (!coord || !coord.attached || coord.busy || coord.closing) continue;
+    if (cfg.dry) { log(`DRY-RUN would hand ${messages.length} message(s) to ${coord.agent} as a turn (${cid})`); continue; }
+    deliverTurn(runtime, coord, messages);
+  }
+
   if (!chosen.length) {
     /*
      * Say "nothing to seat" only when that is NEWS.
@@ -449,21 +1126,23 @@ async function tick(cfg, runtime) {
      * The cap itself is working as designed. What was broken was that its
      * decision was invisible in the only log anyone reads.
      */
-    const blocked = considered.filter((r) => r.code === 'cap' || r.code === 'in-flight');
+    const blocked = considered.filter((r) => r.code === 'cap');
+    const live = [...runtime.coords.values()].map((c) => `${c.agent}${c.busy ? '*' : ''}`);
     const quiet = blocked.length
       ? `SATURATED - ${blocked.length} eligible message(s) refused; `
-        + `${runtime.inFlight.size}/${cfg.maxConcurrent} coordinators in flight `
-        + `[${[...runtime.inFlight].join(', ')}]. Nothing is wrong with autoseat; it has no free slot.`
-      : `nothing to seat (${considered.length} pending message(s) considered)`;
+        + `${runtime.coords.size}/${cfg.maxConcurrent} coordinators live, all mid-turn `
+        + `[${live.join(', ')}]. Nothing is wrong with autoseat; it has no free slot.`
+      : `nothing to seat (${considered.length} pending message(s) considered, ${runtime.coords.size} coordinator(s) live)`;
     if (!cfg.explain && quiet !== runtime.lastQuiet) { log(quiet); runtime.lastQuiet = quiet; }
     runtime.lastOutcome = blocked.length
-      ? `saturated, ${blocked.length} waiting on ${runtime.inFlight.size}/${cfg.maxConcurrent} slots`
-      : `idle, ${considered.length} considered`;
+      ? `saturated, ${blocked.length} waiting on ${runtime.coords.size}/${cfg.maxConcurrent} slots`
+      : `idle, ${considered.length} considered, ${runtime.coords.size} live${deliveries.length ? `, ${byConv.size} turn(s) delivered` : ''}`;
     return;
   }
   runtime.lastQuiet = null;
 
   for (const pick of chosen) {
+    if (runtime.stopping) return;
     /*
      * RE-READ THE SEAT. The list above is a snapshot, and the gap between
      * reading it and acting on it is exactly where a human or a router seats
@@ -487,62 +1166,107 @@ async function tick(cfg, runtime) {
      * server's own clock via agentSince, so seatUnwatched already reads false
      * for them without any special-casing here.
      */
+    const rec = runtime.state.tabs[pick.conversationId];
     const liveUnwatched = !!(live.agentState && live.agentState.seatUnwatched);
-    if (live.agent && !liveUnwatched) { log(`SKIP ${pick.conversationId}: ${live.agent} took the seat while we were deciding`); continue; }
+    const liveOwnDead = !!(live.agent && rec && rec.agent === live.agent && !runtime.coords.has(pick.conversationId));
+    if (runtime.coords.has(pick.conversationId)) { log(`SKIP ${pick.conversationId}: a coordinator of ours appeared while we were deciding`); continue; }
+    if (live.agent && !liveUnwatched && !liveOwnDead) { log(`SKIP ${pick.conversationId}: ${live.agent} took the seat while we were deciding`); continue; }
     if (live.archived || live.stopAck === 'stopped') { log(`SKIP ${pick.conversationId}: closed while we were deciding`); continue; }
 
-    const agent = agentName(live.title || pick.title, pick.conversationId);
-    const covered = coveredBy(tasks, pick.conversationId);
+    /* The same name for the life of the tab: a resumed coordinator keeps the
+     * name its own transcript already uses everywhere. */
+    const title = live.title || pick.title;
+    const agent = rec && rec.agent ? rec.agent : agentName(title, pick.conversationId);
+    const coveredIds = new Set(coveredBy(tasks, pick.conversationId));
+    const messages = tasks.filter((t) => coveredIds.has(t.id));
 
     if (cfg.dry) {
-      log(`DRY-RUN would dispatch ${agent} into ${pick.title} (${pick.conversationId}), covering ${covered.length} message(s)`);
+      log(`DRY-RUN would dispatch ${agent} into ${pick.title} (${pick.conversationId}), covering ${messages.length} message(s)`
+        + `${pick.resumeSessionId ? `, resuming ${pick.resumeSessionId}` : ''}${pick.evict ? `, evicting ${pick.evictAgent}` : ''}`);
       continue;
     }
 
-    /*
-     * RECORD BEFORE SPAWNING. If this process dies between the write and the
-     * spawn, the outcome is a message nobody was sent to answer - which the
-     * watchdog already alarms on. If it were the other way round, the outcome
-     * would be a message that dispatches a coordinator on every restart,
-     * forever. The first failure is visible and bounded; the second is the
-     * backlog this system has already drowned in once.
-     */
-    const at = new Date().toISOString();
-    for (const id of covered) {
-      runtime.state.dispatched[id] = { at, conversationId: pick.conversationId, agent };
-    }
-    saveState(cfg.stateFile, runtime.state);
-
-    fs.mkdirSync(cfg.logDir, { recursive: true });
-    const logFile = path.join(cfg.logDir, `${agent}-${at.replace(/[:.]/g, '-')}.log`);
-    const fd = fs.openSync(logFile, 'a');
-
-    const args = ['-p', brief({ ...pick, title: live.title || pick.title, agent, queue: cfg.queue })];
-    if (cfg.model) args.push('--model', cfg.model);
-
-    let child;
-    try {
-      child = spawn(cfg.claude, args, { cwd: cfg.cwd, stdio: ['ignore', fd, fd], windowsHide: true });
-    } catch (e) {
-      fs.closeSync(fd);
-      log(`DISPATCH FAILED ${agent} -> ${pick.conversationId}: ${e.message}`);
-      continue;
+    if (pick.evict) {
+      const victim = runtime.coords.get(pick.evict);
+      if (!victim || !victim.attached || victim.busy || victim.closing) {
+        log(`SKIP ${pick.conversationId}: the idle coordinator chosen for eviction is no longer idle`);
+        continue;
+      }
+      /* The victim is idle, so it exits within a second of EOF. Spawning
+       * before it has gone means one tick of cap+1 processes, of which one is
+       * idle and leaving - cheaper than a whole extra poll of waiting. */
+      closeCoordinator(runtime, victim, 'evicted',
+        `least recently active idle coordinator (${Math.round((Date.now() - victim.lastActiveAt) / 1000)}s), evicted at the cap to seat ${title}`);
     }
 
-    runtime.inFlight.add(pick.conversationId);
-    log(`DISPATCH ${agent} -> ${pick.title} (${pick.conversationId}) covering ${covered.length} message(s), log ${path.basename(logFile)}`);
-
-    child.on('exit', (code) => {
-      try { fs.closeSync(fd); } catch { /* already closed */ }
-      runtime.inFlight.delete(pick.conversationId);
-      log(`FINISHED ${agent} exit=${code} (${pick.conversationId})`);
-    });
-    child.on('error', (e) => {
-      runtime.inFlight.delete(pick.conversationId);
-      log(`DISPATCH ERROR ${agent}: ${e.message}`);
+    spawnCoordinator(runtime, {
+      conversationId: pick.conversationId, title, agent, messages, resumeSessionId: pick.resumeSessionId,
     });
   }
-  runtime.lastOutcome = `seated ${chosen.length}`;
+  runtime.lastOutcome = `seated ${chosen.length}, ${runtime.coords.size} live`;
+}
+
+/*
+ * GRACEFUL SHUTDOWN - WHAT HAPPENS TO THE COORDINATORS WHEN AUTOSEAT STOPS.
+ *
+ * Two bad options bracket the choice. Killing them kills a turn in progress,
+ * and that turn is an answer the human is already waiting on. Leaving them
+ * running with nobody feeding stdin would park a process on a seat forever.
+ *
+ * The chosen shape costs nothing extra because of how stdin works: every
+ * coordinator's stdin is closed. An IDLE one reads EOF and exits at once, and
+ * its seat is released here before autoseat exits (bounded by
+ * SHUTDOWN_WAIT_MS). A coordinator MID-TURN also reads EOF, but only after its
+ * current turn: Claude finishes the turn, writes its result to its own log
+ * file (a file, so no broken pipe - see readTail), and exits. So nothing is
+ * orphaned for longer than one turn. The same holds if autoseat dies without
+ * this handler (SIGKILL, crash): the pipe closes all the same.
+ *
+ * Whoever starts next - the flock'd supervisor restarts autoseat in 5s - finds
+ * that still-finishing process through state.json and pidAlive(), adopts it
+ * instead of seating a second coordinator, and releases its seat after it
+ * exits. The session id stays, so the tab's next message resumes it.
+ */
+function serialTicker(cfg, runtime, beat) {
+  /* A caller arriving mid-tick gets the promise of the run that will include
+   * its request, so `await safeTick()` always means "a tick has seen the
+   * world as of now" - not "a tick was already going, good luck". */
+  const safeTick = () => {
+    if (runtime.ticking) { runtime.again = true; return runtime.tickPromise; }
+    runtime.ticking = true;
+    runtime.tickPromise = (async () => {
+      try {
+        do {
+          runtime.again = false;
+          await tick(cfg, runtime).then(beat, (e) => runtime.log(`tick failed: ${e.message}`));
+        } while (runtime.again && !runtime.stopping);
+      } finally {
+        runtime.ticking = false;
+      }
+    })();
+    return runtime.tickPromise;
+  };
+  runtime.pokeFn = safeTick;
+  return safeTick;
+}
+
+async function shutdown(runtime, sig, opts) {
+  if (runtime.stopping) return;
+  runtime.stopping = true;
+  clearTimeout(runtime.pokeTimer);
+  const { log } = runtime;
+  const mine = [...runtime.coords.values()].filter((c) => c.attached);
+  const idle = mine.filter((c) => !c.busy && !c.closing);
+  const busy = mine.filter((c) => c.busy);
+  log(`${sig}: closing stdin on ${mine.length} coordinator(s); ${idle.length} idle exit now `
+    + `[${idle.map((c) => `${c.agent} pid ${c.pid}`).join(', ')}], ${busy.length} mid-turn finish their turn then exit `
+    + `[${busy.map((c) => `${c.agent} pid ${c.pid}`).join(', ')}]`);
+  for (const c of idle) c.closing = 'shutdown';
+  for (const c of mine) { try { c.child.stdin.end(); } catch { /* gone */ } }
+  const until = Date.now() + SHUTDOWN_WAIT_MS;
+  while (Date.now() < until && idle.some((c) => !c.finalized)) await delay(100);
+  for (const c of runtime.coords.values()) { stopWatch(c); clearInterval(c.tailTimer); clearInterval(c.pidTimer); }
+  if (!(opts && opts.noExit)) process.exit(0);
 }
 
 function parseArgs(argv) {
@@ -564,8 +1288,20 @@ function parseArgs(argv) {
      *
      * Raising this is a mitigation, not the cure. The cure is that a
      * coordinator which cannot act should not burn a slot for half an hour.
+     *
+     * Since 2026-09-17 a slot is held by a long-lived coordinator, so the cap
+     * counts live processes, and an IDLE one is evicted to make room rather
+     * than starving the new tab (see selectSeats).
      */
     maxConcurrent: 6,
+    /*
+     * 30 minutes idle, then retire. Long enough to cover a conversation's
+     * natural pauses - he reads a reply, walks away, answers ten minutes later
+     * - so the follow-up lands in a warm session. Short enough to stay under
+     * the server's 45-minute vacant-chair sweep, so autoseat releases its own
+     * seats with a reason before the sweep has to presume anyone gone.
+     */
+    idleMs: 30 * 60 * 1000,
     stateFile: DEFAULT_STATE,
     heartbeatFile: DEFAULT_HEARTBEAT,
     logDir: path.join(path.dirname(DEFAULT_STATE), 'logs'),
@@ -584,6 +1320,10 @@ function parseArgs(argv) {
     // tree's .claude/settings.json carries WINDOWS hook paths, so rooting a WSL
     // session there would load a guard command that cannot execute, which is
     // the default-allow case above rather than an error anyone would see.
+    //
+    // Also load-bearing for --resume: Claude Code stores a session's transcript
+    // under a directory derived from the cwd, so a coordinator can only be
+    // resumed from the same cwd it started in.
     cwd: '/home/hypnodroid/Projects/relay-queue',
     model: '',
     ignore: new Set(),
@@ -598,6 +1338,7 @@ function parseArgs(argv) {
     else if (a === '--interval') cfg.intervalMs = Number(next()) * 1000;
     else if (a === '--grace') cfg.graceMs = Number(next()) * 1000;
     else if (a === '--max-concurrent') cfg.maxConcurrent = Number(next());
+    else if (a === '--idle') cfg.idleMs = Number(next()) * 60000;
     else if (a === '--state') cfg.stateFile = next();
     else if (a === '--heartbeat') cfg.heartbeatFile = next();
     else if (a === '--log-dir') cfg.logDir = next();
@@ -611,26 +1352,28 @@ function parseArgs(argv) {
     else if (a === '--help' || a === '-h') cfg.help = true;
     else throw new Error(`unknown argument ${a}`);
   }
+  if (!(cfg.idleMs > 0)) throw new Error('--idle must be a positive number of minutes');
   return cfg;
 }
 
-const USAGE = `autoseat - dispatch a coordinator into a tab that has a human message and no agent.
+const USAGE = `autoseat - keep one long-lived coordinator per tab that has a human message.
 
   node tools/autoseat.js [--once] [--dry] [--explain]
 
   --queue URL          relay base (default ${DEFAULT_QUEUE})
-  --interval SEC       seconds between polls (default 10)
+  --interval SEC       seconds between polls (default 10; a live coordinator's tab is also watched over SSE)
   --grace SEC          seconds a message must wait before seating (default 20)
-  --max-concurrent N   most coordinators dispatched at once (default 3)
-  --state FILE         dispatch memory (default ${DEFAULT_STATE})
+  --max-concurrent N   most live coordinators at once; an idle one is evicted for a new tab (default 6)
+  --idle MIN           minutes without a turn before a coordinator is retired and its seat released (default 30)
+  --state FILE         dispatch memory and per-tab session ids (default ${DEFAULT_STATE})
   --heartbeat FILE     proof-of-life for the supervisor (default ${DEFAULT_HEARTBEAT})
-  --log-dir DIR        per-dispatch child logs
+  --log-dir DIR        per-coordinator stream-json logs
   --claude PATH        the claude executable
   --cwd DIR            working directory for the coordinator (default /home/hypnodroid/Projects/relay-queue;
                        this is where the coordinator skill and the guard are found - see the note in parseArgs)
   --model NAME         model for the coordinator (default: whatever claude is configured with)
   --ignore A,B         conversation ids never to seat
-  --once               run a single pass and exit
+  --once               run a single pass and exit; a coordinator it started answers that one turn and exits
   --dry                decide, log, spawn nothing
   --explain            print every message considered and why it was or was not seated
 `;
@@ -641,11 +1384,14 @@ async function main() {
   if (cfg.help) { console.log(USAGE); return; }
 
   const log = (m) => console.log(`${stamp()}  ${m}`);
-  const runtime = { state: loadState(cfg.stateFile), inFlight: new Set(), log, lastOutcome: 'starting' };
+  const runtime = createRuntime(cfg, log);
 
   log(`autoseat watching ${cfg.queue} every ${cfg.intervalMs / 1000}s; grace ${cfg.graceMs / 1000}s, `
-    + `cap ${cfg.maxConcurrent}, ${Object.keys(runtime.state.dispatched).length} message(s) already dispatched`
+    + `cap ${cfg.maxConcurrent}, idle ${cfg.idleMs / 60000}m, ${Object.keys(runtime.state.dispatched).length} message(s) already dispatched, `
+    + `${Object.keys(runtime.state.tabs).length} tab session(s) remembered`
     + (cfg.dry ? ' [DRY-RUN]' : ''));
+
+  if (!cfg.dry) await adoptSurvivors(runtime);
 
   /*
    * Nothing a single tick can throw is worth taking the watcher down for. An
@@ -662,21 +1408,41 @@ async function main() {
    * allowed to vouch for this process.
    */
   const beat = () => { if (!cfg.once) writeHeartbeat(cfg.heartbeatFile, runtime.lastOutcome); };
-  const safeTick = () => tick(cfg, runtime).then(beat, (e) => log(`tick failed: ${e.message}`));
+  /*
+   * ONE TICK AT A TIME. Two overlapping ticks can both read the same empty tab
+   * and both seat it - the double coordinator by another route. With the SSE
+   * doorbell poking ticks between polls, overlap is the normal case, not a
+   * corner, so a tick that arrives mid-tick is folded into one re-run after it.
+   * A hung tick still starves the heartbeat, as intended above.
+   */
+  const safeTick = serialTicker(cfg, runtime, beat);
+
+  process.on('SIGTERM', () => { shutdown(runtime, 'SIGTERM'); });
+  process.on('SIGINT', () => { shutdown(runtime, 'SIGINT'); });
 
   /* Stamp one before the first poll, so a just-started autoseat is never
    * mistaken for a wedged one during the seconds its first tick takes. */
   beat();
 
   await safeTick();
-  if (cfg.once) return; /* a spawned child keeps running; we just stop deciding */
+  if (cfg.once) {
+    /* --once hands out one turn and stops deciding. Closing stdin makes any
+     * coordinator it started answer that turn and exit - the old one-shot
+     * behavior, which is what a single manual pass should mean. */
+    await shutdown(runtime, 'once');
+    return;
+  }
   setInterval(safeTick, cfg.intervalMs);
 }
 
 // parseArgs is exported for autoseat-selftest.js, which asserts that the
 // DEFAULT cwd is a directory actually containing the coordinator skill and the
 // guard registration. That coupling has no runtime symptom when broken, so it
-// needs a test rather than a comment.
-module.exports = { selectSeats, coveredBy, agentName, brief, writeHeartbeat, parseArgs, HUMAN_ORIGINS };
+// needs a test rather than a comment. The runtime pieces are exported so the
+// selftest can drive the real lifecycle against a fake relay and a fake claude.
+module.exports = {
+  selectSeats, coveredBy, agentName, brief, turnText, writeHeartbeat, parseArgs, HUMAN_ORIGINS,
+  createRuntime, tick, serialTicker, adoptSurvivors, shutdown, pidAlive, loadState,
+};
 
 if (require.main === module) main();

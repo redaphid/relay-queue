@@ -97,6 +97,14 @@ const tasks = [
 ];
 
 /*
+ * A coordinator process that is alive but not ours to feed: a survivor of an
+ * earlier autoseat, finishing its last turn. This replaced the in-memory
+ * `inFlight` Set, which was lost on every restart - and a restart is exactly
+ * when the Sporefall tab got a second coordinator on 2026-09-17.
+ */
+const STILL_RUNNING = new Map([['c-inflight', { agent: 'auto-inflight', pid: 4242, attached: false, busy: true, closing: null }]]);
+
+/*
  * The default cap here is deliberately ROOMY - larger than the number of tabs
  * these fixtures can possibly seat. The cap has its own tests further down with
  * an explicit `maxConcurrent`; letting it also bite in the general run would
@@ -111,7 +119,7 @@ function run(mod, over) {
     tasks,
     conversations,
     dispatched: new Set(['t-already']),
-    inFlight: new Set(['c-inflight']),
+    coordinators: STILL_RUNNING,
     ignore: new Set(['c-ignored']),
     now: NOW,
     graceMs: GRACE_MS,
@@ -185,7 +193,7 @@ function check(mod) {
    * was refused for hitting the cap instead. The guard was passing on the
    * strength of a different guard's work.
    */
-  const roomy = run(mod, { maxConcurrent: 99, inFlight: new Set() });
+  const roomy = run(mod, { maxConcurrent: 99, coordinators: new Map() });
   ok(roomy.chosen.filter((c) => c.conversationId === 'c-two').length === 1,
     'with no cap in the way, a tab with two waiting messages was seated twice');
   ok(/already chosen this pass/.test((roomy.considered.find((r) => r.taskId === 't-two-b') || {}).why || ''),
@@ -218,7 +226,7 @@ function check(mod) {
     'a message inside the grace window was seated');
   ok(refused('t-already') && /already dispatched/.test(why['t-already']),
     'a message that already had a coordinator was dispatched a second time');
-  ok(refused('t-inflight') && /still running/.test(why['t-inflight']),
+  ok(refused('t-inflight') && /still holds this tab/.test(why['t-inflight']),
     'a tab with a dispatch already running was seated again');
 
   // Every pending message is accounted for. A selector that silently drops
@@ -228,7 +236,7 @@ function check(mod) {
 
   // The cap, measured with nothing already in flight so it is the cap being
   // tested and not the in-flight guard.
-  const capped = run(mod, { maxConcurrent: 1, inFlight: new Set() });
+  const capped = run(mod, { maxConcurrent: 1, coordinators: new Map() });
   ok(capped.chosen.length === 1, `cap of 1 let ${capped.chosen.length} through`);
   ok(capped.chosen[0] && capped.chosen[0].taskId === 't-two-a',
     'under a cap of 1 the oldest waiting message was not the one that got the coordinator');
@@ -238,7 +246,7 @@ function check(mod) {
   // In-flight counts against the cap, not just against its own tab: an agent
   // still starting up is an agent. A cap that only counted THIS pass would
   // spawn the cap afresh every tick.
-  ok(run(mod, { maxConcurrent: 1, inFlight: new Set(['c-inflight']) }).chosen.length === 0,
+  ok(run(mod, { maxConcurrent: 1, coordinators: STILL_RUNNING }).chosen.length === 0,
     'the cap ignored a dispatch that was already in flight');
 
   // One coordinator answers the whole tab, so both of its messages must be
@@ -263,7 +271,81 @@ function check(mod) {
   ok(!mod.coveredBy(tasks, 'c-watchdog').length && !mod.coveredBy(tasks, 'c-checklist').length,
     'coveredBy counted a watchdog poke or a checklist settle as a human message');
 
+  lifecycle(mod, ok);
   return fail;
+}
+
+/*
+ * THE LONG-LIVED COORDINATOR DECISIONS, as pure fixtures, so the mutation pass
+ * below covers them too. Each gets its own tabs for the same reason the
+ * fixtures above do: a shared tab lets one guard pass on another's work.
+ */
+function lifecycle(mod, ok) {
+  const t = (id, cid, sec, from) => ({ id, conversationId: cid, role: 'user', from: from || 'web', ts: ago(sec) });
+  const conv = (id, agent, extra) => ({ id, title: id, agent: agent || null, archived: false, stopAck: null, ...extra });
+  const pick = (res, id) => res.considered.find((r) => r.taskId === id) || {};
+
+  // A LIVE, IDLE coordinator of ours: the message is its next turn - even
+  // inside the grace window, and never a second seat.
+  const live = new Map([['L', { agent: 'auto-l', pid: 11, attached: true, busy: false, closing: null, lastActiveAt: 5 }]]);
+  let r = mod.selectSeats({
+    tasks: [t('l1', 'L', 2), t('l2', 'L', 1)], conversations: [conv('L', 'auto-l')],
+    coordinators: live, now: NOW, graceMs: GRACE_MS, maxConcurrent: 1,
+  });
+  ok(r.deliveries.length === 2 && !r.chosen.length,
+    `a message for a live idle coordinator was not delivered as a turn (deliveries ${r.deliveries.length}, seats ${r.chosen.length})`);
+
+  // The same coordinator MID-TURN: nothing is written into a running turn.
+  const busy = new Map([['L', { agent: 'auto-l', pid: 11, attached: true, busy: true, closing: null }]]);
+  r = mod.selectSeats({
+    tasks: [t('l1', 'L', 60)], conversations: [conv('L', 'auto-l')],
+    coordinators: busy, now: NOW, graceMs: GRACE_MS, maxConcurrent: 9,
+  });
+  ok(!r.deliveries.length && !r.chosen.length && pick(r, 'l1').code === 'busy',
+    'a message was delivered into, or seated beside, a coordinator that is mid-turn');
+
+  // OUR OWN DEAD COORDINATOR'S NAME ON THE SEAT: reseat it at once, as a
+  // resume of its remembered session - no 2-minute seatUnwatched wait.
+  r = mod.selectSeats({
+    tasks: [t('o1', 'O', 60)], conversations: [conv('O', 'auto-o')],
+    records: { O: { agent: 'auto-o', sessionId: 'sess-o' } }, now: NOW, graceMs: GRACE_MS, maxConcurrent: 9,
+  });
+  ok(r.chosen.length === 1 && r.chosen[0].resumeSessionId === 'sess-o',
+    'a seat held only by the name of our own dead coordinator was not reseated as a resume');
+  // ...but a stranger's name on the seat is still an occupant.
+  r = mod.selectSeats({
+    tasks: [t('o1', 'O', 60)], conversations: [conv('O', 'someone-else')],
+    records: { O: { agent: 'auto-o', sessionId: 'sess-o' } }, now: NOW, graceMs: GRACE_MS, maxConcurrent: 9,
+  });
+  ok(!r.chosen.length, 'a seat held by somebody else was taken because we once had a coordinator in that tab');
+
+  // EVICTION AT THE CAP: the least recently active IDLE one goes.
+  const two = new Map([
+    ['A', { agent: 'auto-a', pid: 1, attached: true, busy: false, closing: null, lastActiveAt: 200 }],
+    ['B', { agent: 'auto-b', pid: 2, attached: true, busy: false, closing: null, lastActiveAt: 100 }],
+  ]);
+  r = mod.selectSeats({
+    tasks: [t('n1', 'N', 60)], conversations: [conv('N'), conv('A', 'auto-a'), conv('B', 'auto-b')],
+    coordinators: two, now: NOW, graceMs: GRACE_MS, maxConcurrent: 2,
+  });
+  ok(r.chosen.length === 1 && r.chosen[0].evict === 'B',
+    `at the cap, the least recently active idle coordinator was not the one evicted (evict=${r.chosen[0] && r.chosen[0].evict})`);
+  // ...and never one mid-turn: all slots busy means wait.
+  const allBusy = new Map([...two].map(([k, v]) => [k, { ...v, busy: true }]));
+  r = mod.selectSeats({
+    tasks: [t('n1', 'N', 60)], conversations: [conv('N'), conv('A', 'auto-a'), conv('B', 'auto-b')],
+    coordinators: allBusy, now: NOW, graceMs: GRACE_MS, maxConcurrent: 2,
+  });
+  ok(!r.chosen.length && pick(r, 'n1').code === 'cap',
+    'at the cap with every coordinator mid-turn, one was evicted anyway - that kills an answer in progress');
+
+  // A delivery is still bound by the human allowlist: agent/watchdog frames
+  // in a live tab must never become turns.
+  r = mod.selectSeats({
+    tasks: [t('w1', 'L', 60, 'relay-watchdog'), { ...t('a1', 'L', 60), role: 'agent' }],
+    conversations: [conv('L', 'auto-l')], coordinators: live, now: NOW, graceMs: GRACE_MS, maxConcurrent: 9,
+  });
+  ok(!r.deliveries.length, 'a watchdog poke or an agent post in a live tab was delivered as a turn - that is the loop');
 }
 
 // ------------------------------------------------------------- mutations
@@ -287,22 +369,29 @@ function loadMutant(find, replace) {
 const MUTATIONS = [
   ['the human-vs-agent test', "if (t.role !== 'user')", 'if (false)'],
   ['the human-client test', 'if (!HUMAN_ORIGINS.has(t.from))', 'if (false)'],
-  ['the occupied-seat test', 'if (conv.agent && !unwatched)', 'if (false)'],
+  ['the occupied-seat test', 'if (conv.agent && !unwatched && !ownDeadSeat)', 'if (false)'],
   /*
    * THE FLUXPREP REGRESSION, REPRODUCED ON PURPOSE. Reverting to the OLD,
    * pre-fix guard (`if (conv.agent)`, with no seatUnwatched override at all)
    * must make t-unwatched go unseated again - if it didn't, the override was
    * never the thing doing the work.
    */
-  ['the seat-unwatched override', 'if (conv.agent && !unwatched)', 'if (conv.agent)'],
+  ['the seat-unwatched override', 'if (conv.agent && !unwatched && !ownDeadSeat)', 'if (conv.agent && !ownDeadSeat)'],
   ['the archived test', 'if (conv.archived)', 'if (false)'],
   ['the stopped test', "if (conv.stopAck === 'stopped')", 'if (false)'],
   ['the ignore list', 'if (ignore.has(cid))', 'if (false)'],
   ['the grace window', 'if (!(ageMs >= graceMs))', 'if (false)'],
   ['the already-dispatched memory', 'if (dispatched.has(t.id))', 'if (false)'],
-  ['the in-flight guard', 'if (inFlight.has(cid))', 'if (false)'],
+  ['the live-process guard (persisted dedupe)', 'if (coord) {', 'if (false) {'],
   ['the one-per-tab guard', 'if (takenThisPass.has(cid))', 'if (false)'],
-  ['the concurrency cap', 'if (inFlight.size + chosen.length >= maxConcurrent)', 'if (false)'],
+  ['the concurrency cap', 'if (occupied() + chosen.length >= maxConcurrent)', 'if (false)'],
+  ['delivery to a live coordinator', 'if (coord && coord.attached && !coord.closing) {', 'if (false) {'],
+  ['the mid-turn wait', 'if (coord.busy) {', 'if (false) {'],
+  ['our own dead seat is reseatable', 'if (conv.agent && !unwatched && !ownDeadSeat)', 'if (conv.agent && !unwatched)'],
+  ['our own dead seat must be OUR name', 'rec && rec.agent === conv.agent', 'rec'],
+  ['eviction at the cap', 'if (!victim) {', 'if (true) {'],
+  ['never evict mid-turn', 'c.attached && !c.busy && !c.closing', 'c.attached && !c.closing'],
+  ['least recently active first', '(a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0)', '(b[1].lastActiveAt || 0) - (a[1].lastActiveAt || 0)'],
   ['human messages counted for coverage', "t.role === 'user' && HUMAN_ORIGINS.has(t.from)", 'true'],
   /*
    * The allowlist itself, mutated in BOTH directions, because it is a list and
@@ -416,5 +505,342 @@ if (missing.length) {
   }
 }
 
-console.log(bad ? `\n${bad} FAILURE(S)` : '\nall good');
-process.exit(bad ? 1 : 0);
+// ------------------------------------------------------------ lifecycle
+
+/*
+ * THE LIFECYCLE, DRIVEN FOR REAL. Everything above is the pure decision; this
+ * runs the actual process management - spawn, stdin turns, stream-json
+ * tailing, the SSE watch, resume, restart adoption, idle release, eviction -
+ * against a fake relay (in this process) and a fake `claude` (a real child
+ * process that speaks the same stream-json protocol and keeps a session store
+ * on disk, so --resume can succeed or fail honestly).
+ *
+ * The fake claude's protocol was copied from the real CLI (2.1.x), measured on
+ * 2026-09-17: one JSON line per user turn on stdin, a `system/init` event, a
+ * `result` event per finished turn, a turn in progress FINISHED after stdin
+ * EOF before exit, and `No conversation found with session ID: <id>` plus a
+ * non-zero exit for an unknown --resume.
+ */
+const http = require('node:http');
+const os = require('node:os');
+const { spawn } = require('node:child_process');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(what, cond, ms) {
+  const until = Date.now() + (ms || 10000);
+  while (Date.now() < until) {
+    const v = await cond();
+    if (v) return v;
+    await sleep(50);
+  }
+  throw new Error(`timed out waiting for: ${what}`);
+}
+
+const FAKE_CLAUDE = `#!${process.execPath}
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+let sid = null; let resume = false;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--session-id') sid = args[i + 1];
+  if (args[i] === '--resume') { sid = args[i + 1]; resume = true; }
+}
+const store = process.env.FAKE_STORE;
+const relay = process.env.FAKE_RELAY;
+const sfile = path.join(store, sid + '.json');
+const journal = (o) => fs.appendFileSync(path.join(store, 'journal.jsonl'), JSON.stringify({ pid: process.pid, sid, resume, ...o }) + '\\n');
+if (resume && !fs.existsSync(sfile)) {
+  process.stderr.write('No conversation found with session ID: ' + sid + '\\n');
+  console.log(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sid }));
+  process.exit(1);
+}
+const sess = fs.existsSync(sfile) ? JSON.parse(fs.readFileSync(sfile, 'utf8')) : { turns: 0, agent: null, cid: null };
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }));
+journal({ ev: 'start' });
+let inflight = 0; let closed = false;
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    const text = JSON.parse(line).message.content;
+    const name = /Your name is \\x60([^\\x60]+)\\x60/.exec(text) || /as \\x60([^\\x60]+)\\x60/.exec(text);
+    const cid = /conversationId \\x60([^\\x60]+)\\x60/.exec(text);
+    if (name) sess.agent = name[1];
+    if (cid) sess.cid = cid[1];
+    const ids = [...text.matchAll(/^- task (\\S+) /gm)].map((m) => m[1]);
+    sess.turns++;
+    fs.writeFileSync(sfile, JSON.stringify(sess));
+    journal({ ev: 'turn', n: sess.turns, ids, brief: /FIRST, read/.test(text) });
+    inflight++;
+    const slow = /SLOW/.test(text) ? 2500 : 50;
+    setTimeout(async () => {
+      try {
+        await fetch(relay + '/fake/answer', { method: 'POST', body: JSON.stringify({ ids, agent: sess.agent, cid: sess.cid }) });
+      } catch {}
+      journal({ ev: 'result', n: sess.turns });
+      console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: sid, result: 'ok' }));
+      inflight--;
+      if (closed && !inflight) process.exit(0);
+    }, slow);
+  }
+});
+process.stdin.on('end', () => { closed = true; if (!inflight) process.exit(0); });
+`;
+
+function fakeRelay() {
+  const convs = new Map();
+  const tasks = [];
+  const listeners = new Map();
+  const subs = new Map();
+  const releases = [];
+  let seq = 0;
+  const conv = (id) => {
+    if (!convs.has(id)) convs.set(id, { id, title: `Tab ${id}`, agent: null, archived: false, stopAck: null });
+    return convs.get(id);
+  };
+  const view = (c) => ({ ...c, agentState: { seatUnwatched: false, listeners: listeners.get(c.id) || 0 } });
+  const push = (cid, obj) => { for (const res of subs.get(cid) || []) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
+  const server = http.createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    let body = '';
+    for await (const c of req) body += c;
+    const json = (code, o) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+    if (req.method === 'GET' && u.pathname === '/tasks') return json(200, { tasks: tasks.filter((t) => t.status === 'pending') });
+    if (req.method === 'GET' && u.pathname === '/conversations') return json(200, { conversations: [...convs.values()].map(view) });
+    const m = /^\/conversations\/([^/]+)$/.exec(u.pathname);
+    if (m && req.method === 'GET') return json(200, view(conv(m[1])));
+    if (m && req.method === 'POST') {
+      const b = JSON.parse(body || '{}');
+      const c = conv(m[1]);
+      if (b.agent === null) releases.push({ cid: c.id, agent: c.agent, reason: b.agentLeftReason });
+      c.agent = b.agent;
+      push(c.id, { conversation: c });
+      return json(200, view(c));
+    }
+    if (req.method === 'POST' && u.pathname === '/fake/answer') {
+      const b = JSON.parse(body || '{}');
+      if (b.cid && b.agent && !conv(b.cid).agent) conv(b.cid).agent = b.agent; /* the coordinator takes its seat */
+      for (const t of tasks) if (b.ids.includes(t.id)) t.status = 'done';
+      if (b.cid) push(b.cid, { entries: [{ id: 'x' }] });
+      return json(200, {});
+    }
+    if (req.method === 'GET' && u.pathname === '/events') {
+      const cid = u.searchParams.get('conversation');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('retry: 1000\n\n');
+      listeners.set(cid, (listeners.get(cid) || 0) + 1);
+      if (!subs.has(cid)) subs.set(cid, new Set());
+      subs.get(cid).add(res);
+      res.on('close', () => { listeners.set(cid, listeners.get(cid) - 1); subs.get(cid).delete(res); });
+      return undefined;
+    }
+    return json(404, {});
+  });
+  return {
+    server, convs, tasks, listeners, releases, conv,
+    say(cid, text, extra) {
+      const t = { id: `t${++seq}`, conversationId: cid, role: 'user', from: 'web', instruction: text,
+        ts: new Date(Date.now() - 60000).toISOString(), status: 'pending', ...extra };
+      conv(cid);
+      tasks.push(t);
+      push(cid, { entries: [t] });
+      return t;
+    },
+    close() { for (const set of subs.values()) for (const r of set) r.destroy(); server.close(); },
+  };
+}
+
+function journalOf(store) {
+  try {
+    return fs.readFileSync(path.join(store, 'journal.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch { return []; }
+}
+
+async function lifecycleSuite() {
+  const results = [];
+  const test = async (name, fn) => {
+    try { await fn(); results.push([true, name]); } catch (e) { results.push([false, `${name}: ${e.message}`]); }
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoseat-life-'));
+  const store = path.join(dir, 'store');
+  fs.mkdirSync(store);
+  const fake = path.join(dir, 'fake-claude.js');
+  fs.writeFileSync(fake, FAKE_CLAUDE, { mode: 0o755 });
+
+  const relay = fakeRelay();
+  await new Promise((r) => relay.server.listen(0, '127.0.0.1', r));
+  const queue = `http://127.0.0.1:${relay.server.address().port}`;
+  process.env.FAKE_STORE = store;
+  process.env.FAKE_RELAY = queue;
+
+  const argsFor = (name, extra) => ['--queue', queue, '--state', path.join(dir, `${name}.json`),
+    '--heartbeat', path.join(dir, `${name}.hb`), '--log-dir', path.join(dir, 'logs'), '--claude', fake,
+    '--cwd', dir, '--grace', '0', '--interval', '1', ...(extra || [])];
+  const inProcess = (name, extra) => {
+    const cfg = real.parseArgs(argsFor(name, extra));
+    const lines = [];
+    const runtime = real.createRuntime(cfg, (m) => lines.push(m));
+    const tick = real.serialTicker(cfg, runtime, () => {});
+    return { cfg, runtime, lines, tick };
+  };
+  const count = (lines, re) => lines.filter((l) => re.test(l)).length;
+  const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
+
+  // ---- 1. turn injection into a live process, and the watch it holds
+  const A = inProcess('a');
+  await test('a second message is a TURN in the same live process, delivered by the SSE doorbell', async () => {
+    relay.say('tabA', 'first');
+    await A.tick();
+    const c = A.runtime.coords.get('tabA');
+    assert(c && c.pid, 'no coordinator was spawned for a message in an empty tab');
+    await waitFor('turn 1 result', () => c.turns === 1);
+    assert(relay.convs.get('tabA').agent === c.agent, 'the fake coordinator did not take its seat');
+    await waitFor('autoseat SSE listener on tabA', () => relay.listeners.get('tabA') === 1);
+    relay.say('tabA', 'second');
+    /* No manual tick: the SSE frame alone must deliver it. */
+    await waitFor('turn 2 via the doorbell', () => c.turns === 2, 8000);
+    const turns = journalOf(store).filter((e) => e.ev === 'turn' && e.sid === c.sessionId);
+    assert(turns.length === 2 && turns.every((e) => e.pid === c.pid), `turns came from pids ${turns.map((e) => e.pid)} not all ${c.pid}`);
+    assert(turns[0].brief && !turns[1].brief, 'the brief should ride the first turn only');
+    assert(count(A.lines, /^DISPATCH /) === 1, `expected 1 DISPATCH, log has ${count(A.lines, /^DISPATCH /)}`);
+    assert(count(A.lines, /^TURN auto-/) === 1, 'the second message was not logged as a TURN');
+    assert(relay.listeners.get('tabA') === 1, `listeners on tabA = ${relay.listeners.get('tabA')}, expected exactly 1 while alive`);
+  });
+
+  // ---- 2. resume after the process dies
+  await test('a killed coordinator is released, then RESUMED with the same session on the next message', async () => {
+    const c = A.runtime.coords.get('tabA');
+    const { pid, sessionId } = c;
+    process.kill(pid, 'SIGKILL');
+    await waitFor('exit handled', () => !A.runtime.coords.has('tabA'));
+    await waitFor('seat released', () => relay.convs.get('tabA').agent === null);
+    await waitFor('listener dropped with the process', () => relay.listeners.get('tabA') === 0);
+    relay.say('tabA', 'third');
+    await A.tick();
+    const n = A.runtime.coords.get('tabA');
+    assert(n && n.pid !== pid, 'no new process for the third message');
+    assert(n.sessionId === sessionId && n.resumed, `expected resume of ${sessionId}, got ${n.sessionId} resumed=${n.resumed}`);
+    await waitFor('resumed turn', () => n.turns === 1);
+    const last = journalOf(store).filter((e) => e.ev === 'turn').pop();
+    assert(last.resume && last.sid === sessionId && last.n === 3, `fake claude saw ${JSON.stringify(last)}`);
+    assert(count(A.lines, /DISPATCH .* RESUMED/) === 1, 'no RESUMED dispatch line');
+  });
+
+  // ---- 3. resume that fails falls back to a fresh session, logged
+  await test('a resume the CLI refuses falls back to a FRESH session and still answers', async () => {
+    A.runtime.state.tabs.tabR = { agent: 'auto-r', sessionId: '00000000-0000-4000-8000-00000000dead', title: 'R', pid: null,
+      lastActiveAt: new Date().toISOString() };
+    const t = relay.say('tabR', 'answer me');
+    await A.tick();
+    await waitFor('fallback coordinator answered', () => {
+      const c = A.runtime.coords.get('tabR');
+      return c && !c.resumed && c.turns === 1;
+    });
+    assert(count(A.lines, /RESUME FAILED auto-r .*No conversation found/) === 1, 'RESUME FAILED was not logged with the CLI error');
+    assert(relay.tasks.find((x) => x.id === t.id).status === 'done', 'the message was not answered after the fallback');
+  });
+
+  // ---- 4. idle release
+  await test('an idle coordinator is retired, its seat released with a reason, its session kept', async () => {
+    const c = A.runtime.coords.get('tabR');
+    A.cfg.idleMs = 300;
+    await sleep(400);
+    await A.tick();
+    await waitFor('idle exit', () => !A.runtime.coords.has('tabR') && c.finalized);
+    const rel = relay.releases.filter((r) => r.cid === 'tabR').pop();
+    assert(rel && /idle/.test(rel.reason), `release reason ${rel && rel.reason}`);
+    assert(A.runtime.state.tabs.tabR.sessionId === c.sessionId && A.runtime.state.tabs.tabR.pid === null,
+      'the session id was not kept for resume, or the pid was not cleared');
+    A.cfg.idleMs = 30 * 60000;
+  });
+  await real.shutdown(A.runtime, 'test', { noExit: true });
+  await waitFor('A coordinators gone', () => A.runtime.coords.size === 0 || [...A.runtime.coords.values()].every((c) => c.finalized));
+
+  // ---- 5. eviction at the cap
+  const E = inProcess('e', ['--max-concurrent', '1']);
+  await test('at the cap the idle coordinator is evicted; with it mid-turn the new tab waits (SATURATED)', async () => {
+    relay.say('tabE1', 'hello');
+    await E.tick();
+    const e1 = E.runtime.coords.get('tabE1');
+    await waitFor('E1 idle', () => e1.turns === 1);
+    relay.say('tabE2', 'SLOW please');
+    await E.tick();
+    assert(e1.closing === 'evicted', `E1 was not evicted (closing=${e1.closing})`);
+    const e2 = E.runtime.coords.get('tabE2');
+    assert(e2 && e2.busy, 'E2 was not seated after the eviction');
+    await waitFor('E1 exit + release', () => e1.finalized);
+    relay.say('tabE3', 'me too');
+    await E.tick();
+    assert(!E.runtime.coords.has('tabE3') && !e2.closing, 'a mid-turn coordinator was evicted, or E3 was seated over the cap');
+    assert(count(E.lines, /^SATURATED/) >= 1, 'saturation was not logged');
+    await waitFor('E2 done', () => e2.turns === 1, 6000);
+    await E.tick();
+    assert(e2.closing === 'evicted' && E.runtime.coords.has('tabE3'), 'once E2 went idle it was not evicted for E3');
+  });
+  await real.shutdown(E.runtime, 'test', { noExit: true });
+
+  // ---- 6. autoseat restart: no double seat, mid-turn left alone, then resume
+  await test('an autoseat RESTART adopts a mid-turn coordinator instead of seating twice, then resumes it', async () => {
+    const cli = path.join(__dirname, 'autoseat.js');
+    const startAutoseat = () => {
+      const p = spawn(process.execPath, [cli, ...argsFor('r')], { stdio: ['ignore', 'pipe', 'pipe'] });
+      p.out = '';
+      p.stdout.on('data', (d) => { p.out += d; });
+      p.stderr.on('data', (d) => { p.out += d; });
+      return p;
+    };
+    /* Earlier tests' coordinators must be finished, or this autoseat would
+     * (correctly) pick up their tabs and muddy which DISPATCH is which. */
+    await waitFor('earlier tabs answered', () => relay.tasks.every((t) => t.status === 'done'), 10000);
+    const one = startAutoseat();
+    relay.say('tabS', 'SLOW long job');
+    const first = await waitFor('restart-test dispatch', () => /DISPATCH (\S+) -> Tab tabS \(tabS\) pid (\d+) session (\S+)/.exec(one.out), 8000);
+    const pid = Number(first[2]);
+    const sessionId = first[3];
+    await waitFor('the slow turn has started', () => journalOf(store).some((e) => e.ev === 'turn' && e.pid === pid));
+    one.kill('SIGKILL'); /* the harshest restart: no shutdown handler at all */
+    await new Promise((r) => one.on('exit', r));
+    relay.say('tabS', 'another while it is busy');
+    const two = startAutoseat();
+    await waitFor('adoption', () => new RegExp(`ADOPTED \\S+ pid ${pid} `).test(two.out), 8000);
+    await sleep(1200);
+    assert(!/DISPATCH/.test(two.out), `the restarted autoseat seated a tab whose coordinator was still alive:\n${two.out}`);
+    await waitFor('orphan finished its turn and exited', () => journalOf(store).some((e) => e.ev === 'result' && e.pid === pid), 8000);
+    const resumed = await waitFor('resume after the survivor exits',
+      () => /DISPATCH \S+ -> Tab tabS \(tabS\) pid (\d+) session (\S+) RESUMED/.exec(two.out), 12000)
+      .catch((e) => { throw new Error(`${e.message}\n${two.out}`); });
+    assert(resumed[2] === sessionId && Number(resumed[1]) !== pid, `resumed ${resumed[2]} pid ${resumed[1]}, expected session ${sessionId}`);
+    await waitFor('resumed turn answered', () => relay.tasks.filter((t) => t.conversationId === 'tabS').every((t) => t.status === 'done'), 8000);
+    await waitFor('idle', () => /TURN DONE .* turn #1 /.test(two.out.split('RESUMED')[1] || ''), 4000);
+    // Graceful shutdown: the idle coordinator exits and its seat is released before autoseat exits.
+    two.kill('SIGTERM');
+    const code = await new Promise((r) => two.on('exit', (c) => r(c)));
+    assert(code === 0, `autoseat exited ${code} on SIGTERM`);
+    assert(/SIGTERM: closing stdin on 1 coordinator\(s\); 1 idle/.test(two.out), `shutdown line missing:\n${two.out.slice(-600)}`);
+    assert(relay.releases.some((r) => r.cid === 'tabS' && /stopping/.test(r.reason || '')), 'the idle seat was not released on SIGTERM');
+    assert(!pidAlive(Number(resumed[1])), 'the idle coordinator was left running after SIGTERM');
+  });
+
+  relay.close();
+  await sleep(300); /* let the last coordinators' exits land before their store goes */
+  fs.rmSync(dir, { recursive: true, force: true });
+  return results;
+}
+
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+
+lifecycleSuite().then((results) => {
+  console.log('\nlifecycle - real processes against a fake relay and a fake claude:');
+  for (const [pass, name] of results) {
+    console.log(`${pass ? 'ok  ' : 'FAIL'}  ${name}`);
+    if (!pass) bad++;
+  }
+  console.log(bad ? `\n${bad} FAILURE(S)` : '\nall good');
+  process.exit(bad ? 1 : 0);
+}, (e) => {
+  console.log(`FAIL  lifecycle suite crashed: ${e.stack}`);
+  process.exit(1);
+});
