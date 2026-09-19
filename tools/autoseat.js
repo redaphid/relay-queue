@@ -100,7 +100,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 
 const DEFAULT_QUEUE = 'http://127.0.0.1:3901';
 const DEFAULT_STATE = path.join(os.homedir(), '.relay-autoseat', 'state.json');
@@ -135,6 +135,350 @@ const DEFAULT_STATE = path.join(os.homedir(), '.relay-autoseat', 'state.json');
  * starves it and the supervisor sees the staleness.
  */
 const DEFAULT_HEARTBEAT = path.join(os.homedir(), '.relay-autoseat', 'heartbeat.json');
+
+/*
+ * WHAT EVERY SEAT CARRIES, WHATEVER FOLDER IT RUNS IN (folder scopes, 2026-09-19).
+ *
+ * A seat's cwd is its conversation's folder (see seatCwd), so the coordinator
+ * protocol and the guard can no longer be found by being rooted in this repo.
+ * They are handed to every spawn explicitly instead, both derived from where
+ * this file lives rather than from any hardcoded checkout:
+ *
+ *   --settings=<REPO>/src/claude-config/settings.json
+ *       relay's OWN settings and nothing else: the PreToolUse registration of
+ *       the default-deny guard (src/claude-config/hooks/coordinator-guard.js).
+ *       It layers on top of the folder's own .claude/settings.json, which loads
+ *       normally and which relay never reads, writes or knows about.
+ *   --add-dir=<REPO>
+ *       makes <REPO>/.claude/skills/relay-coordinator discoverable.
+ *
+ * Both use the `--flag=value` form on purpose: both flags are variadic in the
+ * claude CLI, and the spaced form swallows following positional arguments. The
+ * prompt travels on stdin (stream-json) today, so nothing positional follows
+ * them - the `=` form keeps that true if one ever does.
+ *
+ * verifySeatConfig() checks both at startup and autoseat REFUSES TO RUN if
+ * either is wrong. A seat without the guard must be impossible, not unlikely:
+ * a missing or unregistered guard fails silently, default-deny becoming
+ * default-allow with no error anywhere.
+ */
+const REPO = path.resolve(__dirname, '..');
+const SEAT_SETTINGS = path.join(REPO, 'src', 'claude-config', 'settings.json');
+const SEAT_SKILL = path.join(REPO, '.claude', 'skills', 'relay-coordinator', 'SKILL.md');
+const GUARD_NAME = 'coordinator-guard.js';
+
+function seatArgs(cfg) {
+  return [`--settings=${(cfg && cfg.seatSettings) || SEAT_SETTINGS}`, `--add-dir=${REPO}`];
+}
+
+/*
+ * Returns a list of problems; empty means every seat will be guarded and will
+ * find its protocol. `strict` additionally requires the executables the
+ * registration names to exist: a hook whose command cannot run is a
+ * NON-BLOCKING hook error, which fails open exactly like a missing one. The
+ * checked-in registration names the LIVE checkout's absolute guard path, so
+ * strict mode is for the real daemon; the selftest (which may run in a
+ * worktree before that path exists) checks the rest.
+ */
+function verifySeatConfig(opts) {
+  const strict = !!(opts && opts.strict);
+  const file = (opts && opts.settings) || SEAT_SETTINGS;
+  const problems = [];
+  if (!fs.existsSync(SEAT_SKILL)) problems.push(`coordinator skill missing: ${SEAT_SKILL}`);
+  let settings;
+  try {
+    settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    problems.push(`seat settings unreadable: ${file} (${e.message})`);
+    return problems;
+  }
+  /*
+   * A project's own .claude/settings(.local).json with `"disableAllHooks": true`
+   * switches off EVERY hook, the --settings guard included - silently
+   * (verified 2026-09-19). A scalar key takes the highest-precedence source,
+   * and --settings outranks project and local, so relay's file must say
+   * `false` explicitly. Without it the guard is off in exactly the folders
+   * whose owners turned their own hooks off.
+   */
+  if (!settings || settings.disableAllHooks !== false) {
+    problems.push(`${file} must set "disableAllHooks": false - otherwise a folder's own settings can switch the guard off`);
+  }
+  const pre = (settings && settings.hooks && settings.hooks.PreToolUse) || [];
+  const guards = [];
+  for (const m of Array.isArray(pre) ? pre : []) {
+    if (!m || !/\bBash\b/.test(String(m.matcher || '')) || !/\bWrite\b/.test(String(m.matcher || ''))) continue;
+    for (const h of Array.isArray(m.hooks) ? m.hooks : []) {
+      const words = [String(h.command || ''), ...(Array.isArray(h.args) ? h.args.map(String) : [])];
+      const script = words.find((w) => w.endsWith(GUARD_NAME));
+      if (h.type === 'command' && script) guards.push({ command: String(h.command || ''), script });
+    }
+  }
+  if (!guards.length) {
+    problems.push(`${file} does not register ${GUARD_NAME} as a PreToolUse command hook matching Bash and Write`);
+    return problems;
+  }
+  if (strict) {
+    for (const g of guards) {
+      if (!fs.existsSync(g.script)) problems.push(`the registered guard does not exist: ${g.script}`);
+      if (g.command !== g.script && !fs.existsSync(g.command)) problems.push(`the registered hook command does not exist: ${g.command}`);
+    }
+  }
+  return problems;
+}
+
+/*
+ * A conversation's `path` is a folder relative to the home directory; '' (or
+ * none) is home itself. The server normalizes it, and this checks again anyway:
+ * a seat is a coordinator with hands, and where it stands is not something to
+ * take on trust from a queue with no auth. Lexical containment only - a
+ * symlink under home that points elsewhere is the owner's own arrangement.
+ * Returns { cwd } or { error }.
+ */
+function seatCwd(home, relPath) {
+  const base = path.resolve(home);
+  const rel = relPath == null ? '' : String(relPath);
+  if (rel.includes('\0')) return { error: 'the path contains a NUL byte' };
+  const cwd = path.resolve(base, rel.replace(/^[\\/]+/, ''));
+  if (cwd !== base && !cwd.startsWith(base + path.sep)) return { error: `the path resolves to ${cwd}, outside ${base}` };
+  return { cwd };
+}
+
+/* A missing folder, or one that is not a directory, is not a place to seat. */
+function folderProblem(cwd) {
+  try {
+    return fs.statSync(cwd).isDirectory() ? null : `${cwd} exists but is not a directory`;
+  } catch (e) {
+    return e.code === 'ENOENT' ? `${cwd} does not exist` : `${cwd} cannot be read (${e.code || e.message})`;
+  }
+}
+
+/*
+ * EVERY TAB STARTS IN ITS OWN GIT WORKTREE (owner, 2026-09-19).
+ *
+ * If a tab's folder is inside a git repo, its seat does not stand in that
+ * checkout. It stands in a worktree made for the tab:
+ *
+ *   <home>/Worktrees/<repo>/<slug>   on branch <slug>
+ *
+ * <repo> is the basename of the MAIN working tree (a folder inside a linked
+ * worktree resolves to its main repo, so worktrees never nest), <slug> is the
+ * tab title in kebab-case. The seat cwd is that worktree plus the folder's
+ * subpath inside the repo, so a tab at Projects/foo/sub runs in
+ * Worktrees/foo/<slug>/sub. Two reasons: parallel tabs in one repo stop
+ * trampling each other's working tree, and nobody's edits land in a checkout
+ * that something else serves (relay's own live checkout IS its deployment).
+ *
+ * A worktree that already exists is brought up to date first: <origin/main>
+ * (fetched) is MERGED into it - never rebase, never reset, never discard. A
+ * dirty tree or a conflicting merge is left exactly as it was (the merge is
+ * aborted) and the tab is still seated there, with a note in the tab.
+ *
+ * The chosen worktree and branch are stored in the tab record, so renaming the
+ * tab does not move its seat. Nothing here may crash autoseat: every git call is
+ * an argument array (no shell), bounded by a timeout, and non-interactive; any
+ * failure to make a worktree seats the tab in the plain folder with a note.
+ * Only run when a coordinator is (re)spawned, never per tick - and
+ * asynchronously, so a slow fetch never freezes the SSE watches or tails.
+ */
+const GIT_TIMEOUT_MS = 30000;
+const GIT_FETCH_TIMEOUT_MS = 60000;
+const GIT_ADD_TIMEOUT_MS = 120000;
+const GIT_MERGE_TIMEOUT_MS = 120000;
+/* The operations that check files out run with the repo's own hooks off:
+ * autoseat is preparing a seat, not doing the owner's git work, and a
+ * post-checkout hook (or an LFS smudge, see GIT_ENV) can take any time at all. */
+const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
+const GIT_ENV = {
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+  GIT_MERGE_AUTOEDIT: 'no',
+  GIT_LFS_SKIP_SMUDGE: '1',
+  LC_ALL: 'C',
+};
+
+function git(cwd, args, timeout) {
+  return new Promise((resolve) => {
+    try {
+      execFile('git', ['-C', cwd, ...args], {
+        timeout: timeout || GIT_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+        env: { ...process.env, ...GIT_ENV },
+      }, (err, stdout, stderr) => {
+        const out = String(stdout || '').trim();
+        const lastLine = (s) => String(s || '').trim().split('\n').filter(Boolean).pop() || '';
+        const why = err ? (err.killed ? `timed out after ${(timeout || GIT_TIMEOUT_MS) / 1000}s` : (lastLine(stderr) || lastLine(stdout) || err.message)) : '';
+        resolve({ ok: !err, out, err: why });
+      });
+    } catch (e) {
+      resolve({ ok: false, out: '', err: e.message });
+    }
+  });
+}
+
+function slugify(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+    .slice(0, 40).replace(/-+$/, '');
+}
+
+function parseWorktrees(out) {
+  return String(out || '').split(/\n\s*\n/).map((block) => {
+    const t = {};
+    for (const line of block.split('\n')) {
+      const sp = line.indexOf(' ');
+      const k = sp < 0 ? line : line.slice(0, sp);
+      const v = sp < 0 ? true : line.slice(sp + 1);
+      if (k === 'worktree') t.path = v; else if (k === 'branch') t.branch = v; else if (k === 'bare') t.bare = true;
+    }
+    return t;
+  }).filter((t) => t.path);
+}
+
+/*
+ * folder: an existing directory under home. conv: { id, title }. rec: the
+ * tab's stored record, if any. Returns
+ *   { cwd, folder, repo, worktree, branch, base, created, note }
+ * where worktree/branch/repo are null for a folder that is not in a repo.
+ */
+async function prepareSeatDir(home, folder, conv, rec) {
+  const notes = [];
+  const plain = (note) => ({
+    cwd: folder, folder, repo: null, worktree: null, branch: null, base: null, created: false,
+    note: [...notes, ...(note ? [note] : [])].join('; ') || null,
+  });
+  const inside = await git(folder, ['rev-parse', '--is-inside-work-tree']);
+  if (!inside.ok || inside.out !== 'true') return plain();
+  const prefix = (await git(folder, ['rev-parse', '--show-prefix'])).out.replace(/\/+$/, '');
+  await git(folder, ['worktree', 'prune']);
+  const listed = await git(folder, ['worktree', 'list', '--porcelain']);
+  if (!listed.ok) return plain(`no worktree: git worktree list failed (${listed.err}); seated in the folder itself`);
+  const trees = parseWorktrees(listed.out);
+  const main = trees[0];
+  if (!main || main.bare) return plain();
+  const top = main.path;
+  /* A repo AT or ABOVE home (a dotfiles repo in ~) would put every tab in a
+   * worktree of it. Only a repo strictly under home is a project. */
+  const homeAbs = path.resolve(home);
+  if (!path.resolve(top).startsWith(homeAbs + path.sep)) return plain();
+
+  const verify = async (ref) => (await git(top, ['rev-parse', '--verify', '-q', ref])).ok;
+  const hasOrigin = (await git(top, ['remote'])).out.split('\n').includes('origin');
+  let def = null;
+  if (hasOrigin) {
+    const h = await git(top, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+    if (h.ok && h.out.startsWith('origin/')) def = h.out.slice('origin/'.length);
+  }
+  if (!def) {
+    for (const b of ['main', 'master']) {
+      if (await verify(`refs/heads/${b}`) || (hasOrigin && await verify(`refs/remotes/origin/${b}`))) { def = b; break; }
+    }
+  }
+  if (!def) def = 'main';
+  if (hasOrigin) {
+    const f = await git(top, ['fetch', 'origin', def], GIT_FETCH_TIMEOUT_MS);
+    if (!f.ok) notes.push(`could not fetch origin/${def} (${f.err}), so the local copy was used`);
+  }
+  let base = null;
+  if (hasOrigin && await verify(`refs/remotes/origin/${def}`)) base = `origin/${def}`;
+  else if (await verify(`refs/heads/${def}`)) base = def;
+
+  /* The stored choice wins, so a renamed tab keeps its seat. */
+  /*
+   * WHICH BRANCH. Only the tab's OWN record may pin an existing branch or
+   * worktree. A name that merely matches is somebody else's: a tab titled
+   * "folder scopes" under Projects/relay-queue must not adopt the owner's own
+   * ~/Projects/relay-queue-folder-scopes and merge main into it. So an unpinned
+   * tab takes the first of <slug>, <slug>-2, ... that has no branch, no
+   * worktree and no directory yet - and a worktree outside
+   * <home>/Worktrees/<repo>/ is never adopted, pinned or not.
+   */
+  const root = path.join(homeAbs, 'Worktrees', path.basename(top));
+  const under = (p) => path.resolve(p).startsWith(root + path.sep);
+  const treeOf = (b) => trees.find((t) => t.branch === `refs/heads/${b}`);
+  let branch = null;
+  let preferred = null;
+  if (rec && rec.repo === top && rec.branch) {
+    const pinnedTree = treeOf(rec.branch);
+    if (pinnedTree === main) return plain(`branch ${rec.branch} is checked out in the main working tree ${top}; seated in the folder itself, no worktree`);
+    if (!pinnedTree || under(pinnedTree.path)) { branch = rec.branch; preferred = rec.worktree || null; }
+    else notes.push(`this tab's branch ${rec.branch} is now checked out at ${pinnedTree.path}, outside ${root}, so it was not adopted`);
+  }
+  if (!branch) {
+    let stem = slugify(conv.title) || slugify(conv.id) || 'tab';
+    if (new Set([def, 'main', 'master', 'head']).has(stem)) stem = `tab-${stem}`;
+    if (!(await git(top, ['check-ref-format', '--branch', stem])).ok) stem = `tab-${slugify(conv.id) || 'x'}`;
+    for (let n = 1; !branch; n++) {
+      if (n > 50) return plain(`no worktree: ${stem} and 49 numbered alternatives are all taken; seated in the folder itself`);
+      const cand = n === 1 ? stem : `${stem}-${n}`;
+      if (treeOf(cand) || await verify(`refs/heads/${cand}`) || fs.existsSync(path.join(root, cand))) continue;
+      branch = cand;
+    }
+  }
+
+  const tree = treeOf(branch);
+  let wt;
+  let created = null;
+  if (tree) {
+    wt = tree.path; /* pinned and under root, checked above */
+  } else {
+    const wanted = preferred && under(preferred) ? preferred : path.join(root, branch);
+    let dir = wanted;
+    /* Something already there that is not this branch's worktree is never
+     * clobbered: take the next free numbered name instead. */
+    for (let n = 2; fs.existsSync(dir); n++) {
+      if (n > 50) return plain(`no worktree: ${wanted} and 49 numbered alternatives are all taken; seated in the folder itself`);
+      dir = `${wanted}-${n}`;
+    }
+    try { fs.mkdirSync(path.dirname(dir), { recursive: true }); } catch (e) {
+      return plain(`could not create ${path.dirname(dir)} (${e.message}); seated in the folder itself`);
+    }
+    const hasBranch = await verify(`refs/heads/${branch}`);
+    let add;
+    if (hasBranch) add = await git(top, [...NO_HOOKS, 'worktree', 'add', dir, branch], GIT_ADD_TIMEOUT_MS);
+    else if (base) add = await git(top, [...NO_HOOKS, 'worktree', 'add', '-b', branch, dir, base], GIT_ADD_TIMEOUT_MS);
+    else return plain(`no worktree: found no ${def} branch to start one from; seated in the folder itself`);
+    if (!add.ok) {
+      const left = fs.existsSync(dir) ? ` (it left ${dir} behind; check \`git worktree list\` before removing it)` : '';
+      return plain(`could not create a worktree at ${dir} (${add.err})${left}; seated in the folder itself`);
+    }
+    wt = dir;
+    created = hasBranch ? 'existing-branch' : 'new-branch';
+  }
+
+  /* Bring it up to date - unless it was branched from base a moment ago. */
+  if (created !== 'new-branch' && base) {
+    const st = await git(wt, ['status', '--porcelain', '--untracked-files=no']);
+    if (!st.ok) {
+      notes.push(`could not read its status (${st.err}), so ${base} was NOT merged in`);
+    } else if (st.out) {
+      notes.push(`it has uncommitted changes, so ${base} was NOT merged into ${branch}; it is as it was`);
+    } else {
+      const lock = (await git(wt, ['rev-parse', '--path-format=absolute', '--git-path', 'index.lock'])).out;
+      if (lock && fs.existsSync(lock)) {
+        notes.push(`${lock} exists (another git running, or one that died), so ${base} was NOT merged in`);
+      } else {
+        const m = await git(wt, [...NO_HOOKS, 'merge', '--no-edit', base], GIT_MERGE_TIMEOUT_MS);
+        if (!m.ok) {
+          if ((await git(wt, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])).ok) await git(wt, ['merge', '--abort']);
+          /* A lock the killed merge left is reported, never deleted blindly:
+           * something else may legitimately hold it by now. */
+          const stale = lock && fs.existsSync(lock) ? `; it left ${lock} behind - remove it once no git is running there` : '';
+          notes.push(`merging ${base} into ${branch} failed (${m.err}); aborted, the worktree is as it was${stale}`);
+        }
+      }
+    }
+  }
+
+  let cwd = prefix ? path.join(wt, prefix) : wt;
+  if (!fs.existsSync(cwd)) {
+    try {
+      fs.mkdirSync(cwd, { recursive: true });
+      notes.push(`${prefix} is not on ${branch}, so it was created empty in the worktree`);
+    } catch (e) {
+      notes.push(`${prefix} is not on ${branch} and could not be created (${e.message}); seated at the worktree top`);
+      cwd = wt;
+    }
+  }
+  return { cwd, folder, repo: top, worktree: wt, branch, base, created: !!created, note: notes.join('; ') || null };
+}
 
 /*
  * The human's own clients - the surfaces HE posts from, and nothing else.
@@ -209,6 +553,10 @@ function selectSeats(opts) {
   const coordinators = opts.coordinators || new Map();
   const records = opts.records || {};
   const ignore = opts.ignore || new Set();
+  /* cid -> why: tabs whose folder is missing, already reported in the tab.
+   * Refused here rather than after choosing, so a tab that cannot be seated
+   * never holds one of this pass's cap slots against a tab that can. */
+  const unseatable = opts.unseatable || new Map();
   const now = opts.now;
   const graceMs = opts.graceMs;
   const maxConcurrent = opts.maxConcurrent == null ? 3 : opts.maxConcurrent;
@@ -241,6 +589,7 @@ function selectSeats(opts) {
     if (!conv) { no('conversation is not in the conversation list'); continue; }
     if (conv.archived) { no('conversation is archived, which IS the answer'); continue; }
     if (conv.stopAck === 'stopped') { no('conversation was deliberately stopped'); continue; }
+    if (unseatable.has(cid)) { no(unseatable.get(cid), 'folder'); continue; }
     /*
      * SEAT-UNWATCHED: the server's own answer to "is anyone actually reading
      * this conversation's SSE stream right now", combined server-side with a
@@ -386,7 +735,14 @@ function brief(o) {
     'Autoseat holds the SSE watch on this tab for you, so do NOT arm a Monitor, an SSE watcher, a poll loop or',
     'a sleep to wait for messages. Ending your turn IS how you wait.',
     '',
-    'FIRST, read `/home/hypnodroid/Projects/relay-queue/COORDINATOR.md`. It is the mechanical reference for this API',
+    ...(o.cwd ? [
+      `Your working directory is \`${o.cwd}\`: the folder this tab is scoped to. Work there.`,
+      ...(o.worktree ? [`It is inside this tab's own git worktree \`${o.worktree}\` on branch \`${o.branch}\`, made for this tab.`,
+        'Changes for this tab belong on that branch. Never merge it into the default branch yourself - that is the human\'s call.'] : []),
+      `The relay-queue repo \`${REPO}\` is loaded alongside (--add-dir) only so the relay-coordinator skill is available.`,
+      '',
+    ] : []),
+    `FIRST, read \`${path.join(REPO, 'COORDINATOR.md')}\`. It is the mechanical reference for this API`,
     'and it documents several traps that fail silently. Then, in this order:',
     '',
     `1. Take the seat ONCE: POST /conversations/${o.conversationId} with {"agent":"${o.agent}"}. Keep that same`,
@@ -504,9 +860,16 @@ function loadState(file) {
     for (const [k, v] of Object.entries(raw.tabs || {})) {
       if (v && v.sessionId && Date.parse(v.lastActiveAt || v.startedAt) >= cutoff) tabs[k] = v;
     }
-    return { dispatched: out, tabs };
+    /* Missing-folder reports already posted, { [cid]: { path, cwd, at } }.
+     * Persisted so an autoseat restart does not post the same complaint into
+     * the tab again. */
+    const missing = {};
+    for (const [k, v] of Object.entries(raw.missing || {})) {
+      if (v && Date.parse(v.at) >= cutoff) missing[k] = v;
+    }
+    return { dispatched: out, tabs, missing };
   } catch {
-    return { dispatched: {}, tabs: {} };
+    return { dispatched: {}, tabs: {}, missing: {} };
   }
 }
 
@@ -681,6 +1044,48 @@ function writeTurn(coord, text, messages) {
   } catch { /* the exit handler reports a dead pipe; nothing useful to add here */ }
 }
 
+/*
+ * AUTOSEAT SPEAKING IN A TAB. Used only for what the human must know and no
+ * coordinator can tell him - its folder is missing, or which worktree it runs
+ * in. POST /messages stores it `role: 'agent'`, so it can never dispatch
+ * anything (see HUMAN_ORIGINS). Returns whether it landed; callers remember
+ * what they said only when it did, so a relay outage retries instead of
+ * silently dropping it.
+ */
+async function tellTab(runtime, cid, text) {
+  try {
+    await postJson(runtime.cfg.queue, '/messages', { conversationId: cid, agent: 'autoseat', from: 'autoseat', text });
+    return true;
+  } catch (e) {
+    runtime.log(`TELL FAILED (${cid}): ${e.message}`);
+    return false;
+  }
+}
+
+/*
+ * Says where a freshly placed seat stands: always when a worktree was just
+ * made for the tab, and otherwise only a note that differs from the last one
+ * posted in this tab (a fetch that keeps failing is said once, not on every
+ * revive). A clean, fast update says nothing.
+ */
+async function reportSeatDir(runtime, cid, title, prep) {
+  const rec = runtime.state.tabs[cid];
+  const note = prep.note || null;
+  let text = null;
+  if (prep.created) {
+    text = `[autoseat] This tab works in its own git worktree: \`${prep.worktree}\` on branch \`${prep.branch}\``
+      + `${prep.base ? `, from ${prep.base}` : ''}. The folder you filed it under is untouched.${note ? ` Note: ${note}.` : ''}`;
+  } else if (note && (!rec || rec.seatNote !== note)) {
+    text = `[autoseat] ${prep.worktree ? `Worktree \`${prep.worktree}\`: ` : ''}${note}.`;
+  }
+  if (!note && rec && rec.seatNote) { rec.seatNote = null; save(runtime); }
+  if (!text) return;
+  if (await tellTab(runtime, cid, text)) {
+    runtime.log(`TOLD ${title} (${cid}): ${text}`);
+    if (rec) { rec.seatNote = note; save(runtime); }
+  }
+}
+
 async function releaseIfOurs(runtime, cid, agent, reason) {
   const { cfg, log } = runtime;
   try {
@@ -826,6 +1231,9 @@ function spawnCoordinator(runtime, o) {
   const resume = !!o.resumeSessionId;
   const sessionId = o.resumeSessionId || crypto.randomUUID();
   const nowIso = new Date().toISOString();
+  /* Never a default: a seat with no folder decided for it is refused, not
+   * rooted wherever this process happens to be. */
+  if (!o.cwd) { log(`DISPATCH REFUSED ${o.agent} -> ${cid}: no seat folder was resolved`); return null; }
 
   /*
    * RECORD BEFORE SPAWNING. If this process dies between the write and the
@@ -839,10 +1247,24 @@ function spawnCoordinator(runtime, o) {
    * half of that write: it is what the next autoseat reads to know a process
    * of ours still holds this tab, and which session to resume when none does.
    */
+  /* `cwd` is stored so a later revive can tell whether the tab's folder moved
+   * since this session started; a moved tab gets a fresh session there. */
   runtime.state.tabs[cid] = {
     ...(runtime.state.tabs[cid] || {}),
-    agent: o.agent, sessionId, title: o.title, pid: null, startedAt: nowIso, lastActiveAt: nowIso,
+    agent: o.agent, sessionId, title: o.title, cwd: o.cwd, pid: null, startedAt: nowIso, lastActiveAt: nowIso,
   };
+  /* Where the seat came from. `folder` is what a move is detected against
+   * every tick; repo/worktree/branch pin the tab's worktree across renames.
+   * Only a fresh placement writes them - the resume-failed respawn keeps the
+   * record's. */
+  if (o.folder !== undefined) runtime.state.tabs[cid].folder = o.folder;
+  /* The pin is only ever REPLACED by a real worktree. A placement that fell
+   * back to the plain folder (a failed fetch, a git timeout) leaves it alone,
+   * so the tab returns to the same worktree and branch once git recovers
+   * instead of being handed <slug>-2. */
+  if (o.worktree) {
+    Object.assign(runtime.state.tabs[cid], { repo: o.repo, worktree: o.worktree, branch: o.branch });
+  }
   if (!o.skipRecord) recordDelivered(runtime, o.messages, cid, o.agent);
   save(runtime);
 
@@ -851,7 +1273,9 @@ function spawnCoordinator(runtime, o) {
   const fd = fs.openSync(logFile, 'a');
   const offset = fs.fstatSync(fd).size;
 
-  const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
+  /* The guard and the skill ride on every spawn - see SEAT_SETTINGS. There is
+   * no argument list without them. */
+  const args = [...seatArgs(cfg), '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
   if (resume) args.push('--resume', sessionId); else args.push('--session-id', sessionId);
   if (cfg.model) args.push('--model', cfg.model);
 
@@ -862,7 +1286,7 @@ function spawnCoordinator(runtime, o) {
      * (a Ctrl-C, a supervisor teardown) does not kill a turn in progress. It
      * still cannot outlive autoseat by more than one turn - see shutdown().
      */
-    child = spawn(cfg.claude, args, { cwd: cfg.cwd, stdio: ['pipe', fd, fd], detached: true, windowsHide: true });
+    child = spawn(cfg.claude, args, { cwd: o.cwd, stdio: ['pipe', fd, fd], detached: true, windowsHide: true });
   } catch (e) {
     fs.closeSync(fd);
     log(`DISPATCH FAILED ${o.agent} -> ${o.conversationId}: ${e.message}`);
@@ -871,7 +1295,7 @@ function spawnCoordinator(runtime, o) {
   fs.closeSync(fd); /* the child holds its own copy */
 
   const coord = {
-    cid, agent: o.agent, title: o.title, sessionId, child, pid: child.pid,
+    cid, agent: o.agent, title: o.title, cwd: o.cwd, folder: o.folder || runtime.state.tabs[cid].folder || null, sessionId, child, pid: child.pid,
     attached: true, busy: false, closing: null, lastActiveAt: Date.now(),
     logFile, offset, resumed: resume, sawInit: false, turns: 0, okTurns: 0, lastTurn: null,
   };
@@ -890,7 +1314,7 @@ function spawnCoordinator(runtime, o) {
   startWatch(runtime, coord);
 
   log(`DISPATCH ${o.agent} -> ${o.title} (${cid}) pid ${child.pid} session ${sessionId} `
-    + `${resume ? 'RESUMED' : 'fresh'}, covering ${o.messages.length} message(s), log ${path.basename(logFile)}`);
+    + `${resume ? 'RESUMED' : 'fresh'}, covering ${o.messages.length} message(s), cwd ${o.cwd}, log ${path.basename(logFile)}`);
 
   const turn = turnText({ ...o, conversationId: cid });
   writeTurn(coord, resume ? turn : `${brief({ ...o, queue: cfg.queue })}\n\n---\n\n${turn}`, o.messages);
@@ -921,6 +1345,7 @@ const LEFT_REASONS = {
   idle: 'autoseat: idle, retired; session kept for resume',
   evicted: 'autoseat: idle, evicted to free a slot; session kept for resume',
   shutdown: 'autoseat: stopping; session kept for resume',
+  moved: 'autoseat: the tab moved to another folder; the next message starts a fresh session there',
 };
 
 async function onExit(runtime, coord, code, signal) {
@@ -957,7 +1382,7 @@ async function onExit(runtime, coord, code, signal) {
     log(`RESUME FAILED ${coord.agent} session ${coord.sessionId} (${why}); starting a FRESH session for ${coord.title} (${coord.cid})`);
     save(runtime);
     spawnCoordinator(runtime, {
-      conversationId: coord.cid, title: coord.title, agent: coord.agent,
+      conversationId: coord.cid, title: coord.title, agent: coord.agent, cwd: coord.cwd,
       messages: coord.lastTurn.messages, resumeSessionId: null, skipRecord: true,
     });
     coord.finalized = true;
@@ -1062,12 +1487,37 @@ async function tick(cfg, runtime) {
       closeCoordinator(runtime, coord, 'seat-taken', `the seat now belongs to ${conv.agent}`);
     } else if (conv && (conv.archived || conv.stopAck === 'stopped')) {
       closeCoordinator(runtime, coord, 'idle', 'the tab was archived or stopped');
+    } else if (conv && coord.folder && seatCwd(cfg.home, conv.path).cwd !== coord.folder) {
+      /* The tab was moved to another folder. This process stands in the old
+       * one, so it is retired; the next message seats a FRESH session in the
+       * new folder (see the resume decision below). */
+      closeCoordinator(runtime, coord, 'moved', `the tab moved to /${conv.path || ''}, away from ${coord.folder}`);
     } else if (Date.now() - coord.lastActiveAt >= cfg.idleMs) {
       closeCoordinator(runtime, coord, 'idle', `idle ${Math.round((Date.now() - coord.lastActiveAt) / 60000)}m (limit ${cfg.idleMs / 60000}m)`);
     }
   }
 
+  /*
+   * TABS WHOSE FOLDER IS MISSING AND ALREADY SAID SO. Still missing under the
+   * same path: refused quietly, every tick, until the folder appears or the
+   * tab moves. Resolved either way: the memory is dropped, so the waiting
+   * message is seated on this very tick and a later loss is reported afresh.
+   */
+  const unseatable = new Map();
+  for (const [cid, r] of Object.entries(runtime.state.missing)) {
+    const conv = convById.get(cid);
+    const target = conv ? seatCwd(cfg.home, conv.path) : null;
+    const problem = target && (target.error || folderProblem(target.cwd));
+    if (conv && problem && String(conv.path || '') === r.path) {
+      unseatable.set(cid, `its folder is unusable (${problem}); already reported in the tab`);
+    } else if (conv) {
+      delete runtime.state.missing[cid];
+      save(runtime);
+    }
+  }
+
   const { chosen, deliveries, considered } = selectSeats({
+    unseatable,
     tasks,
     conversations: convs,
     dispatched: new Set(Object.entries(runtime.state.dispatched).filter(([, v]) => !(v && v.requeue)).map(([k]) => k)),
@@ -1141,6 +1591,7 @@ async function tick(cfg, runtime) {
   }
   runtime.lastQuiet = null;
 
+  let seated = 0;
   for (const pick of chosen) {
     if (runtime.stopping) return;
     /*
@@ -1173,6 +1624,33 @@ async function tick(cfg, runtime) {
     if (live.agent && !liveUnwatched && !liveOwnDead) { log(`SKIP ${pick.conversationId}: ${live.agent} took the seat while we were deciding`); continue; }
     if (live.archived || live.stopAck === 'stopped') { log(`SKIP ${pick.conversationId}: closed while we were deciding`); continue; }
 
+    /*
+     * WHERE THE SEAT STANDS: the conversation's folder under home, read from
+     * this same live record. A folder that is missing (or a path that escapes
+     * home) is refused outright - NEVER a fallback to another cwd, because a
+     * coordinator standing in the wrong project is worse than none. The tab is
+     * told once per path (persisted), and the message waits until the folder
+     * exists or the tab moves.
+     */
+    const livePath = String(live.path || '');
+    const target = seatCwd(cfg.home, livePath);
+    const folderIssue = target.error || folderProblem(target.cwd);
+    if (folderIssue) {
+      const seen = runtime.state.missing[pick.conversationId];
+      if (seen && seen.path === livePath) continue;
+      if (cfg.dry) { log(`DRY-RUN would report an unusable folder for ${pick.title} (${pick.conversationId}): ${folderIssue}`); continue; }
+      const text = `[autoseat] No coordinator was started in this tab: its folder \`~/${livePath}\` is unusable - `
+        + `${folderIssue}. Nothing runs anywhere else instead. Create the folder, or move this conversation to one that `
+        + 'exists; the waiting message is picked up automatically once it resolves.';
+      if (await tellTab(runtime, pick.conversationId, text)) {
+        runtime.state.missing[pick.conversationId] = { path: livePath, cwd: target.cwd || null, at: new Date().toISOString() };
+        save(runtime);
+        log(`FOLDER MISSING ${pick.title} (${pick.conversationId}): ${folderIssue}; told the tab, not seating`);
+      } else {
+        log(`FOLDER MISSING ${pick.title} (${pick.conversationId}): ${folderIssue}; could not tell the tab, will retry`);
+      }
+      continue;
+    }
     /* The same name for the life of the tab: a resumed coordinator keeps the
      * name its own transcript already uses everywhere. */
     const title = live.title || pick.title;
@@ -1181,9 +1659,52 @@ async function tick(cfg, runtime) {
     const messages = tasks.filter((t) => coveredIds.has(t.id));
 
     if (cfg.dry) {
-      log(`DRY-RUN would dispatch ${agent} into ${pick.title} (${pick.conversationId}), covering ${messages.length} message(s)`
-        + `${pick.resumeSessionId ? `, resuming ${pick.resumeSessionId}` : ''}${pick.evict ? `, evicting ${pick.evictAgent}` : ''}`);
+      log(`DRY-RUN would dispatch ${agent} into ${pick.title} (${pick.conversationId}) from folder ${target.cwd}, covering ${messages.length} message(s)`
+        + `${pick.resumeSessionId ? `, resuming ${pick.resumeSessionId} if its cwd is unchanged` : ''}${pick.evict ? `, evicting ${pick.evictAgent}` : ''}`);
       continue;
+    }
+
+    /* The tab's own worktree, when its folder is in a git repo (see
+     * prepareSeatDir). Only here, on a (re)spawn - never per tick. */
+    let prep;
+    try {
+      prep = await prepareSeatDir(cfg.home, target.cwd, { id: pick.conversationId, title }, rec);
+    } catch (e) {
+      prep = { cwd: target.cwd, folder: target.cwd, repo: null, worktree: null, branch: null, base: null, created: false,
+        note: `worktree preparation failed (${e.message}); seated in the folder itself` };
+    }
+    if (runtime.stopping) return;
+    /* Git can take a while; ask the seat question once more before acting. */
+    if (runtime.coords.has(pick.conversationId)) { log(`SKIP ${pick.conversationId}: a coordinator of ours appeared while preparing its folder`); continue; }
+    try {
+      const again = await getJson(cfg.queue, `/conversations/${pick.conversationId}`);
+      const againUnwatched = !!(again.agentState && again.agentState.seatUnwatched);
+      const againOwnDead = !!(again.agent && rec && rec.agent === again.agent);
+      if (again.agent && !againUnwatched && !againOwnDead) { log(`SKIP ${pick.conversationId}: ${again.agent} took the seat while its folder was prepared`); continue; }
+      if (again.archived || again.stopAck === 'stopped') { log(`SKIP ${pick.conversationId}: closed while its folder was prepared`); continue; }
+    } catch (e) {
+      log(`SKIP ${pick.conversationId}: could not re-read the seat after preparing its folder (${e.message})`);
+      continue;
+    }
+    const cwd = prep.cwd;
+
+    /*
+     * RESUME ONLY WHERE THE SESSION WAS BORN. A tab moved to another folder
+     * since its session started gets a fresh session: the old transcript is
+     * about another project, and its early reads were of files that are not
+     * here. Compared on the tab's LOGICAL place (`folder`, the conversation's
+     * folder), not the resolved cwd: a worktree that fails once and falls
+     * back to the plain folder - or recovers - is the same tab in the same
+     * project, and must not cost it its context. A record with no stored
+     * folder predates folder scopes (it ran in the relay repo); it is resumed
+     * - --resume works from any cwd, and keeping the tab's context across the
+     * deploy is worth more than a clean start - and gets its folder recorded,
+     * so from now on a move is detectable.
+     */
+    let resumeSessionId = pick.resumeSessionId;
+    if (resumeSessionId && rec && rec.folder && rec.folder !== target.cwd) {
+      log(`MOVED ${pick.title} (${pick.conversationId}): session ${resumeSessionId} belongs to ${rec.folder}, the tab is now ${target.cwd}; starting FRESH`);
+      resumeSessionId = null;
     }
 
     if (pick.evict) {
@@ -1199,11 +1720,14 @@ async function tick(cfg, runtime) {
         `least recently active idle coordinator (${Math.round((Date.now() - victim.lastActiveAt) / 1000)}s), evicted at the cap to seat ${title}`);
     }
 
-    spawnCoordinator(runtime, {
-      conversationId: pick.conversationId, title, agent, messages, resumeSessionId: pick.resumeSessionId,
+    const coord = spawnCoordinator(runtime, {
+      conversationId: pick.conversationId, title, agent, messages, resumeSessionId, cwd,
+      folder: prep.folder, repo: prep.repo, worktree: prep.worktree, branch: prep.branch,
     });
+    if (coord) seated++;
+    await reportSeatDir(runtime, pick.conversationId, title, prep);
   }
-  runtime.lastOutcome = `seated ${chosen.length}, ${runtime.coords.size} live`;
+  runtime.lastOutcome = `seated ${seated} of ${chosen.length} chosen, ${runtime.coords.size} live`;
 }
 
 /*
@@ -1306,25 +1830,39 @@ function parseArgs(argv) {
     heartbeatFile: DEFAULT_HEARTBEAT,
     logDir: path.join(path.dirname(DEFAULT_STATE), 'logs'),
     claude: process.env.AUTOSEAT_CLAUDE || path.join(os.homedir(), '.local', 'bin', 'claude'),
-    // SECURITY-COUPLED, do not "tidy" this to some other checkout.
-    // Claude Code discovers .claude/skills/ and loads .claude/settings.json
-    // ONLY for the directory the session is rooted in. The coordinator
-    // protocol (skills/relay-coordinator) and the default-deny PreToolUse
-    // guard (hooks/coordinator-guard.js) both live in
-    // /home/hypnodroid/Projects/relay-queue/.claude. Point this anywhere else
-    // and the coordinator boots with no protocol AND no guard, silently:
-    // nothing errors, and default-deny quietly becomes default-allow.
+    // SECURITY-COUPLED - read before touching how a seat is spawned.
     //
-    // 2026-09-01: moved off D:\projects\relay-queue with the container's code
-    // mount. The cwd, the skill and the guard have to travel together - the D:
-    // tree's .claude/settings.json carries WINDOWS hook paths, so rooting a WSL
-    // session there would load a guard command that cannot execute, which is
-    // the default-allow case above rather than an error anyone would see.
+    // Until 2026-09-19 this was `cwd: /home/hypnodroid/Projects/relay-queue`,
+    // and the guard's safety rested on it: Claude Code loads .claude/settings.json
+    // only for the directory a session is rooted in, so rooting every seat in
+    // this repo was what registered the guard. Folder scopes ended that. A seat
+    // now stands in its conversation's folder, `home` + conversation.path (see
+    // seatCwd), and the guard is INJECTED PER SEAT, independent of cwd:
     //
-    // Also load-bearing for --resume: Claude Code stores a session's transcript
-    // under a directory derived from the cwd, so a coordinator can only be
-    // resumed from the same cwd it started in.
-    cwd: '/home/hypnodroid/Projects/relay-queue',
+    //   --settings=<REPO>/src/claude-config/settings.json  registers
+    //       <REPO>/src/claude-config/hooks/coordinator-guard.js (PreToolUse)
+    //   --add-dir=<REPO>  loads <REPO>/.claude/skills/relay-coordinator
+    //
+    // REPO is derived from this file's location (see SEAT_SETTINGS), and
+    // main() refuses to start unless verifySeatConfig() passes, so a seat
+    // without the guard cannot be spawned. The repo's own .claude/settings.json
+    // no longer registers the guard at all - by the owner's choice, a session
+    // started by hand in the repo is NOT guarded; coordinator mode is a session
+    // started by relay. Verified on Claude Code 2.1.278: a --settings hook fires
+    // and can deny in a -p session rooted in an unrelated folder, and --add-dir
+    // loads that dir's .claude/skills.
+    //
+    // --resume works from any cwd (2.1.223+, verified), so a tab's session
+    // survives a revive wherever it stands; a tab MOVED to another folder is
+    // deliberately given a fresh session instead (see the resume decision in
+    // tick()).
+    //
+    // `home` is only the base the conversation paths are relative to.
+    home: os.homedir(),
+    legacyCwd: null,
+    /* Only for tests (a worktree whose registered guard path is not live yet).
+     * Whatever it names is held to the same startup check as the default. */
+    seatSettings: SEAT_SETTINGS,
     model: '',
     ignore: new Set(),
     once: false,
@@ -1343,7 +1881,11 @@ function parseArgs(argv) {
     else if (a === '--heartbeat') cfg.heartbeatFile = next();
     else if (a === '--log-dir') cfg.logDir = next();
     else if (a === '--claude') cfg.claude = next();
-    else if (a === '--cwd') cfg.cwd = next();
+    else if (a === '--home') cfg.home = path.resolve(next());
+    else if (a === '--seat-settings') cfg.seatSettings = path.resolve(next());
+    /* Accepted and IGNORED: the seat cwd now comes from each conversation's
+     * path. The live supervisor still passes it, and must keep starting. */
+    else if (a === '--cwd') cfg.legacyCwd = next();
     else if (a === '--model') cfg.model = next();
     else if (a === '--ignore') String(next()).split(',').forEach((x) => x && cfg.ignore.add(x.trim()));
     else if (a === '--once') cfg.once = true;
@@ -1369,8 +1911,11 @@ const USAGE = `autoseat - keep one long-lived coordinator per tab that has a hum
   --heartbeat FILE     proof-of-life for the supervisor (default ${DEFAULT_HEARTBEAT})
   --log-dir DIR        per-coordinator stream-json logs
   --claude PATH        the claude executable
-  --cwd DIR            working directory for the coordinator (default /home/hypnodroid/Projects/relay-queue;
-                       this is where the coordinator skill and the guard are found - see the note in parseArgs)
+  --home DIR           the folder conversation paths are relative to; a seat runs in HOME/<path>, or in its
+                       own worktree under HOME/Worktrees when that folder is in a git repo (default ${os.homedir()})
+  --seat-settings FILE for tests: another guard registration, held to the same startup check (default ${SEAT_SETTINGS})
+  --cwd DIR            ignored (logged). A seat's cwd is its conversation's folder; the guard and the skill
+                       are injected per seat with --settings/--add-dir - see the note in parseArgs
   --model NAME         model for the coordinator (default: whatever claude is configured with)
   --ignore A,B         conversation ids never to seat
   --once               run a single pass and exit; a coordinator it started answers that one turn and exits
@@ -1384,11 +1929,24 @@ async function main() {
   if (cfg.help) { console.log(USAGE); return; }
 
   const log = (m) => console.log(`${stamp()}  ${m}`);
+
+  /* A seat without the guard must be impossible: refuse to run at all. */
+  const problems = verifySeatConfig({ strict: true, settings: cfg.seatSettings });
+  if (problems.length) {
+    for (const p of problems) log(`REFUSING TO START: ${p}`);
+    log('Every seat is spawned with --settings=' + cfg.seatSettings + ' and --add-dir=' + REPO
+      + '; without a working guard registration a coordinator runs unguarded, silently.');
+    process.exit(2);
+  }
+  if (cfg.seatSettings !== SEAT_SETTINGS) log(`SEAT SETTINGS OVERRIDDEN: ${cfg.seatSettings} instead of ${SEAT_SETTINGS} (--seat-settings is for tests)`);
+  if (cfg.legacyCwd) log(`--cwd ${cfg.legacyCwd} is ignored: each seat runs in its conversation's folder under ${cfg.home}`);
+
   const runtime = createRuntime(cfg, log);
 
   log(`autoseat watching ${cfg.queue} every ${cfg.intervalMs / 1000}s; grace ${cfg.graceMs / 1000}s, `
     + `cap ${cfg.maxConcurrent}, idle ${cfg.idleMs / 60000}m, ${Object.keys(runtime.state.dispatched).length} message(s) already dispatched, `
-    + `${Object.keys(runtime.state.tabs).length} tab session(s) remembered`
+    + `${Object.keys(runtime.state.tabs).length} tab session(s) remembered; seats run under ${cfg.home} `
+    + `with --settings=${cfg.seatSettings} --add-dir=${REPO}`
     + (cfg.dry ? ' [DRY-RUN]' : ''));
 
   if (!cfg.dry) await adoptSurvivors(runtime);
@@ -1435,14 +1993,16 @@ async function main() {
   setInterval(safeTick, cfg.intervalMs);
 }
 
-// parseArgs is exported for autoseat-selftest.js, which asserts that the
-// DEFAULT cwd is a directory actually containing the coordinator skill and the
-// guard registration. That coupling has no runtime symptom when broken, so it
-// needs a test rather than a comment. The runtime pieces are exported so the
-// selftest can drive the real lifecycle against a fake relay and a fake claude.
+// seatArgs/verifySeatConfig/SEAT_SETTINGS/REPO are exported for
+// autoseat-selftest.js, which asserts that every spawn carries a --settings
+// file that registers the guard and an --add-dir holding the coordinator skill.
+// That coupling has no runtime symptom when broken, so it needs a test rather
+// than a comment. The runtime pieces are exported so the selftest can drive the
+// real lifecycle against a fake relay and a fake claude.
 module.exports = {
   selectSeats, coveredBy, agentName, brief, turnText, writeHeartbeat, parseArgs, HUMAN_ORIGINS,
   createRuntime, tick, serialTicker, adoptSurvivors, shutdown, pidAlive, loadState,
+  seatArgs, verifySeatConfig, seatCwd, folderProblem, prepareSeatDir, slugify, REPO, SEAT_SETTINGS, SEAT_SKILL,
 };
 
 if (require.main === module) main();

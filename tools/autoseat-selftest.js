@@ -57,6 +57,8 @@ const conversations = [
   { id: 'c-archived', title: 'Archived', agent: null, archived: true, stopAck: null },
   { id: 'c-stopped', title: 'Stopped', agent: null, archived: false, stopAck: 'stopped' },
   { id: 'c-ignored', title: 'Ignored', agent: null, archived: false, stopAck: null },
+  /* Its folder is missing and the tab was already told (folder scopes). */
+  { id: 'c-nofolder', title: 'No folder', agent: null, archived: false, stopAck: null, path: 'gone' },
   { id: 'c-agentmsg', title: 'Agent chatter', agent: null, archived: false, stopAck: null },
   { id: 'c-watchdog', title: 'Watchdog poke', agent: null, archived: false, stopAck: null },
   { id: 'c-checklist', title: 'Checklist tick', agent: null, archived: false, stopAck: null },
@@ -84,6 +86,7 @@ const tasks = [
   { id: 't-archived', conversationId: 'c-archived', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-stopped', conversationId: 'c-stopped', role: 'user', from: 'web', ts: ago(120) },
   { id: 't-ignored', conversationId: 'c-ignored', role: 'user', from: 'web', ts: ago(120) },
+  { id: 't-nofolder', conversationId: 'c-nofolder', role: 'user', from: 'web', ts: ago(120) },
   // The dispatched agent's own post. Seating on this is the infinite loop.
   { id: 't-agentmsg', conversationId: 'c-agentmsg', role: 'agent', from: 'web', ts: ago(120) },
   // The watchdog nagging about the very tab we would be dispatching into.
@@ -121,6 +124,7 @@ function run(mod, over) {
     dispatched: new Set(['t-already']),
     coordinators: STILL_RUNNING,
     ignore: new Set(['c-ignored']),
+    unseatable: new Map([['c-nofolder', 'its folder is unusable (/home/u/gone does not exist); already reported in the tab']]),
     now: NOW,
     graceMs: GRACE_MS,
     maxConcurrent: 9,
@@ -210,6 +214,8 @@ function check(mod) {
     'a deliberately stopped tab was seated, or refused for the wrong reason');
   ok(refused('t-ignored') && /ignore list/.test(why['t-ignored']),
     'an ignored tab was seated, or refused for the wrong reason');
+  ok(refused('t-nofolder') && /folder is unusable/.test(why['t-nofolder']),
+    'a tab whose folder is missing was seated (or refused for the wrong reason) - it must never fall back to another cwd');
   ok(refused('t-agentmsg') && /not the human speaking/.test(why['t-agentmsg']),
     'an AGENT post triggered a dispatch - this is the infinite loop');
   /*
@@ -380,6 +386,7 @@ const MUTATIONS = [
   ['the archived test', 'if (conv.archived)', 'if (false)'],
   ['the stopped test', "if (conv.stopAck === 'stopped')", 'if (false)'],
   ['the ignore list', 'if (ignore.has(cid))', 'if (false)'],
+  ['the missing-folder refusal', 'if (unseatable.has(cid))', 'if (false)'],
   ['the grace window', 'if (!(ageMs >= graceMs))', 'if (false)'],
   ['the already-dispatched memory', 'if (dispatched.has(t.id))', 'if (false)'],
   ['the live-process guard (persisted dedupe)', 'if (coord) {', 'if (false) {'],
@@ -468,41 +475,78 @@ if (!b.includes('cid-1') || !b.includes('"by"') || /[^\x00-\x7F]/.test(b)) {
 }
 
 /*
- * The coordinator is spawned with cfg.cwd, and Claude Code discovers
- * .claude/skills/ and loads .claude/settings.json ONLY for the directory a
- * session is rooted in. So the default cwd is not a convenience - it is what
- * makes the coordinator protocol visible and what registers the default-deny
- * guard.
+ * EVERY SEAT CARRIES THE GUARD AND THE SKILL, WHEREVER IT STANDS.
  *
- * Break it and NOTHING reports an error: the coordinator boots with no manual,
- * the PreToolUse hook never fires, and default-deny silently becomes
- * default-allow. There is no log line and no failed request to notice. That is
- * exactly the class of fault that needs a test instead of a comment.
+ * Since folder scopes a seat runs in its conversation's folder, so neither the
+ * coordinator protocol nor the default-deny guard can be found by being rooted
+ * in this repo. They ride on every spawn instead: --settings=<a file that
+ * registers coordinator-guard.js> and --add-dir=<a dir holding the skill>.
  *
- * Assert against the files themselves, not against a hardcoded path string, so
- * the directory can legitimately move as long as the protocol moves with it.
+ * Break that and NOTHING reports an error: the coordinator boots with no
+ * manual, the PreToolUse hook never fires, and default-deny silently becomes
+ * default-allow. So assert against the files the arguments name, not against
+ * path strings - the lifecycle suite below then checks a real spawn got them.
  */
-const defaults = real.parseArgs([]);
-const seatCwd = defaults.cwd;
-const needed = [
-  path.join(seatCwd, '.claude', 'skills', 'relay-coordinator', 'SKILL.md'),
-  path.join(seatCwd, '.claude', 'settings.json'),
-];
-const missing = needed.filter((p) => !fs.existsSync(p));
-if (missing.length) {
-  console.log(`FAIL  coordinators would start in ${seatCwd}, which is missing:`);
-  for (const m of missing) console.log(`        ${m}`);
-  console.log('      A coordinator started there gets NO protocol and NO guard, silently.');
-  bad++;
-} else {
-  const reg = fs.readFileSync(path.join(seatCwd, '.claude', 'settings.json'), 'utf8');
-  if (!/coordinator-guard\.js/.test(reg)) {
-    console.log(`FAIL  ${seatCwd}\\.claude\\settings.json does not register coordinator-guard.js.`);
-    console.log('      Default-deny would silently become default-allow.');
+{
+  const args = real.seatArgs(real.parseArgs([]));
+  const settingsArg = args.find((x) => x.startsWith('--settings='));
+  const addDirArg = args.find((x) => x.startsWith('--add-dir='));
+  const settingsFile = settingsArg && settingsArg.slice('--settings='.length);
+  const addDir = addDirArg && addDirArg.slice('--add-dir='.length);
+  const problems = [];
+  if (!settingsFile || !fs.existsSync(settingsFile)) problems.push(`--settings names no existing file (${settingsArg})`);
+  else if (real.verifySeatConfig({ settings: settingsFile }).length) problems.push(...real.verifySeatConfig({ settings: settingsFile }));
+  if (!addDir || !fs.existsSync(path.join(addDir, '.claude', 'skills', 'relay-coordinator', 'SKILL.md'))) {
+    problems.push(`--add-dir names no dir holding .claude/skills/relay-coordinator/SKILL.md (${addDirArg})`);
+  }
+  /* The registration names the LIVE checkout's absolute guard path, which a
+   * worktree may not have yet; the file it will be must exist in THIS tree. */
+  if (settingsFile && fs.existsSync(settingsFile)) {
+    const reg = fs.readFileSync(settingsFile, 'utf8');
+    const m = /"([^"]*src\/claude-config\/hooks\/coordinator-guard\.js)"/.exec(reg);
+    if (!m) problems.push(`${settingsFile} does not name src/claude-config/hooks/coordinator-guard.js`);
+    else if (!fs.existsSync(path.join(real.REPO, 'src', 'claude-config', 'hooks', 'coordinator-guard.js'))) problems.push('the guard script is missing from this tree');
+  }
+  /* A registration that names no guard must be refused, or the check is decoration. */
+  const tmpSettings = path.join(require('node:os').tmpdir(), `autoseat-noguard-${process.pid}.json`);
+  fs.writeFileSync(tmpSettings, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash|Write', hooks: [{ type: 'command', command: 'true' }] }] } }));
+  if (!real.verifySeatConfig({ settings: tmpSettings }).length) problems.push('verifySeatConfig accepted settings that register no guard');
+  /* A folder's own `"disableAllHooks": true` switches off the --settings guard
+   * too, unless relay's file pins it false. A registration without that pin
+   * must be refused. */
+  const pinned = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  delete pinned.disableAllHooks;
+  fs.writeFileSync(tmpSettings, JSON.stringify(pinned));
+  if (!real.verifySeatConfig({ settings: tmpSettings }).some((x) => /disableAllHooks/.test(x))) {
+    problems.push('verifySeatConfig accepted a guard registration without "disableAllHooks": false');
+  }
+  fs.rmSync(tmpSettings, { force: true });
+  if (args.indexOf(settingsArg) < 0 || args.some((x) => x === '--settings' || x === '--add-dir')) {
+    problems.push('--settings/--add-dir must use the --flag=value form: both are variadic and the spaced form swallows positionals');
+  }
+  if (problems.length) {
+    for (const p of problems) console.log(`FAIL  ${p}`);
+    console.log('      A coordinator spawned like that gets NO protocol or NO guard, silently.');
     bad++;
   } else {
-    console.log('ok    the spawn cwd contains the coordinator skill AND registers the guard');
+    console.log('ok    every spawn carries --settings= (registers the guard) and --add-dir= (holds the coordinator skill)');
   }
+
+  const H = '/home/u';
+  const cases = [
+    ['', H], [undefined, H], ['Projects/foo', `${H}/Projects/foo`], ['/Projects/foo', `${H}/Projects/foo`],
+    ['../etc', null], ['Projects/../../x', null], ['a/../b', `${H}/b`],
+  ];
+  const wrong = cases.filter(([p, want]) => {
+    const r = real.seatCwd(H, p);
+    return want === null ? !r.error : r.cwd !== want;
+  });
+  if (wrong.length) { console.log(`FAIL  seatCwd mis-resolves ${JSON.stringify(wrong.map((w) => w[0]))}`); bad++; }
+  else console.log('ok    seat cwd = home + conversation path, and a path escaping home is refused');
+
+  if (real.slugify('Fix The Thing!  (v2)') !== 'fix-the-thing-v2' || real.slugify('x'.repeat(60)).length !== 40 || real.slugify('***') !== '') {
+    console.log('FAIL  slugify'); bad++;
+  } else console.log('ok    tab slugs are kebab-case ascii, at most 40 chars');
 }
 
 // ------------------------------------------------------------ lifecycle
@@ -557,7 +601,7 @@ if (resume && !fs.existsSync(sfile)) {
 }
 const sess = fs.existsSync(sfile) ? JSON.parse(fs.readFileSync(sfile, 'utf8')) : { turns: 0, agent: null, cid: null };
 console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }));
-journal({ ev: 'start' });
+journal({ ev: 'start', argv: args, cwd: process.cwd() });
 let inflight = 0; let closed = false;
 let buf = '';
 process.stdin.on('data', (d) => {
@@ -596,6 +640,7 @@ function fakeRelay() {
   const listeners = new Map();
   const subs = new Map();
   const releases = [];
+  const messages = [];
   let seq = 0;
   const conv = (id) => {
     if (!convs.has(id)) convs.set(id, { id, title: `Tab ${id}`, agent: null, archived: false, stopAck: null });
@@ -620,6 +665,11 @@ function fakeRelay() {
       push(c.id, { conversation: c });
       return json(200, view(c));
     }
+    if (req.method === 'POST' && u.pathname === '/messages') {
+      const b = JSON.parse(body || '{}');
+      messages.push(b);
+      return json(201, { id: `m${messages.length}` });
+    }
     if (req.method === 'POST' && u.pathname === '/fake/answer') {
       const b = JSON.parse(body || '{}');
       if (b.cid && b.agent && !conv(b.cid).agent) conv(b.cid).agent = b.agent; /* the coordinator takes its seat */
@@ -640,7 +690,7 @@ function fakeRelay() {
     return json(404, {});
   });
   return {
-    server, convs, tasks, listeners, releases, conv,
+    server, convs, tasks, listeners, releases, messages, conv,
     say(cid, text, extra) {
       const t = { id: `t${++seq}`, conversationId: cid, role: 'user', from: 'web', instruction: text,
         ts: new Date(Date.now() - 60000).toISOString(), status: 'pending', ...extra };
@@ -676,9 +726,15 @@ async function lifecycleSuite() {
   process.env.FAKE_STORE = store;
   process.env.FAKE_RELAY = queue;
 
+  /* A temp HOME: every seat folder and <home>/Worktrees live under it, so
+   * nothing here can touch the real ~/Projects. */
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home);
+  /* `--cwd` is still passed, as the live supervisor does: it must be accepted
+   * (and ignored), never an error. */
   const argsFor = (name, extra) => ['--queue', queue, '--state', path.join(dir, `${name}.json`),
     '--heartbeat', path.join(dir, `${name}.hb`), '--log-dir', path.join(dir, 'logs'), '--claude', fake,
-    '--cwd', dir, '--grace', '0', '--interval', '1', ...(extra || [])];
+    '--cwd', dir, '--home', home, '--grace', '0', '--interval', '1', ...(extra || [])];
   const inProcess = (name, extra) => {
     const cfg = real.parseArgs(argsFor(name, extra));
     const lines = [];
@@ -696,6 +752,12 @@ async function lifecycleSuite() {
     await A.tick();
     const c = A.runtime.coords.get('tabA');
     assert(c && c.pid, 'no coordinator was spawned for a message in an empty tab');
+    const start = await waitFor('fake claude start', () => journalOf(store).find((e) => e.ev === 'start' && e.pid === c.pid));
+    const sArg = start.argv.find((x) => x.startsWith('--settings='));
+    const dArg = start.argv.find((x) => x.startsWith('--add-dir='));
+    assert(sArg && real.verifySeatConfig({ settings: sArg.slice(11) }).length === 0, `the spawn carried no guard registration: ${start.argv.join(' ')}`);
+    assert(dArg && fs.existsSync(path.join(dArg.slice(10), '.claude', 'skills', 'relay-coordinator', 'SKILL.md')), `the spawn carried no skill dir: ${start.argv.join(' ')}`);
+    assert(start.cwd === fs.realpathSync(home), `a tab with no path must run in home ${home}, ran in ${start.cwd}`);
     await waitFor('turn 1 result', () => c.turns === 1);
     assert(relay.convs.get('tabA').agent === c.agent, 'the fake coordinator did not take its seat');
     await waitFor('autoseat SSE listener on tabA', () => relay.listeners.get('tabA') === 1);
@@ -785,8 +847,20 @@ async function lifecycleSuite() {
   // ---- 6. autoseat restart: no double seat, mid-turn left alone, then resume
   await test('an autoseat RESTART adopts a mid-turn coordinator instead of seating twice, then resumes it', async () => {
     const cli = path.join(__dirname, 'autoseat.js');
+    /*
+     * The daemon refuses to start unless every file its guard registration
+     * names exists. The checked-in one names the LIVE checkout's guard, which a
+     * worktree may not have yet, so the subprocess gets an equivalent one that
+     * registers THIS tree's guard - held to the same strict check.
+     */
+    const seatSettings = path.join(dir, 'seat-settings.json');
+    fs.writeFileSync(seatSettings, JSON.stringify({ disableAllHooks: false, hooks: { PreToolUse: [{
+      matcher: 'Bash|PowerShell|Write|Edit|NotebookEdit',
+      hooks: [{ type: 'command', command: process.execPath,
+        args: [path.join(real.REPO, 'src', 'claude-config', 'hooks', 'coordinator-guard.js')], timeout: 15 }],
+    }] } }));
     const startAutoseat = () => {
-      const p = spawn(process.execPath, [cli, ...argsFor('r')], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const p = spawn(process.execPath, [cli, ...argsFor('r', ['--seat-settings', seatSettings])], { stdio: ['ignore', 'pipe', 'pipe'] });
       p.out = '';
       p.stdout.on('data', (d) => { p.out += d; });
       p.stderr.on('data', (d) => { p.out += d; });
@@ -806,6 +880,7 @@ async function lifecycleSuite() {
     relay.say('tabS', 'another while it is busy');
     const two = startAutoseat();
     await waitFor('adoption', () => new RegExp(`ADOPTED \\S+ pid ${pid} `).test(two.out), 8000);
+    assert(/--cwd \S+ is ignored/.test(two.out), 'the supervisor\'s --cwd was not accepted-and-ignored with a log line');
     await sleep(1200);
     assert(!/DISPATCH/.test(two.out), `the restarted autoseat seated a tab whose coordinator was still alive:\n${two.out}`);
     await waitFor('orphan finished its turn and exited', () => journalOf(store).some((e) => e.ev === 'result' && e.pid === pid), 8000);
@@ -823,6 +898,216 @@ async function lifecycleSuite() {
     assert(relay.releases.some((r) => r.cid === 'tabS' && /stopping/.test(r.reason || '')), 'the idle seat was not released on SIGTERM');
     assert(!pidAlive(Number(resumed[1])), 'the idle coordinator was left running after SIGTERM');
   });
+
+  // ---- 7. folder scopes: plain folder, missing folder, escape, move
+  const cwdOf = async (coord) => (await waitFor(`start of ${coord.agent}`,
+    () => journalOf(store).find((e) => e.ev === 'start' && e.pid === coord.pid))).cwd;
+  const tabMsgs = (cid) => relay.messages.filter((m) => m.conversationId === cid);
+  const killAndWait = async (R, cid) => {
+    const c = R.runtime.coords.get(cid);
+    process.kill(c.pid, 'SIGKILL');
+    await waitFor(`exit of ${cid}`, () => !R.runtime.coords.has(cid) && c.finalized);
+  };
+  const F = inProcess('f');
+  await test('a tab with a path runs in HOME/<path>; a non-repo folder gets no worktree and no message', async () => {
+    fs.mkdirSync(path.join(home, 'plain'));
+    relay.conv('tabP').path = 'plain';
+    relay.say('tabP', 'hi');
+    await F.tick();
+    const c = F.runtime.coords.get('tabP');
+    assert(c, 'no coordinator for a tab whose folder exists');
+    assert(await cwdOf(c) === path.join(home, 'plain'), `ran in ${await cwdOf(c)}`);
+    assert(F.runtime.state.tabs.tabP.cwd === path.join(home, 'plain'), 'the tab record does not store its cwd');
+    assert(tabMsgs('tabP').length === 0, 'a plain folder should say nothing');
+    await waitFor('tabP turn', () => c.turns === 1);
+  });
+  await test('a MISSING folder spawns nothing, is reported ONCE (across a restart), and seats once created', async () => {
+    relay.conv('tabM').path = 'nope/deeper';
+    relay.say('tabM', 'where am i');
+    await F.tick();
+    await F.tick();
+    assert(!F.runtime.coords.has('tabM'), 'a coordinator was spawned for a missing folder');
+    assert(tabMsgs('tabM').length === 1 && /does not exist/.test(tabMsgs('tabM')[0].text), `expected 1 report, got ${JSON.stringify(tabMsgs('tabM'))}`);
+    const F2 = inProcess('f'); /* same state file: a restarted autoseat */
+    await F2.tick();
+    assert(!F2.runtime.coords.has('tabM') && tabMsgs('tabM').length === 1, 'a restart re-reported the missing folder or seated it');
+    await real.shutdown(F2.runtime, 'test', { noExit: true });
+    F.runtime.state = real.loadState(F.cfg.stateFile);
+    fs.mkdirSync(path.join(home, 'nope', 'deeper'), { recursive: true });
+    await F.tick();
+    const c = F.runtime.coords.get('tabM');
+    assert(c && await cwdOf(c) === path.join(home, 'nope', 'deeper'), 'not seated in the folder once it existed');
+    await waitFor('tabM turn', () => c.turns === 1);
+  });
+  await test('a path that escapes HOME is refused and reported, never spawned', async () => {
+    relay.conv('tabX').path = '../outside';
+    const t = relay.say('tabX', 'escape');
+    await F.tick();
+    assert(!F.runtime.coords.has('tabX') && tabMsgs('tabX').length === 1 && /outside/.test(tabMsgs('tabX')[0].text),
+      `escape not refused/reported: ${JSON.stringify(tabMsgs('tabX'))}`);
+    t.status = 'done'; /* nothing will ever answer it */
+  });
+  await test('a tab MOVED to another folder retires its coordinator and starts a FRESH session there', async () => {
+    const old = F.runtime.coords.get('tabP');
+    const oldSid = old.sessionId;
+    fs.mkdirSync(path.join(home, 'plain2'));
+    relay.conv('tabP').path = 'plain2';
+    await F.tick();
+    assert(old.closing === 'moved', `the coordinator in the old folder was not retired (closing=${old.closing})`);
+    await waitFor('old exit', () => old.finalized);
+    relay.say('tabP', 'moved');
+    await F.tick();
+    const c = F.runtime.coords.get('tabP');
+    assert(c && !c.resumed && c.sessionId !== oldSid, `expected a fresh session, got resumed=${c && c.resumed}`);
+    assert(await cwdOf(c) === path.join(home, 'plain2'), 'the fresh session is not in the new folder');
+    assert(count(F.lines, /^MOVED /) === 1, 'the fresh start was not logged as MOVED');
+    await waitFor('tabP turn', () => c.turns === 1);
+  });
+
+  // ---- 8. every tab in a git repo starts in its own worktree
+  const gitEnv = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t',
+    GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+  Object.assign(process.env, gitEnv); /* autoseat's own git calls run in this process */
+  const { execFileSync } = require('node:child_process');
+  const g = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const origin = path.join(dir, 'origin.git');
+  const pusher = path.join(dir, 'pusher');
+  const repo = path.join(home, 'Projects', 'foo');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin]);
+  execFileSync('git', ['clone', '-q', origin, pusher], { stdio: 'ignore' });
+  fs.mkdirSync(path.join(pusher, 'sub'));
+  fs.writeFileSync(path.join(pusher, 'a.txt'), 'one\n');
+  fs.writeFileSync(path.join(pusher, 'sub', 'b.txt'), 'b\n');
+  g(pusher, 'add', '.'); g(pusher, 'commit', '-qm', 'c1'); g(pusher, 'push', '-q', 'origin', 'HEAD:main');
+  fs.mkdirSync(path.dirname(repo), { recursive: true });
+  execFileSync('git', ['clone', '-q', origin, repo], { stdio: 'ignore' });
+  const push = (file, text, msg) => {
+    fs.writeFileSync(path.join(pusher, file), text);
+    g(pusher, 'add', file); g(pusher, 'commit', '-qm', msg); g(pusher, 'push', '-q', 'origin', 'HEAD:main');
+    return g(pusher, 'rev-parse', 'HEAD');
+  };
+  const wt = path.join(home, 'Worktrees', 'foo', 'fix-the-thing');
+  const isAncestor = (sha, cwd) => { try { g(cwd, 'merge-base', '--is-ancestor', sha, 'HEAD'); return true; } catch { return false; } };
+
+  await test('a tab in a repo gets <home>/Worktrees/<repo>/<slug> on branch <slug>, from origin/main; the folder is untouched', async () => {
+    const c2 = push('c.txt', 'fetched\n', 'c2'); /* only on origin: the clone must FETCH to see it */
+    const cv = relay.conv('tabG'); cv.path = 'Projects/foo'; cv.title = 'Fix The Thing!';
+    relay.say('tabG', 'work');
+    await F.tick();
+    const c = F.runtime.coords.get('tabG');
+    assert(c, 'no coordinator for a repo tab');
+    assert(await cwdOf(c) === wt, `ran in ${await cwdOf(c)}, expected ${wt}`);
+    assert(g(wt, 'branch', '--show-current') === 'fix-the-thing', 'worktree is not on branch fix-the-thing');
+    assert(g(wt, 'rev-parse', 'HEAD') === c2, 'worktree does not start from the FETCHED origin/main');
+    assert(g(repo, 'branch', '--show-current') === 'main' && g(repo, 'status', '--porcelain') === '', 'the original checkout was touched');
+    const rec = F.runtime.state.tabs.tabG;
+    assert(rec.worktree === wt && rec.branch === 'fix-the-thing' && rec.cwd === wt, `tab record ${JSON.stringify(rec)}`);
+    assert(tabMsgs('tabG').length === 1 && /own git worktree/.test(tabMsgs('tabG')[0].text), `expected a worktree message, got ${JSON.stringify(tabMsgs('tabG'))}`);
+    await waitFor('tabG turn', () => c.turns === 1);
+  });
+  await test('a revive REUSES the worktree after a rename, merging new origin/main in first, silently', async () => {
+    const c3 = push('a.txt', 'two\n', 'c3');
+    relay.conv('tabG').title = 'Renamed Completely';
+    await killAndWait(F, 'tabG');
+    relay.say('tabG', 'again');
+    await F.tick();
+    const c = F.runtime.coords.get('tabG');
+    assert(c && c.resumed, 'the same cwd should RESUME the session');
+    assert(await cwdOf(c) === wt, `a rename moved the seat to ${await cwdOf(c)}`);
+    assert(isAncestor(c3, wt), 'origin/main was not merged into the existing worktree');
+    assert(!fs.existsSync(path.join(home, 'Worktrees', 'foo', 'renamed-completely')), 'a rename made a second worktree');
+    assert(tabMsgs('tabG').length === 1, `a clean update should say nothing, got ${JSON.stringify(tabMsgs('tabG').slice(1))}`);
+    await waitFor('tabG turn', () => c.turns === 1);
+  });
+  await test('a DIRTY worktree is not merged, keeps its changes, is still seated, and the tab is told', async () => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'local edit\n');
+    const c4 = push('c.txt', 'four\n', 'c4');
+    await killAndWait(F, 'tabG');
+    relay.say('tabG', 'dirty');
+    await F.tick();
+    const c = F.runtime.coords.get('tabG');
+    assert(c && await cwdOf(c) === wt, 'a dirty worktree was not seated');
+    assert(!isAncestor(c4, wt), 'a dirty worktree was merged into');
+    assert(fs.readFileSync(path.join(wt, 'a.txt'), 'utf8') === 'local edit\n', 'the uncommitted change was lost');
+    const all = tabMsgs('tabG');
+    const last = all[all.length - 1];
+    assert(all.length === 2 && /uncommitted/.test(last.text), `expected an uncommitted-changes note, got ${JSON.stringify(last)}`);
+    await waitFor('tabG turn', () => c.turns === 1);
+  });
+  await test('a tab at a SUBFOLDER of a repo runs at that subpath inside its worktree', async () => {
+    const cv = relay.conv('tabSub'); cv.path = 'Projects/foo/sub'; cv.title = 'Sub Work';
+    relay.say('tabSub', 'sub');
+    await F.tick();
+    const c = F.runtime.coords.get('tabSub');
+    const want = path.join(home, 'Worktrees', 'foo', 'sub-work', 'sub');
+    assert(c && await cwdOf(c) === want, `ran in ${c && await cwdOf(c)}, expected ${want}`);
+    await waitFor('tabSub turn', () => c.turns === 1);
+  });
+  await test('a target dir already taken by something else is never clobbered: a numbered sibling is used', async () => {
+    const taken = path.join(home, 'Worktrees', 'foo', 'collide');
+    fs.mkdirSync(taken, { recursive: true });
+    fs.writeFileSync(path.join(taken, 'keep.txt'), 'mine\n');
+    const cv = relay.conv('tabC'); cv.path = 'Projects/foo'; cv.title = 'Collide';
+    relay.say('tabC', 'collide');
+    await F.tick();
+    const c = F.runtime.coords.get('tabC');
+    assert(c && await cwdOf(c) === `${taken}-2`, `ran in ${c && await cwdOf(c)}`);
+    assert(fs.readFileSync(path.join(taken, 'keep.txt'), 'utf8') === 'mine\n', 'the existing dir was touched');
+    await waitFor('tabC turn', () => c.turns === 1);
+  });
+  await test('two tabs with the SAME title get distinct worktrees and branches', async () => {
+    const cv = relay.conv('tabG2'); cv.path = 'Projects/foo'; cv.title = 'Fix The Thing!';
+    relay.say('tabG2', 'twin');
+    await F.tick();
+    const c = F.runtime.coords.get('tabG2');
+    const want = path.join(home, 'Worktrees', 'foo', 'fix-the-thing-2');
+    assert(c && await cwdOf(c) === want, `ran in ${c && await cwdOf(c)}, expected ${want}`);
+    assert(g(want, 'branch', '--show-current') === 'fix-the-thing-2', 'the twin is not on its own branch');
+    await waitFor('tabG2 turn', () => c.turns === 1);
+  });
+  await test('an unrelated branch or worktree that merely shares the slug is NEVER adopted or merged into', async () => {
+    /* The owner's own worktree, outside <home>/Worktrees - the relay-queue-folder-scopes case. */
+    const theirs = path.join(home, 'Projects', 'foo-owners-work');
+    g(repo, 'worktree', 'add', '-q', '-b', 'owners-work', theirs, 'HEAD');
+    const theirHead = g(theirs, 'rev-parse', 'HEAD');
+    g(repo, 'branch', 'plain-branch', 'HEAD');
+    const plainHead = g(repo, 'rev-parse', 'plain-branch');
+    const a = relay.conv('tabO'); a.path = 'Projects/foo'; a.title = 'Owners Work';
+    const b = relay.conv('tabB'); b.path = 'Projects/foo'; b.title = 'Plain Branch';
+    relay.say('tabO', 'o');
+    relay.say('tabB', 'b');
+    await F.tick();
+    const co = F.runtime.coords.get('tabO');
+    const cb = F.runtime.coords.get('tabB');
+    assert(co && await cwdOf(co) === path.join(home, 'Worktrees', 'foo', 'owners-work-2'), `tabO ran in ${co && await cwdOf(co)}`);
+    assert(cb && await cwdOf(cb) === path.join(home, 'Worktrees', 'foo', 'plain-branch-2'), `tabB ran in ${cb && await cwdOf(cb)}`);
+    assert(g(theirs, 'rev-parse', 'HEAD') === theirHead && g(repo, 'rev-parse', 'plain-branch') === plainHead,
+      'an unrelated branch was merged into');
+    await waitFor('tabO/tabB turns', () => co.turns === 1 && cb.turns === 1);
+  });
+  await test('a worktree that fails once falls back to the folder, KEEPS the session and the pin, and returns', async () => {
+    const rec = F.runtime.state.tabs.tabG;
+    const sid = rec.sessionId;
+    await killAndWait(F, 'tabG');
+    const saved = process.env.PATH;
+    process.env.PATH = '/nonexistent'; /* git cannot be found: every git call fails */
+    try {
+      relay.say('tabG', 'no git');
+      await F.tick();
+    } finally { process.env.PATH = saved; }
+    let c = F.runtime.coords.get('tabG');
+    assert(c && c.resumed && c.sessionId === sid, 'a transient fallback cost the tab its session');
+    assert(await cwdOf(c) === repo, `fallback ran in ${await cwdOf(c)}, expected the plain folder`);
+    assert(F.runtime.state.tabs.tabG.worktree === wt && F.runtime.state.tabs.tabG.branch === 'fix-the-thing', 'the fallback wiped the worktree pin');
+    await waitFor('tabG turn', () => c.turns === 1);
+    await killAndWait(F, 'tabG');
+    relay.say('tabG', 'git is back');
+    await F.tick();
+    c = F.runtime.coords.get('tabG');
+    assert(c && c.resumed && c.sessionId === sid && await cwdOf(c) === wt, 'did not return to its own worktree, resumed');
+    await waitFor('tabG turn', () => c.turns === 1);
+  });
+  await real.shutdown(F.runtime, 'test', { noExit: true });
 
   relay.close();
   await sleep(300); /* let the last coordinators' exits land before their store goes */

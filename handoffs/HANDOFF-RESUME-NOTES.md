@@ -1,7 +1,7 @@
 # HANDOFF resume - work log (agent `HandoffResume`, 2026-08-29)
 
 Operational log, appended as each task closes, so a crash on this box does not
-lose the thread. Terse on purpose. The narrative lives in `HANDOFF.md`.
+lose the thread. Terse on purpose. The narrative lives in `handoffs/HANDOFF-2026-08-28.md` (was the root `HANDOFF.md`).
 
 ## Task 1 - autoseat supervision (HANDOFF 3.2 / 3.5) - DONE
 

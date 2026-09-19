@@ -1,22 +1,4 @@
 {
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|PowerShell|Write|Edit|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/hypnodroid/.local/share/fnm/aliases/default/bin/node",
-            "args": [
-              "/home/hypnodroid/Projects/relay-queue/.claude/hooks/coordinator-guard.js"
-            ],
-            "timeout": 15,
-            "statusMessage": "Coordinator guard"
-          }
-        ]
-      }
-    ]
-  },
   "permissions": {
     "allow": [
       "mcp__claude_ai_mindmeld",

@@ -287,7 +287,16 @@ function handleShell(event) {
  * has changes nothing and repaints nothing.
  */
 function dataKey(url) {
-  if (url.pathname === '/conversations') return '/__relay-offline/conversations';
+  /*
+   * One list per folder scope, because a scoped page asks for `?path=` and a
+   * saved list of a different scope would show him the wrong tabs offline.
+   * The root keeps the original key, so an unscoped page reads the copy it
+   * always did.
+   */
+  if (url.pathname === '/conversations') {
+    const scope = url.searchParams.get('path') || '';
+    return '/__relay-offline/conversations' + (scope && scope !== '/' ? '?path=' + encodeURIComponent(scope) : '');
+  }
   const conv = url.searchParams.get('conversation') || url.searchParams.get('conversationId') || '';
   return '/__relay-offline/thread?conversation=' + encodeURIComponent(conv);
 }
@@ -433,11 +442,18 @@ self.addEventListener('fetch', function (event) {
   if (url.origin !== self.location.origin) return;
 
   /*
-   * Only the root is the app. Any other path is a 404 from the server, and
-   * answering one with the shell would turn a plain mistake into a page that
-   * looks like it loaded and then does nothing.
+   * Every navigation is the app. `/Projects/relay-queue` is the page scoped to
+   * that folder, and the server answers a browser navigation to any path its
+   * router does not own with the same shell `/` gets - so a deep link must get
+   * the saved shell offline too, not the browser's error page.
+   *
+   * This cannot hide a real answer: handleShell is network-first and hands
+   * back exactly what the network said, so a navigation to an API URL still
+   * shows its JSON, and only a response stamped as the shell is ever saved.
+   * The one cost is offline, where a navigation to an API URL shows the app
+   * (scoped to a folder of that name) instead of an error.
    */
-  if (req.mode === 'navigate' && url.pathname === '/') { event.respondWith(handleShell(event)); return; }
+  if (req.mode === 'navigate') { event.respondWith(handleShell(event)); return; }
   if (url.pathname === '/thread' || url.pathname === '/conversations') {
     event.respondWith(handleData(event, url));
     return;

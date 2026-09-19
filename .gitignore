@@ -24,26 +24,25 @@ Thumbs.db
 .env.*
 docker-compose.override.yml
 
-# Agent-harness config. As of 2026-08-29 this repo is the HOME of the
-# coordinator protocol (.claude/skills/relay-coordinator/) and the default-deny
-# security guard (.claude/hooks/coordinator-guard.js), so those two must be
-# VERSIONED — this used to be a blanket `.claude/` exclusion, which would have
-# silently left the whole protocol untracked after the move.
+# Agent-harness config is split in two, and both halves are VERSIONED:
+#  - .claude/ is this PROJECT's config: the coordinator protocol skill
+#    (.claude/skills/relay-coordinator/) and the permissions in settings.json.
+#  - src/claude-config/ is RELAY's config, injected into every seat by
+#    tools/autoseat.js via --settings: the default-deny guard registration
+#    (settings.json) and the guard itself (hooks/coordinator-guard.js).
 #
-# Everything else under .claude/ is still machine-local and never published:
-# permission allowlists accrete literal command lines from real sessions, and
+# Everything else is machine-local and never published: *.local.json
+# allowlists accrete literal command lines from real sessions, and
 # coordinator-violations.log records whatever an agent was sending when it was
 # blocked, including personal messages.
 .claude/*
-!.claude/hooks/
 !.claude/skills/
 !.claude/settings.json
-!.claude/settings.json.bak-pre-default-deny
-
-# ...but re-exclude local state inside the directories re-included above.
 .claude/**/*.log
 .claude/**/*.local.json
-.claude/.guard-mainthread-seen
+src/claude-config/**/*.log
+src/claude-config/**/*.local.json
+src/claude-config/.guard-mainthread-seen
 
 # Build output of the API description. `openapi.json` is the AUTHORED source of
 # truth and stays committed; `openapi.yaml` is derived from it by openapi-yaml.js,

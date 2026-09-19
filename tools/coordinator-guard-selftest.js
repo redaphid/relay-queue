@@ -42,7 +42,7 @@
  * evidence. Point it at the guard as it was before the loosening and it must
  * report failures - the allow half is precisely what that version refused:
  *
- *   git show HEAD:.claude/hooks/coordinator-guard.js > /tmp/old-guard.js
+ *   git show HEAD:src/claude-config/hooks/coordinator-guard.js > /tmp/old-guard.js
  *   COORDINATOR_GUARD=/tmp/old-guard.js node tools/coordinator-guard-selftest.js
  *
  * The guard is run from a THROWAWAY COPY. It appends every denial to
@@ -61,8 +61,8 @@ const path = require('node:path');
 
 const REPO = path.resolve(__dirname, '..');
 const SOURCE = process.env.COORDINATOR_GUARD
-  || path.join(REPO, '.claude', 'hooks', 'coordinator-guard.js');
-const REAL_LOG = path.join(REPO, '.claude', 'coordinator-violations.log');
+  || path.join(REPO, 'src', 'claude-config', 'hooks', 'coordinator-guard.js');
+const REAL_LOG = path.join(REPO, 'src', 'claude-config', 'coordinator-violations.log');
 
 if (!fs.existsSync(SOURCE)) {
   console.error(`guard not found: ${SOURCE}`);
