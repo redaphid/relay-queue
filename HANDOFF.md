@@ -36,7 +36,15 @@ before running one.
 
 ## STATUS
 
-Implementation: **not started.** The previous session read the code, ran part
+**2026-09-19 (second session): items 1-6 implemented, reviewed, merged and
+deployed** (see the PR). Added beyond the spec: per-tab worktrees under
+`~/Worktrees/<repo>/<tab-slug>`, `GET /folders` + drawer folder drilldown,
+`disableAllHooks: false` pinned in the seat settings. **Remaining: the data
+migration below (needs the owner's go-ahead - it archives most tabs), the
+`D:\Projects\CLAUDE.md` update, and the open guard live-write exemption
+question.** The table below is the original plan, kept for reference.
+
+Implementation (original note): **not started.** The previous session read the code, ran part
 of the empirical checks, and was stopped by the owner to hand off. No code on
 this branch differs from `origin/main` (c0adfd3) except these docs.
 
@@ -55,6 +63,33 @@ Selftests run so far: **none.**
 
 Known broken bits: none in code (nothing changed). The empirical probe script
 had a bug (below).
+
+## Update 2026-09-19 (second session) - supersedes parts of the spec
+
+- **Layout decision (owner):** project config vs relay config are separate.
+  - `.claude/` = this project's config: `skills/relay-coordinator/` and
+    `settings.json` with ONLY `permissions` (no `hooks` - the owner does not
+    want the guard on Claudes started in this directory).
+  - `src/claude-config/` = relay's seat config: `settings.json` (ONLY the guard
+    registration, absolute path
+    `/home/hypnodroid/Projects/relay-queue/src/claude-config/hooks/coordinator-guard.js`)
+    and `hooks/coordinator-guard.js`. Replaces the spec's `.claude/seat-settings.json`.
+  - Seats: `--settings <repo>/src/claude-config/settings.json` + `--add-dir <repo>`.
+- Done in the working tree (uncommitted): files moved, `.gitignore` rewritten,
+  `tools/coordinator-guard-selftest.js` repointed - it passes. The `.bak` files
+  were dropped (the owner deleted them; git history has them).
+- **Open, needs the owner:** the guard's live-write exemption (`LIVE_CLAUDE`,
+  ~line 992) covers only `<live>/.claude`. The guard now lives in
+  `src/claude-config`, so fixing it from inside a subagent is fenced. Widening
+  the exemption is a security loosening - recommend, do not apply.
+- Empirical checks re-run on **2.1.278**: (a) PASS, and a `--settings` hook
+  exiting 2 blocks the call; (b) identical hook in `--settings` and project
+  settings runs ONCE; (c) PASS - `--add-dir` loads `<dir>/.claude/skills`
+  (control without it did not). Also: `--plugin-dir <dir>` loads `<dir>/skills`
+  with no manifest, namespaced `<dirname>:<skill>` - not used.
+- **Deploy coupling is now stricter:** after merge the live
+  `.claude/settings.json` has no hooks and the old guard path is gone, so
+  autoseat's `--settings` change must be in the same commit.
 
 ## Empirical checks (Claude Code 2.1.275 in WSL `survivor`)
 

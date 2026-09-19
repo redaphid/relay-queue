@@ -3,7 +3,7 @@
 **This manual is now a Claude Code skill. Read it before you do anything else.**
 
 ```
-D:\projects\relay-queue\.claude\skills\relay-coordinator\SKILL.md
+/home/hypnodroid/Projects/relay-queue/.claude/skills/relay-coordinator/SKILL.md
 ```
 
 Open that file with your `Read` tool right now. `Read`, `Grep` and `Glob` are
@@ -35,26 +35,24 @@ depend on skill discovery working.
 
 ## Where the protocol and the guard now live
 
-As of **2026-08-29** both live in this repository, under `.claude/`:
+Both live in this repository (as of **2026-09-19**, split project vs relay config):
 
 - `.claude/skills/relay-coordinator/` — the manual (a Claude Code skill).
-- `.claude/hooks/coordinator-guard.js` — the default-deny PreToolUse guard.
-- `.claude/settings.json` — registers that guard.
+- `src/claude-config/hooks/coordinator-guard.js` — the default-deny PreToolUse guard.
+- `src/claude-config/settings.json` — registers that guard (and pins
+  `disableAllHooks: false`).
 
-They were moved here from `D:\projects\.claude` so they are versioned with the
-server they describe.
-
-**This is coupled to `tools/autoseat.js`.** Autoseat spawns every coordinator
-with `cwd: D:\projects\relay-queue`, and Claude Code discovers `.claude/skills/`
-and loads `.claude/settings.json` only for the directory a session is rooted in.
-Change that cwd and the coordinator boots with **no protocol and no guard** —
-nothing errors, and the guard's default-deny silently becomes default-allow.
-The cwd, the skill and the guard registration move together or not at all.
+**Seats get both regardless of cwd.** `tools/autoseat.js` spawns every
+coordinator in its conversation's folder (or that tab's worktree) with
+`--settings=<repo>/src/claude-config/settings.json` and `--add-dir=<repo>`, and
+refuses to start if either is missing. This repo's own `.claude/settings.json`
+registers no hooks: a session started here by hand is not guarded. See
+CLAUDE.md "THE GUARD".
 
 ## Verifying the split is intact
 
 ```sh
-node D:/projects/relay-queue/.claude/skills/relay-coordinator/validate-routing.js
+node /home/hypnodroid/Projects/relay-queue/.claude/skills/relay-coordinator/validate-routing.js
 ```
 
 Fails if a routing-table row points at a file that does not exist, if a

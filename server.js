@@ -82,6 +82,12 @@ const MAX_LEFT_REASON = 120;
  * past, so the cap never silently eats a boundary he was looking for.
  */
 const MAX_CONTEXT_MARKS = 100;
+/*
+ * A conversation's folder, home-relative (see normaliseConvPath). Linux caps a
+ * whole path at 4096 bytes; this is far below that and far above any folder
+ * anyone will actually type, and it rides on every /conversations read.
+ */
+const MAX_CONV_PATH = 1024;
 
 // --- speech to text (POST /stt) -------------------------------------------
 // Audio is relayed to a Wyoming ASR server (wyoming-whisper) over a plain TCP
@@ -403,6 +409,16 @@ function newConversation(id, title, agent) {
     title,
     agent: agent || null, // who is meant to answer here; set and read by the agent side
     /*
+     * THE FOLDER THIS CONVERSATION BELONGS TO, relative to the owner's home.
+     * `""` is the home root, which is where every conversation written before
+     * folder scopes lives. The page scopes its drawer by it (`/Projects/x` in
+     * the address bar lists this folder and everything under it) and autoseat
+     * runs the seat's coordinator with it as cwd. This server never resolves it
+     * to a directory and never touches the filesystem with it: it is a label
+     * here, normalised by normaliseConvPath and nothing more.
+     */
+    path: '',
+    /*
      * WHEN THE CURRENT OCCUPANT SAT DOWN. Null whenever the chair is empty.
      *
      * sweepVacantChairs() asks "has whoever is sitting here gone quiet", and
@@ -495,6 +511,8 @@ function newConversation(id, title, agent) {
  */
 function normaliseConv(conv) {
   const base = {
+    // No log rewrite for folder scopes: a record from before them is at the root.
+    path: '',
     archived: false, archivedAt: null,
     stopRequested: false, stopRequestedAt: null, stopRequestedBy: null,
     stopAck: null, stopAckAt: null, stoppedAt: null, stopNote: null, worktrees: null,
@@ -6982,9 +7000,109 @@ function createConversation(res, body) {
   }
   const agent = readAgent(body);
   if (agent instanceof Error) return fail(res, 400, agent.message);
+  const convPath = body.path === undefined ? '' : normaliseConvPath(body.path, 'path');
+  if (convPath instanceof Error) return fail(res, 400, convPath.message);
   const conv = newConversation(newId(conversations), title, agent);
+  conv.path = convPath;
   appendEvent({ t: 'conv', conv });
   send(res, 201, conv);
+}
+
+/**
+ * THE ONE DEFINITION OF A CONVERSATION FOLDER. Used for the `path` body field
+ * on create and patch, and for the `?path=` filter on GET /conversations, so a
+ * value the list accepts is exactly a value a record can hold.
+ *
+ * Returns the canonical form - home-relative, segments joined by single
+ * slashes, no slash at either end, `""` for the home root - or an Error the
+ * caller turns into a 400.
+ *
+ * The only thing forgiven is ONE slash at each end, because the page derives
+ * its scope from `location.pathname` and `/Projects/x/` is the same folder as
+ * `Projects/x`. `null`, `""` and a lone `/` all mean the root. Everything else
+ * that is not already canonical is refused rather than repaired: `.` and `..`
+ * segments (this becomes a cwd on the host, and "somewhere above home" is not a
+ * folder anyone meant), empty segments (`a//b`, which usually means a typo),
+ * backslashes (a Windows path pasted in; `Projects\x` is not `Projects/x` on
+ * Linux and a silent rewrite would guess), and control characters including
+ * NUL. Whitespace is NOT trimmed: a folder named with a trailing space is a
+ * real, distinct folder, and trimming would point the seat somewhere else.
+ */
+function normaliseConvPath(raw, label) {
+  if (raw === null) return '';
+  if (typeof raw !== 'string') return new Error(`${label} must be a string (a folder relative to home)`);
+  if (raw.length > MAX_CONV_PATH) {
+    return new Error(`${label} too long: ${raw.length} chars, max ${MAX_CONV_PATH}`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return new Error(`${label} must not contain control characters`);
+  if (raw.indexOf('\\') >= 0) return new Error(`${label} must use forward slashes, not backslashes`);
+  if (raw === '' || raw === '/') return '';
+  let p = raw;
+  if (p.startsWith('/')) p = p.slice(1);
+  if (p.endsWith('/')) p = p.slice(0, -1);
+  // Checked on `p`, so `//` - which the two strips above would reduce to
+  // nothing - is an empty segment, not a second spelling of the root.
+  for (const s of p.split('/')) {
+    if (!s) return new Error(`${label} "${raw}" has an empty segment (a doubled slash, or more than one at an end)`);
+    if (s === '.' || s === '..') return new Error(`${label} "${raw}" must not contain "." or ".." segments`);
+  }
+  return p;
+}
+
+/**
+ * Archived ones are hidden unless asked for; `archived=only` shows just them,
+ * and any other value of `archived` shows everything. Shared by
+ * GET /conversations and GET /folders so the two can never disagree about
+ * which tabs exist.
+ */
+function archivedFilter(list, q) {
+  const archived = q.get('archived');
+  if (archived === 'only') return list.filter((c) => c.archived);
+  if (archived === null || archived === 'false' || archived === '0') return list.filter((c) => !c.archived);
+  return list;
+}
+
+/*
+ * GET /folders?path=<scope> - the drill-down under a folder scope: its
+ * IMMEDIATE child folders that hold at least one conversation at or below
+ * them, sorted by name.
+ *
+ * DERIVED ONLY FROM CONVERSATION PATHS. This server never reads a home folder
+ * (it runs in a container with no home mount, on purpose), so a folder with no
+ * conversations in it does not exist as far as this route is concerned, and
+ * that is the honest answer: there is nothing there to drill into.
+ *
+ * `conversations` counts every conversation at or below the child; `pending`
+ * and `unread` sum the same counters the list route shows per row, so a badge
+ * on a folder means exactly "this many, if you went and looked". Conversations
+ * filed at the scope itself belong to no child and are not counted here - they
+ * are what GET /conversations?path=<scope> shows alongside this list.
+ */
+function foldersRoute(res, q) {
+  const scope = q.get('path') === null ? '' : normaliseConvPath(q.get('path'), 'path');
+  if (scope instanceof Error) return fail(res, 400, scope.message);
+  const prefix = scope ? scope + '/' : '';
+  const byName = new Map();
+  for (const c of archivedFilter(conversationSummaries(), q)) {
+    const p = c.path || '';
+    if (!p.startsWith(prefix) || p.length === prefix.length) continue; // outside, or at the scope itself
+    const name = p.slice(prefix.length).split('/')[0];
+    let f = byName.get(name);
+    if (!f) byName.set(name, (f = { name, path: prefix + name, conversations: 0, pending: 0, unread: 0 }));
+    f.conversations++;
+    f.pending += c.counts.pending;
+    f.unread += c.counts.unrelayed;
+  }
+  // Plain code-unit order: stable across locales, and what `ls` does under LC_ALL=C.
+  const folders = [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return send(res, 200, { path: scope, count: folders.length, folders });
+}
+
+/** Is `convPath` the folder `scope`, or somewhere under it? Whole segments only. */
+function inConvScope(convPath, scope) {
+  if (!scope) return true;
+  const p = convPath || '';
+  return p === scope || p.startsWith(scope + '/');
 }
 
 function readAgent(body) {
@@ -7201,6 +7319,18 @@ function updateConversation(res, id, body) {
     }
   }
 
+  /*
+   * Moving a conversation to another folder. Just a label here - the server
+   * never looks at the directory - but autoseat reads it as the seat's cwd and
+   * starts a fresh session when it changes. Allowed on the default conversation
+   * too: nothing about `main` depends on where it is filed.
+   */
+  if (body.path !== undefined) {
+    const convPath = normaliseConvPath(body.path, 'path');
+    if (convPath instanceof Error) return fail(res, 400, convPath.message);
+    patch.path = convPath;
+  }
+
   if (body.archived !== undefined) {
     if (typeof body.archived !== 'boolean') return fail(res, 400, 'archived must be true or false');
     // The default conversation is where every pre-conversation message lives and
@@ -7339,7 +7469,7 @@ function updateConversation(res, id, body) {
   }
 
   if (!Object.keys(patch).length) {
-    return fail(res, 400, 'nothing to update (title, agent, archived, stopRequested, spawnedBy, contextFrom or pendingDispatch)');
+    return fail(res, 400, 'nothing to update (title, agent, path, archived, stopRequested, spawnedBy, contextFrom or pendingDispatch)');
   }
   /*
    * Read BEFORE the write. `conv` is the live stored object and appendEvent
@@ -8159,11 +8289,17 @@ async function route(req, res) {
   // /conversations
   if (seg.length === 1 && seg[0] === 'conversations') {
     if (m === 'GET') {
+      /*
+       * `path=Projects` is a folder scope: that folder and everything under it,
+       * on whole segments (never `ProjectsOld`). Absent, empty or `/` is the
+       * home root, i.e. everything - the list as it was before scopes existed.
+       * Validated before any work, with the same rules as the record field.
+       */
+      const scope = q.get('path') === null ? '' : normaliseConvPath(q.get('path'), 'path');
+      if (scope instanceof Error) return fail(res, 400, scope.message);
       let list = conversationsWithLiveness();
-      // Archived ones are hidden unless asked for; `archived=only` shows just them.
-      const archived = q.get('archived');
-      if (archived === 'only') list = list.filter((c) => c.archived);
-      else if (archived === null || archived === 'false' || archived === '0') list = list.filter((c) => !c.archived);
+      if (scope) list = list.filter((c) => inConvScope(c.path, scope));
+      list = archivedFilter(list, q);
       // `pending=1` is the agent side's question: where is there work waiting?
       const pending = q.get('pending');
       if (pending !== null && pending !== 'false' && pending !== '0') {
@@ -8227,6 +8363,12 @@ async function route(req, res) {
       return fail(res, 405, `method ${m} not allowed here`, { allow: 'GET, POST, DELETE' });
     }
     return fail(res, 404, `no such conversation route "${seg[2]}"`, { known: ['stop-ack', 'activity', 'share'] });
+  }
+
+  // /folders — the child folders under a scope, derived from conversation paths
+  if (seg.length === 1 && seg[0] === 'folders') {
+    if (!need('GET')) return;
+    return foldersRoute(res, q);
   }
 
   // /status — is anything actually listening?
@@ -8574,7 +8716,30 @@ async function route(req, res) {
     return send(res, 200, task);
   }
 
+  /*
+   * A DEEP LINK INTO THE PAGE. `/Projects/relay-queue` is the app scoped to that
+   * folder (see the conversation `path` field), so a browser navigating to a
+   * path nothing above claimed gets the same page `/` serves, and the page reads
+   * its scope out of `location.pathname`.
+   *
+   * Last, after every route, so it can never shadow one: anything the router
+   * knows is answered above and never reaches this line. And only for what is
+   * unmistakably a browser loading a page - `Accept` naming text/html, or the
+   * fetch-metadata navigate mode - so curl, fetch() and every agent (which send a
+   * wildcard Accept, or ask for JSON) still get the honest JSON 404 below, and a typo in an
+   * API URL does not come back as a 200 full of HTML. `vary` because the same
+   * URL now has two answers depending on who is asking.
+   */
+  res.setHeader('vary', 'Accept, Sec-Fetch-Mode');
+  if (m === 'GET' && isNavigation(req)) return sendIndex(res);
+
   fail(res, 404, `no route for ${m} ${url.pathname}`);
+}
+
+/** A browser loading a page, as opposed to a program asking an API a question. */
+function isNavigation(req) {
+  const accept = String(req.headers.accept || '').toLowerCase();
+  return accept.indexOf('text/html') >= 0 || req.headers['sec-fetch-mode'] === 'navigate';
 }
 
 const server = http.createServer((req, res) => {

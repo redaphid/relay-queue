@@ -190,6 +190,64 @@
   }
   #converr.show { display: block; }
   #convlist { display: flex; flex-direction: column; gap: 4px; }
+  /*
+     Folder scopes. The page's path is a folder under home; `/` is everything.
+     The header breadcrumb exists only on a folder page (built by initCrumbs),
+     so none of these rules touch the root header.
+  */
+  #scopebox { display: flex; flex-direction: column; min-width: 0; flex: 0 1 auto; line-height: 1.15; }
+  .crumbs {
+    font-size: 12px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .crumbs a { color: inherit; text-decoration: none; }
+  .crumbs a:hover, .crumbs a:focus-visible { text-decoration: underline; }
+  .crumbs a[aria-current] { color: var(--fg); font-weight: 600; }
+  .crumbs .sep { padding: 0 3px; opacity: .6; }
+  .convpath {
+    margin-top: 1px; font-size: 12px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* The drawer's folder drilldown: one line when folded. */
+  #folders { margin: 0 4px 10px; border: 1px solid var(--line); border-radius: 12px; }
+  #folders[hidden] { display: none; }
+  #foldtoggle {
+    display: flex; align-items: center; gap: 6px; width: 100%; min-height: 40px;
+    padding: 6px 10px; font: inherit; font-size: 14px; font-weight: 600; text-align: left;
+    color: var(--fg); background: transparent; border: 0; border-radius: 12px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #foldtoggle .fcaret { display: inline-block; transition: transform .15s ease; color: var(--muted); }
+  #folders.folded #foldtoggle .fcaret { transform: rotate(-90deg); }
+  #foldwhere {
+    flex: 1 1 auto; min-width: 0; font-weight: 400; font-size: 12px; color: var(--muted); text-align: right;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #folders.folded #foldbody { display: none; }
+  #foldbody { padding: 0 8px 8px; }
+  #foldcrumbs { padding: 2px 2px 6px; font-size: 13px; }
+  #foldlist { display: flex; flex-direction: column; gap: 2px; }
+  .frow {
+    display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 6px 8px;
+    color: var(--fg); text-decoration: none; border-radius: 10px;
+  }
+  .frow:hover, .frow:focus-visible { background: var(--accent-soft); }
+  .fname { flex: 1 1 auto; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fcount { flex: 0 0 auto; font-size: 12px; color: var(--muted); }
+  .fwait { flex: 0 0 auto; font-size: 12px; color: var(--off); }
+  .fgo { display: flex; gap: 6px; margin-top: 6px; }
+  #foldpath {
+    flex: 1 1 auto; min-width: 0; font-family: inherit; font-size: 16px;
+    min-height: 40px; padding: 6px 10px;
+    color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  }
+  #foldopen {
+    flex: 0 0 auto; min-width: 48px; min-height: 40px; font: inherit; font-size: 14px;
+    color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  #folderr { display: none; margin: 6px 2px 0; font-size: 13px; color: var(--err-fg); }
+  #folderr.show { display: block; }
   .conv {
     display: block; width: 100%; min-height: 48px;
     padding: 10px 12px; margin: 0;
@@ -1450,6 +1508,26 @@
         <b>Conversations</b>
         <button id="drawerclose" type="button" aria-label="Close">&times;</button>
       </div>
+      <!--
+        Folder drilldown. Hidden until GET /folders answers, so an older server
+        (or no network) leaves the drawer exactly as it was. Filled by
+        loadFolders(); the fold state is remembered per device.
+      -->
+      <section id="folders" hidden aria-label="Folders">
+        <button id="foldtoggle" type="button" aria-expanded="true" aria-controls="foldbody">
+          <span class="fcaret" aria-hidden="true">&#9662;</span> Folders <span id="foldwhere"></span>
+        </button>
+        <div id="foldbody">
+          <nav id="foldcrumbs" class="crumbs" aria-label="Current folder"></nav>
+          <div id="foldlist"></div>
+          <form id="foldgo" class="fgo" autocomplete="off">
+            <input id="foldpath" type="text" placeholder="Open folder&hellip; Projects/app"
+              autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-label="Open a folder by path">
+            <button id="foldopen" type="submit">Go</button>
+          </form>
+          <p id="folderr"></p>
+        </div>
+      </section>
       <div class="prow">
         <input id="newtitle" type="text" placeholder="New conversation&hellip;" maxlength="200"
           autocomplete="off" autocapitalize="sentences" enterkeyhint="done">
@@ -1655,6 +1733,59 @@
   var convsFromCache = false;
   var convNew = Object.create(null);
   var convTimer = null;
+
+  /*
+   * ---- folder scope -------------------------------------------------------
+   *
+   * The page's PATH is a folder relative to the owner's home: `/` is the whole
+   * queue (exactly the page as it has always been), `/Projects/relay-queue` is
+   * the same page showing only the conversations filed at that folder or below
+   * it. The conversation itself still lives in the hash (see CONV_HASH).
+   *
+   * `SCOPE` is '' at the root, and EVERY scoped behaviour below is guarded on
+   * it being non-empty, so the root page does precisely what it did before
+   * scopes existed. The normalisation is the server's (see FOLDER-SCOPES-SPEC
+   * item 1): slashes trimmed, and no `.`/`..`, empty segments or backslashes.
+   * An address that fails it is treated as the root rather than as an error,
+   * because a typo in the address bar must still land on a working page.
+   */
+  function normScope(raw) {
+    var s = String(raw === undefined || raw === null ? '' : raw).replace(/^\/+|\/+$/g, '');
+    if (!s) return '';
+    if (s.indexOf('\\') >= 0) return null;
+    var parts = s.split('/');
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i] || parts[i] === '.' || parts[i] === '..') return null;
+    }
+    return s;
+  }
+  var SCOPE = (function () {
+    var p;
+    try { p = decodeURIComponent(String((window.location && location.pathname) || '/')); } catch (e) { return ''; }
+    var n = normScope(p);
+    return n === null ? '' : n;
+  })();
+  /** Whether a conversation's `path` is this page's folder or below it. */
+  function inScope(path) {
+    if (!SCOPE) return true;
+    var p = String(path || '');
+    return p === SCOPE || p.indexOf(SCOPE + '/') === 0;
+  }
+  /** The remembered-conversation key: unchanged at the root, one per folder. */
+  function convPrefKey() { return SCOPE ? 'relay.conv:' + SCOPE : 'relay.conv'; }
+  /*
+   * Scoped pages only: true until the first list read has said which
+   * conversation this folder should open on. Nothing is read or merged into
+   * the thread meanwhile, because the conversation named by the hash or by
+   * memory may belong to another folder - and flashing (or, worse, sending
+   * into) `main` on a page that says it is some project would be the very
+   * misrouting the hash was introduced to stop. Stays true while the folder
+   * has no conversations at all. Always false at the root.
+   */
+  var scopeHold = !!SCOPE;
+  // Scoped pages only: `main` is usually not in the scoped list, but the stop
+  // controls still need to know who holds it. See routerInfo().
+  var routerConv = null;
 
   var STATUS = { pending: 'pending', claimed: 'claimed', done: 'answered' };
   // Shape, not just colour: an empty ring, a half-filled ring, a tick.
@@ -2972,6 +3103,9 @@
 
   // All requests are root-relative so the page works unchanged behind a reverse proxy.
   function poll(fullRead) {
+    // A folder page that has not yet settled on one of its own conversations
+    // reads nothing (see scopeHold). Never true at the root.
+    if (scopeHold) return Promise.resolve(false);
     var scope = 'conversation=' + encodeURIComponent(activeConv);
     var url = (!fullRead && cursorMs)
       ? '/thread?' + scope + '&since=' + cursorMs
@@ -3068,6 +3202,15 @@
       fails = 0; setConn(true);
       // A conversation was created, renamed, reassigned or archived.
       if (j && j.conversation) {
+        /*
+         * A folder page ignores conversations filed in other folders: nothing
+         * to add to its list, and nothing to light the dot for. One that WAS
+         * listed here still refreshes the list, which is how a conversation
+         * moved to another folder leaves it.
+         */
+        // Folder counts may have moved (in, out of, or within this folder).
+        if (inScope(j.conversation.path) || convById(j.conversation.id)) queueFolderRefresh();
+        if (SCOPE && !inScope(j.conversation.path) && !convById(j.conversation.id)) return;
         loadConvs();
         /*
          * A tab-list write broadcasts on its CONVERSATION, so this is also the
@@ -3090,7 +3233,18 @@
        * looking at must NOT be merged into the thread on screen — it is only
        * flagged, which is what makes switching an informed choice rather than a
        * guess. Scoping this server-side would have needed a second connection.
+       *
+       * On a folder page the same holds one level up: activity in a
+       * conversation that is not in this folder's list is not this page's
+       * business at all - no dot, no refresh, no merge. The list is the
+       * folder's, so "in the list" is the test (a message frame carries no
+       * path). While the page is still settling on a conversation, nothing is
+       * merged; the read that ends the hold catches up.
        */
+      if (SCOPE) {
+        if (scopeHold) return;
+        if (j && typeof j.conversationId === 'string' && !convById(j.conversationId)) return;
+      }
       if (j && typeof j.conversationId === 'string' && j.conversationId !== activeConv) {
         convNew[j.conversationId] = true;
         markMenu();
@@ -3190,7 +3344,25 @@
    */
   function onUrlChange() {
     var id = convFromUrl() || DEFAULT_CONV; // hash hand-edited away: go home
+    // ...where "home" on a folder page is its first conversation, not `main`.
+    if (SCOPE && !convFromUrl()) id = convs.length ? convs[0].id : activeConv;
     if (id === activeConv) return;
+    /*
+     * A folder page never switches into a conversation it has not listed: the
+     * hash may name another folder's tab, and switching first would let a
+     * message be sent into it before the list read corrected course. Re-read
+     * the list (the tab may simply be new here), then switch only if it is in
+     * this folder; otherwise stay put, say so, and put the address back.
+     */
+    if (SCOPE && !convById(id)) {
+      return loadConvs().then(function () {
+        if (convById(id)) return switchConv(id, true, 'none');
+        showErr('That tab is not in ' + SCOPE + ' — it may be archived or filed in another folder. '
+          + 'Staying on ' + (((convById(activeConv) || {}).title) || 'this folder') + '.');
+        logClient('conv-missing', { wanted: id, scope: SCOPE });
+        if (!scopeHold) setUrl(activeConv, true);
+      });
+    }
     // The URL is already right, so this must not push another entry.
     return switchConv(id, true, 'none').then(function () {
       /*
@@ -3208,7 +3380,13 @@
 
   function markMenu() {
     var any = false;
-    for (var k in convNew) { if (k !== activeConv) { any = true; break; } }
+    for (var k in convNew) {
+      if (k === activeConv) continue;
+      // A folder page: only conversations still listed here count, so one
+      // that was moved to another folder cannot keep the dot lit.
+      if (SCOPE && !convById(k)) continue;
+      any = true; break;
+    }
     if (menuDot) menuDot.className = any ? 'show' : '';
   }
 
@@ -3222,7 +3400,11 @@
     // No `cache: 'no-store'`, for the reason spelled out in poll(): in Firefox
     // it would take this read straight past the service worker, so the
     // conversation list would be missing offline. The server sends no-store.
-    return fetch('/conversations', { headers: { accept: 'application/json' } })
+    // A folder page asks for its folder only (the server includes everything
+    // below it). The root asks exactly as it always has.
+    var listUrl = SCOPE ? '/conversations?path=' + encodeURIComponent(SCOPE) : '/conversations';
+    if (SCOPE) loadRouterConv();
+    return fetch(listUrl, { headers: { accept: 'application/json' } })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         /*
@@ -3237,6 +3419,7 @@
       .then(function (j) {
         if (j && typeof j.defaultId === 'string') DEFAULT_CONV = j.defaultId;
         convs = (j && Array.isArray(j.conversations)) ? j.conversations : [];
+        if (SCOPE) return settleScope();
         // The conversation in the URL — or the remembered one — may have been
         // archived, or may never have existed. Land on the default rather than
         // on a blank page, say which thread this now is, and REPLACE the bad
@@ -3268,6 +3451,246 @@
         return true;
       })
       .catch(function () { return false; });
+  }
+
+  /*
+   * The folder page's half of loadConvs(): settle on a conversation that is
+   * actually filed here. Only ever called with SCOPE set.
+   *
+   *   - the one in the hash / remembered for this folder, if it is listed;
+   *   - otherwise the first one in this folder (never `main`, which lives at
+   *     the root) - saying so if it was one somebody asked for;
+   *   - otherwise nothing: the folder is empty, the page holds (scopeHold),
+   *     reads nothing and refuses to send, and says how to start a tab here.
+   */
+  var scopeAsked = false; // the hash or memory named a conversation (initConvs)
+  var scopeEmptyShown = false; // the "nothing filed here" notice is up
+  function settleScope() {
+    /*
+     * Belt and braces on top of `?path=`: the service worker's offline copy of
+     * the list is shared with the root page, and an older server ignores the
+     * parameter. Either way only this folder's rows may be shown.
+     */
+    convs = convs.filter(function (c) { return c && inScope(c.path); });
+    var wasHeld = scopeHold;
+    var asked = scopeAsked;
+    scopeAsked = false;
+    if (scopeEmptyShown && convs.length) { scopeEmptyShown = false; clearErr(); }
+    if (convById(activeConv)) {
+      if (wasHeld) {
+        // The first read of this conversation; switchConv does the rest
+        // (hue, title, list, address bar).
+        scopeHold = false;
+        return switchConv(activeConv, true, 'replace');
+      }
+      applyHue(activeConv);
+      renderConvs();
+      setTitle();
+      return true;
+    }
+    if (convs.length) {
+      var missing = activeConv;
+      scopeHold = false;
+      return switchConv(convs[0].id, true, 'replace').then(function (ok) {
+        // Silent on a plain first visit (nothing was asked for); out loud when
+        // a link, memory, or the thread already on screen is being overruled.
+        if (asked || !wasHeld) {
+          showErr('That tab is not in ' + SCOPE + ' — it may be archived or filed in another folder. '
+            + 'Showing ' + ((convs[0] && convs[0].title) || convs[0].id) + ' for now.');
+          logClient('conv-missing', { wanted: missing, scope: SCOPE });
+        }
+        return ok;
+      });
+    }
+    // Nothing is filed here yet. Show an empty thread, not some other folder's.
+    scopeHold = true;
+    entries.clear(); sigs.clear();
+    render();
+    renderConvs();
+    if (titleEl) titleEl.textContent = SCOPE.split('/').pop();
+    showErr('Nothing is filed in ' + SCOPE + ' yet. Open the menu and name a tab to start one here.', true);
+    scopeEmptyShown = true;
+    return true;
+  }
+
+  /*
+   * Scoped pages only. The stop controls ask who holds the default
+   * conversation (routerInfo), and on a folder page it is not in the list, so
+   * it is read on its own - at most every 30s, since loadConvs() runs often.
+   */
+  var routerAt = 0;
+  function loadRouterConv() {
+    if (Date.now() - routerAt < 30000) return;
+    routerAt = Date.now();
+    fetch('/conversations/' + encodeURIComponent(DEFAULT_CONV), { headers: { accept: 'application/json' } })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (j) { if (j && j.id) routerConv = j; })
+      .catch(function () { routerAt = 0; /* try again next time; routerInfo copes with none */ });
+  }
+
+  /*
+   * ---- breadcrumbs and folder drilldown -----------------------------------
+   *
+   * A folder is addressed by its path, so every link here is an ordinary
+   * link to `/<path>`: a full page load, which is what re-derives SCOPE.
+   * Each segment is encoded on its own so the slashes stay slashes.
+   */
+  function scopeHref(path) {
+    if (!path) return '/';
+    return '/' + String(path).split('/').map(encodeURIComponent).join('/');
+  }
+
+  /** `~ / Projects / relay-queue`, every segment a link to that folder. */
+  function crumbInto(node, path) {
+    if (!node) return;
+    node.textContent = '';
+    var segs = path ? String(path).split('/') : [];
+    var home = el('a', null, '~');
+    home.href = '/';
+    home.title = 'Everything';
+    if (!segs.length) home.setAttribute('aria-current', 'page');
+    node.appendChild(home);
+    for (var i = 0; i < segs.length; i++) {
+      node.appendChild(el('span', 'sep', '/'));
+      var a = el('a', null, segs[i]);
+      a.href = scopeHref(segs.slice(0, i + 1).join('/'));
+      if (i === segs.length - 1) a.setAttribute('aria-current', 'page');
+      node.appendChild(a);
+    }
+  }
+
+  /*
+   * The header breadcrumb, folder pages only. Built here rather than written
+   * into the markup so the root header is untouched: it stacks a small crumb
+   * line above the conversation title.
+   */
+  function initCrumbs() {
+    if (!SCOPE || !titleEl || !titleEl.parentNode || !titleEl.parentNode.insertBefore) return;
+    var box = el('span');
+    box.id = 'scopebox';
+    var nav = el('nav', 'crumbs');
+    nav.id = 'crumbs';
+    nav.setAttribute('aria-label', 'Folder');
+    crumbInto(nav, SCOPE);
+    titleEl.parentNode.insertBefore(box, titleEl);
+    box.appendChild(nav);
+    box.appendChild(titleEl);
+    try { document.title = SCOPE.split('/').pop() + ' · relay'; } catch (e) { /* cosmetic */ }
+  }
+
+  var foldersBox = document.getElementById('folders');
+  var foldToggle = document.getElementById('foldtoggle');
+  var foldWhere = document.getElementById('foldwhere');
+  var foldCrumbs = document.getElementById('foldcrumbs');
+  var foldList = document.getElementById('foldlist');
+  var foldGo = document.getElementById('foldgo');
+  var foldPath = document.getElementById('foldpath');
+  var foldErr = document.getElementById('folderr');
+  var foldTimer = null;
+  var FOLD_KEY = 'relay.folders.folded';
+
+  function setFolded(on, remember) {
+    if (!foldersBox) return;
+    foldersBox.className = on ? 'folded' : '';
+    if (foldToggle) foldToggle.setAttribute('aria-expanded', on ? 'false' : 'true');
+    if (remember) pref(FOLD_KEY, on ? '1' : '0');
+  }
+
+  function folderRow(f) {
+    var a = el('a', 'frow');
+    a.href = scopeHref(f.path);
+    a.appendChild(el('span', 'fname', (f.name || String(f.path).split('/').pop()) + '/'));
+    var n = Number(f.conversations) || 0;
+    a.appendChild(el('span', 'fcount', n + (n === 1 ? ' tab' : ' tabs')));
+    /*
+     * The same two signals a conversation row carries, in the same clothes:
+     * "N waiting" in the row's meta colour, and the red dot for replies not
+     * yet relayed (`unread` is the sum of those rows' counts.unrelayed).
+     */
+    var unread = Number(f.unread) || 0, pending = Number(f.pending) || 0;
+    if (pending) a.appendChild(el('span', 'fwait', pending + ' waiting'));
+    if (unread) {
+      var dot = el('span', 'convdot');
+      dot.title = unread + ' unread';
+      a.appendChild(dot);
+    }
+    a.setAttribute('aria-label', (f.name || f.path) + ', ' + n + (n === 1 ? ' tab' : ' tabs')
+      + (pending ? ', ' + pending + ' waiting' : '') + (unread ? ', ' + unread + ' unread' : ''));
+    return a;
+  }
+
+  /*
+   * GET /folders?path=<scope>: the folders directly below this one that hold
+   * conversations. Derived from conversation paths, so a folder with nothing
+   * filed in it is not listed - "Open folder" is how one gets its first tab.
+   * Any failure, or an answer without a folder list (an older server), hides
+   * the section without a word: the drawer must not break over a bonus.
+   */
+  function loadFolders() {
+    if (!foldersBox) return Promise.resolve(false);
+    return fetch('/folders?path=' + encodeURIComponent(SCOPE), { headers: { accept: 'application/json' } })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j || !Array.isArray(j.folders)) throw new Error('no folder list');
+        crumbInto(foldCrumbs, SCOPE);
+        // At the root the trail would be a lone "~"; the list says enough.
+        if (foldCrumbs) foldCrumbs.hidden = !SCOPE;
+        if (foldWhere) foldWhere.textContent = SCOPE ? '~/' + SCOPE : '';
+        if (foldList) {
+          foldList.textContent = '';
+          for (var i = 0; i < j.folders.length; i++) {
+            var f = j.folders[i];
+            if (f && typeof f.path === 'string' && normScope(f.path)) foldList.appendChild(folderRow(f));
+          }
+        }
+        foldersBox.hidden = false;
+        return true;
+      })
+      .catch(function () { foldersBox.hidden = true; return false; });
+  }
+
+  /** Coalesced, and only while the drawer is open: opening it always re-reads. */
+  function queueFolderRefresh() {
+    if (!drawerOpen || foldTimer) return;
+    foldTimer = setTimeout(function () { foldTimer = null; loadFolders(); }, 800);
+  }
+
+  /*
+   * Type a home-relative path and go there, whether or not anything is filed
+   * in it yet. Normalised exactly as the address bar is; anything the server
+   * would refuse is refused here, inline, without navigating.
+   */
+  function openFolderFromInput() {
+    if (!foldPath) return;
+    var raw = String(foldPath.value || '').trim().replace(/^~(?=\/|$)/, '');
+    var n = normScope(raw);
+    if (n === null) {
+      if (foldErr) {
+        foldErr.textContent = 'Not a folder path. Use names separated by "/", like Projects/app (no "." or ".." or "\\").';
+        foldErr.className = 'show';
+      }
+      return;
+    }
+    if (foldErr) { foldErr.className = ''; foldErr.textContent = ''; }
+    location.href = scopeHref(n);
+  }
+
+  function initFolders() {
+    if (!foldersBox) return;
+    setFolded(pref(FOLD_KEY) === '1', false);
+    if (foldToggle) foldToggle.addEventListener('click', function () {
+      setFolded(!/folded/.test(foldersBox.className), true);
+    });
+    if (foldGo) foldGo.addEventListener('submit', function (e) {
+      if (e && e.preventDefault) e.preventDefault();
+      openFolderFromInput();
+    });
+    if (foldPath) foldPath.addEventListener('input', function () {
+      if (foldErr && foldErr.className) { foldErr.className = ''; foldErr.textContent = ''; }
+    });
   }
 
   function convById(id) {
@@ -3466,6 +3889,11 @@
       : 'No messages yet';
 
     row.appendChild(top);
+    // A folder page lists its subfolders' conversations too; say which
+    // subfolder, relative to this one. Never shown at the root.
+    if (SCOPE && c.path && c.path !== SCOPE && c.path.indexOf(SCOPE + '/') === 0) {
+      row.appendChild(el('div', 'convpath', c.path.slice(SCOPE.length + 1) + '/'));
+    }
     row.appendChild(snip);
 
     row.appendChild(sparkNode(c));
@@ -3519,7 +3947,7 @@
   function switchConv(id, quiet, urlMode) {
     if (!quiet && id === activeConv) { closeDrawer(); return Promise.resolve(true); }
     activeConv = id;
-    pref('relay.conv', id);
+    pref(convPrefKey(), id);
     if (urlMode !== 'none') setUrl(id, urlMode === 'replace');
     applyHue(id);
     delete convNew[id];
@@ -3558,6 +3986,7 @@
     setTimeout(function () { if (drawerOpen) drawer.className = 'open'; }, 0);
     if (menuBtn) menuBtn.setAttribute('aria-expanded', 'true');
     loadConvs();
+    loadFolders();
     uiSync(); // back should shut this, not leave the app
   }
 
@@ -3579,7 +4008,8 @@
     fetch('/conversations', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: title })
+      // Filed in this page's folder. The root sends exactly what it always has.
+      body: JSON.stringify(SCOPE ? { title: title, path: SCOPE } : { title: title })
     }).then(function (r) {
       return r.json().catch(function () { return null; }).then(function (j) {
         if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
@@ -3602,17 +4032,23 @@
      * thread this phone was already in. localStorage stays as the fallback so
      * that opening the bare bookmarked address still comes back where it was.
      */
-    var saved = pref('relay.conv');
+    var saved = pref(convPrefKey());
     var fromUrl = convFromUrl();
     if (fromUrl) activeConv = fromUrl;
     else if (saved) activeConv = saved;
     // Put it in the address bar from the first paint, without adding a history
     // entry for a page nobody navigated to. Whether the id is real is not known
     // until /conversations answers; loadConvs() repairs it if it is not.
-    setUrl(activeConv, true);
+    // A folder page waits for that answer instead (see scopeHold): the id may
+    // be another folder's, and settleScope() writes the address once it knows.
+    if (SCOPE) {
+      scopeAsked = !!(fromUrl || saved);
+      try { initCrumbs(); } catch (e) { /* the page works without the breadcrumb */ }
+    } else setUrl(activeConv, true);
     window.addEventListener('popstate', onUrlChange);
     window.addEventListener('hashchange', onUrlChange);
     applyHue(activeConv);
+    try { initFolders(); } catch (e) { /* the drawer works without the folder section */ }
     if (menuBtn) menuBtn.addEventListener('click', function () {
       if (drawerOpen) closeDrawer(); else openDrawer();
     });
@@ -4314,7 +4750,7 @@
   var ROUTER_PRESENT = { watching: 1, working: 1, idle: 1, stuck: 1 };
 
   function routerInfo() {
-    var m = convById(DEFAULT_CONV);
+    var m = convById(DEFAULT_CONV) || (SCOPE ? routerConv : null);
     var st = (m && m.agentState && m.agentState.state) || 'unassigned';
     return {
       name: (m && m.agent) || null,
@@ -5154,10 +5590,12 @@
   }
 
   function arcLoad() {
-    return fetch('/conversations?archived=only', { headers: { accept: 'application/json' } })
+    // A folder page shows the archived tabs of its own folder only.
+    return fetch('/conversations?archived=only' + (SCOPE ? '&path=' + encodeURIComponent(SCOPE) : ''), { headers: { accept: 'application/json' } })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (j) {
         var list = (j && Array.isArray(j.conversations)) ? j.conversations : [];
+        if (SCOPE) list = list.filter(function (c) { return c && inScope(c.path); });
         /*
          * Most recently archived first. The server does not sort by this, and
          * the tab he wants back is nearly always the one he just closed - which
@@ -6750,6 +7188,15 @@
    * the user has switched to while it was being transcribed.
    */
   function postTask(text, from, conversationId, images) {
+    /*
+     * A folder page with no conversation of its own yet (scopeHold) must not
+     * post into whatever `activeConv` still names - that is another folder's
+     * thread. Refused out loud; explicit targets (the stop requests to the
+     * default conversation) are unaffected. Never true at the root.
+     */
+    if (scopeHold && (!conversationId || conversationId === activeConv)) {
+      return Promise.reject(new Error('there is no tab in ' + SCOPE + ' yet - open the menu and name one first'));
+    }
     var payload = { text: text, from: from, conversationId: conversationId || activeConv };
     if (images && images.length) payload.images = images;
     return fetch('/tasks', {
@@ -6783,6 +7230,11 @@
      */
     if (offlineAt) {
       showErr('Offline — not sent. Your words are still here; send them when you are back on.', true);
+      return Promise.resolve(false);
+    }
+    // A folder page with no tab of its own yet: nowhere to send (see postTask).
+    if (scopeHold) {
+      showErr('Not sent — there is no tab in ' + SCOPE + ' yet. Open the menu and name one; your words are still here.', true);
       return Promise.resolve(false);
     }
     if (text.length > MAX_CHARS) {

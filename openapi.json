@@ -70,7 +70,7 @@
         "operationId": "getIndex",
         "tags": ["meta"],
         "summary": "The mobile web UI",
-        "description": "One self-contained HTML file, served with a tight CSP and the `x-relay-app: 1` header the service worker keys its cache on.",
+        "description": "One self-contained HTML file, served with a tight CSP and the `x-relay-app: 1` header the service worker keys its cache on.\n\nDEEP LINKS. The same page is also the answer to a GET for any path no route owns, when the request is a browser navigation (`Accept` includes `text/html`, or `Sec-Fetch-Mode: navigate`): `/Projects/relay-queue` is the app scoped to that folder (see the conversation `path` field). Any other client still gets the JSON 404 for an unknown path. A folder whose first segment is a route name (`folders`, `conversations`, `tasks`, `images`, `agents`, `events`, `thread`, `v2`, ...) is answered by that route instead, so it cannot be opened as a scope.",
         "responses": {
           "200": { "description": "the page", "content": { "text/html": { "schema": { "type": "string" } } } },
           "503": {
@@ -840,6 +840,7 @@
         "summary": "The tab list, with liveness",
         "description": "Archived tabs are HIDDEN unless asked for. Each row carries counts, the last message, and the derived liveness the page draws its badges from.",
         "parameters": [
+          { "name": "path", "in": "query", "schema": { "type": "string", "maxLength": 1024 }, "description": "folder scope, home-relative: only tabs whose `path` is this folder or anything under it, on whole segments (`Projects` does not match `ProjectsOld`). Absent, empty or `/` = everything. Normalised like the field; an invalid value is a 400. Stacks with the other filters.", "example": "Projects/relay-queue" },
           { "name": "archived", "in": "query", "schema": { "type": "string", "enum": ["only", "true", "false", "0"] }, "description": "`only` shows just the archived ones; absent, `false` or `0` hides them; any other value shows all" },
           { "name": "pending", "in": "query", "schema": { "type": "string" }, "description": "truthy: only tabs with work waiting. The agent side's \"where is there work?\"" },
           { "name": "unread", "in": "query", "schema": { "type": "string" }, "description": "truthy: only tabs with answers not yet relayed" }
@@ -855,7 +856,8 @@
                 }
               }
             }
-          }
+          },
+          "400": { "description": "invalid `path`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       },
       "post": {
@@ -872,16 +874,68 @@
                 "properties": {
                   "title": { "type": "string", "maxLength": 200, "description": "required, non-empty" },
                   "agent": { "type": "string", "maxLength": 200, "description": "who is meant to answer here. Alias: `assignee`. relay-queue never acts on this and never spawns anything - it is a passive queue recording routing that something else decides." },
-                  "assignee": { "type": "string" }
+                  "assignee": { "type": "string" },
+                  "path": { "$ref": "#/components/schemas/ConversationPath" }
                 }
               },
-              "examples": { "open": { "value": { "title": "OpenAPI spec", "agent": "openapi-worker" } } }
+              "examples": {
+                "open": { "value": { "title": "OpenAPI spec", "agent": "openapi-worker" } },
+                "inFolder": { "summary": "open a tab filed under a folder", "value": { "title": "Station balance pass", "path": "Projects/sporefall-station" } }
+              }
             }
           }
         },
         "responses": {
           "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Conversation" } } } },
-          "400": { "description": "missing/empty title, title over 200 chars, or `agent` not a string", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+          "400": { "description": "missing/empty title, title over 200 chars, `agent` not a string, or an invalid `path`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/folders": {
+      "get": {
+        "operationId": "listFolders",
+        "tags": ["conversations"],
+        "summary": "Child folders under a scope, for drilling down",
+        "description": "The IMMEDIATE child folders of `path` that hold at least one conversation at or below them, sorted by name (plain code-unit order). Derived ONLY from conversation `path` values: the server never reads a home folder, so a folder with no conversations in it is not listed. Conversations filed at the scope itself belong to no child and are not counted here; `GET /conversations?path=` lists them. `pending` and `unread` are sums of the per-row `counts.pending` and `counts.unrelayed` that `GET /conversations` shows (so `unread` includes messages still waiting, exactly as that counter does). The `archived` filter behaves exactly as on `GET /conversations`: archived tabs are left out by default.",
+        "parameters": [
+          { "name": "path", "in": "query", "schema": { "type": "string", "maxLength": 1024 }, "description": "the scope, normalised like the conversation `path` field. Absent, empty or `/` = the home root. Invalid = 400.", "example": "Projects" },
+          { "name": "archived", "in": "query", "schema": { "type": "string", "enum": ["only", "true", "false", "0"] }, "description": "same as on GET /conversations" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the child folders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["path", "count", "folders"],
+                  "properties": {
+                    "path": { "type": "string", "description": "the normalised scope; `\"\"` is the root" },
+                    "count": { "type": "integer" },
+                    "folders": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["name", "path", "conversations", "pending", "unread"],
+                        "properties": {
+                          "name": { "type": "string", "description": "one segment" },
+                          "path": { "type": "string", "description": "home-relative; pass it back as `?path=` to drill in" },
+                          "conversations": { "type": "integer", "description": "conversations at or below this folder" },
+                          "pending": { "type": "integer" },
+                          "unread": { "type": "integer" }
+                        }
+                      }
+                    }
+                  }
+                },
+                "examples": { "projects": { "value": { "path": "Projects", "count": 2, "folders": [
+                  { "name": "relay-queue", "path": "Projects/relay-queue", "conversations": 3, "pending": 1, "unread": 2 },
+                  { "name": "sporefall-station", "path": "Projects/sporefall-station", "conversations": 5, "pending": 0, "unread": 0 }
+                ] } } }
+              }
+            }
+          },
+          "400": { "description": "invalid `path`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -914,6 +968,7 @@
                   "agent": { "type": ["string", "null"], "maxLength": 200, "description": "who is seated here. null or \"\" stands down. Alias: `assignee`." },
                   "assignee": { "type": ["string", "null"] },
                   "agentLeftReason": { "type": ["string", "null"], "maxLength": 120, "description": "why the seat was vacated, in the agent's own words. \"presumed-gone\" is refused. Only valid alongside clearing `agent`." },
+                  "path": { "$ref": "#/components/schemas/ConversationPath" },
                   "archived": { "type": "boolean", "description": "\"main\" cannot be archived" },
                   "stopRequested": { "type": "boolean", "description": "asks. Does not kill." },
                   "spawnedBy": { "type": ["string", "null"], "description": "which top-level session started the agent - the only thing that could actually kill it" },
@@ -924,7 +979,8 @@
               "examples": {
                 "seat": { "summary": "sit down in the tab", "value": { "agent": "openapi-worker" } },
                 "standDown": { "summary": "stand up, and say why", "value": { "agent": null, "agentLeftReason": "done" } },
-                "askToStop": { "value": { "stopRequested": true } }
+                "askToStop": { "value": { "stopRequested": true } },
+                "move": { "summary": "file the tab under another folder", "value": { "path": "Projects/relay-queue" } }
               }
             }
           }
@@ -935,7 +991,7 @@
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Conversation" } } }
           },
           "400": {
-            "description": "nothing to update, a bad field, `agentLeftReason` without an agent leaving, `agentLeftReason: \"presumed-gone\"`, or archiving \"main\"",
+            "description": "nothing to update, a bad field (including an invalid `path`), `agentLeftReason` without an agent leaving, `agentLeftReason: \"presumed-gone\"`, or archiving \"main\"",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -2205,6 +2261,12 @@
         },
         "additionalProperties": true
       },
+      "ConversationPath": {
+        "type": ["string", "null"],
+        "maxLength": 1024,
+        "description": "A folder relative to the owner's home (e.g. `Projects/relay-queue`). `null`, `\"\"` and `/` all mean the home root. One leading and one trailing slash are stripped; anything else not already canonical is a 400: `.` or `..` segments, empty segments (`a//b`), backslashes, and control characters. Whitespace is kept as-is.",
+        "examples": ["Projects/relay-queue", ""]
+      },
       "Conversation": {
         "type": "object",
         "description": "A TAB. Every task belongs to exactly one; records written before conversations existed replay into `main`.\n\nThe stop fields are the honest half of a control this server cannot actually perform: relay-queue can ASK an agent to stop and can record that it answered, but it cannot kill a process and never will. `spawnedBy` names the only session that could, and is null unless something told us - never inferred, because a guess here puts a confident button in front of a process nobody can reach.",
@@ -2218,6 +2280,7 @@
           "agentLeftAt": { "type": ["string", "null"], "format": "date-time" },
           "agentLeftReason": { "type": ["string", "null"], "description": "in the agent's own words. `presumed-gone` is written ONLY by the sweep and is refused from callers." },
           "createdAt": { "type": "string", "format": "date-time" },
+          "path": { "type": "string", "description": "the folder this tab is filed under, relative to the owner's home. `\"\"` is the home root, and is what every record written before folder scopes reads as. The page at `/Projects/x` lists tabs in that folder and below; autoseat runs the tab's coordinator with this folder as cwd. The server never resolves it to a directory." },
           "archived": { "type": "boolean" },
           "archivedAt": { "type": ["string", "null"], "format": "date-time" },
           "stopRequested": { "type": "boolean", "description": "asking, not stopping" },
@@ -2241,7 +2304,7 @@
         },
         "additionalProperties": true,
         "examples": [
-          { "id": "mtjoi1b7-wv10cb", "title": "OpenAPI spec", "agent": "openapi-worker", "agentSince": "2026-09-01T12:00:00.000Z", "createdAt": "2026-09-01T11:58:00.000Z", "archived": false, "stopRequested": false, "stopAck": null, "counts": { "pending": 0, "claimed": 1, "done": 12, "unrelayed": 0 }, "messages": 13 }
+          { "id": "mtjoi1b7-wv10cb", "title": "OpenAPI spec", "agent": "openapi-worker", "agentSince": "2026-09-01T12:00:00.000Z", "createdAt": "2026-09-01T11:58:00.000Z", "path": "Projects/relay-queue", "archived": false, "stopRequested": false, "stopAck": null, "counts": { "pending": 0, "claimed": 1, "done": 12, "unrelayed": 0 }, "messages": 13 }
         ]
       },
       "Term": {

@@ -186,10 +186,25 @@ function makeEnv(opts) {
     'newtitle', 'newconv', 'converr', 'convlist',
     // The offline banner and the composer it sits above. Both are core chrome:
     // the page is entitled to assume they exist, so the stub must have them.
-    'offbar', 'composer'];
+    'offbar', 'composer',
+    // Folder drilldown in the drawer (GET /folders).
+    'folders', 'foldtoggle', 'foldwhere', 'foldcrumbs', 'foldlist', 'foldgo', 'foldpath', 'folderr'];
   const els = {};
   ids.forEach((id) => { els[id] = makeEl(id === 'input' || id === 'newtitle' ? 'textarea' : 'div'); });
   els.drawer.hidden = true;
+  els.folders.hidden = true;
+  /*
+   * The header, so a folder page can slot its breadcrumb in above the title.
+   * Only insertBefore is needed; the root page never calls it.
+   */
+  const header = makeEl('header');
+  header.insertBefore = function (node, ref) {
+    const i = this.children.indexOf(ref);
+    if (i < 0) this.children.push(node); else this.children.splice(i, 0, node);
+    return node;
+  };
+  header.children.push(els.title);
+  els.title.parentNode = header;
   const meter = makeEl('i');
   const posted = [];
   const conv = (id, title, extra) => Object.assign({
@@ -200,8 +215,10 @@ function makeEnv(opts) {
   const store = {
     ctxs: [], nodes: [], tracks: [], started: [], es: null,
     sttText: 'check the widget report', ttsFail: false, micError: null,
-    convs: [conv('main', 'Main', { lastText: 'the first thread' }),
+    convs: opts.convs ? opts.convs.map((c) => conv(c.id, c.title, c)) : [conv('main', 'Main', { lastText: 'the first thread' }),
       conv('c2', 'Widget audit', { lastText: 'how many widgets', counts: { pending: 2, claimed: 0, done: 0, unrelayed: 0 } })],
+    // What GET /folders answers; null models an older server (404).
+    folders: opts.folders === undefined ? null : opts.folders,
     /*
      * A model of the server's checklist store, because checkbox state is server
      * state now. `texts` is what each entry actually said, so the model parses
@@ -259,6 +276,10 @@ function makeEnv(opts) {
     getElementById: (id) => els[id] || null,
     querySelector: (sel) => (sel === '#meter i' ? meter : null),
     createElement: makeEl,
+    // The drawer's per-row manage control draws an SVG icon (dotsIcon()).
+    // Without this the whole row render threw, the page's catch swallowed it,
+    // and the menu tests saw an empty list.
+    createElementNS: (_ns, tag) => makeEl(tag),
     createDocumentFragment: () => makeEl('fragment'),
     // Message bodies are built from nodes now, never from HTML, so the renderer
     // needs real text nodes. textOf() walks them like any other child.
@@ -320,7 +341,9 @@ function makeEnv(opts) {
       protocol: opts.protocol || 'http:',
       host: opts.host || '10.0.136.62:3901',
       origin: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901'),
-      href: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901') + '/',
+      href: (opts.protocol || 'http:') + '//' + (opts.host || '10.0.136.62:3901') + (opts.pathname || '/'),
+      // The folder scope. The root tests leave it out, as the stub always did.
+      pathname: opts.pathname,
       // The conversation lives here. Starts wherever the test says it does, so
       // "opened from a shared link" is expressible.
       hash: opts.hash || '',
@@ -371,9 +394,31 @@ function makeEnv(opts) {
         store.checked[`${entryId}#${body.index}`] = { on: !!body.on, by: body.by, at: new Date().toISOString() };
         return jsonRes({ changed: true, checklist: modelChecklist(entryId) });
       }
+      // GET /conversations?path=X (and &archived=only): X and every folder
+      // below it, on whole segments, as server.js filters.
+      if (/^\/conversations\?/.test(String(url))) {
+        const q = new URLSearchParams(String(url).split('?')[1]);
+        const want = q.get('path');
+        const arc = q.get('archived') === 'only';
+        const list = store.convs.filter((c) => {
+          const p = c.path || '';
+          if (!!c.archived !== arc) return false;
+          return want === null || want === '' || p === want || p.indexOf(want + '/') === 0;
+        });
+        return jsonRes({ count: list.length, defaultId: 'main', conversations: list });
+      }
+      const mOne = /^\/conversations\/([^/?]+)$/.exec(String(url));
+      if (mOne && !(init && init.method)) {
+        const found = store.convs.find((c) => c.id === decodeURIComponent(mOne[1]));
+        return found ? jsonRes(found) : jsonRes({ error: 'no conversation' }, 404);
+      }
+      if (/^\/folders\?/.test(String(url))) {
+        if (!store.folders) return jsonRes({ error: 'not found' }, 404);
+        return jsonRes({ path: new URLSearchParams(String(url).split('?')[1]).get('path') || '', folders: store.folders });
+      }
       if (url === '/conversations') {
         if (init && init.method === 'POST') {
-          const made = conv('c-new', (body && body.title) || 'untitled', { lastText: '' });
+          const made = conv('c-new', (body && body.title) || 'untitled', { lastText: '', path: (body && body.path) || '' });
           store.convs.push(made);
           return jsonRes(made, 201);
         }
@@ -496,6 +541,15 @@ function check(name, cond, detail) {
   failures++;
   console.log(`  FAIL ${name}${detail ? ' — ' + detail : ''}`);
 }
+/*
+ * The drawer's i-th conversation row. Each entry in the list is a wrapper
+ * holding the row <button> and its sibling manage control (see convNode()), so
+ * the row itself is the wrapper's first child.
+ */
+const convRow = (env, i) => {
+  const w = env.els.convlist.children[i];
+  return w && w.children ? w.children[0] : w;
+};
 const settle = () => new Promise((r) => setTimeout(r, 25));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1953,16 +2007,16 @@ async function main() {
     check('the menu lists both conversations', env.els.convlist.children.length === 2,
       `${env.els.convlist.children.length} rows`);
 
-    check('a row shows its title', textOf(env.els.convlist.children[0]).indexOf('Main') > -1,
-      textOf(env.els.convlist.children[0]));
+    check('a row shows its title', textOf(convRow(env, 0)).indexOf('Main') > -1,
+      textOf(convRow(env, 0)));
     check('a row shows a hint of the last message',
-      textOf(env.els.convlist.children[0]).indexOf('the first thread') > -1);
-    check('the active one is marked', /active/.test(env.els.convlist.children[0].className),
-      env.els.convlist.children[0].className);
-    check('the other one is not', !/active/.test(env.els.convlist.children[1].className));
+      textOf(convRow(env, 0)).indexOf('the first thread') > -1);
+    check('the active one is marked', /active/.test(convRow(env, 0).className),
+      convRow(env, 0).className);
+    check('the other one is not', !/active/.test(convRow(env, 1).className));
     check('a conversation with waiting work says so',
-      textOf(env.els.convlist.children[1]).indexOf('2 waiting') > -1,
-      textOf(env.els.convlist.children[1]));
+      textOf(convRow(env, 1)).indexOf('2 waiting') > -1,
+      textOf(convRow(env, 1)));
 
     env.els.menu.dispatch('click');
     await settle();
@@ -1977,15 +2031,15 @@ async function main() {
     const env = liveEnv();
     await settle();
     const before = env.reads().length;
-    env.els.convlist.children[1].dispatch('click'); // switch to "Widget audit"
+    convRow(env, 1).dispatch('click'); // switch to "Widget audit"
     await settle();
     check('the new conversation is read', env.reads().length > before
       && /conversation=c2/.test(env.reads()[env.reads().length - 1].url),
       env.reads()[env.reads().length - 1].url);
     check('the header follows', env.els.title.textContent === 'Widget audit', env.els.title.textContent);
     check('the drawer closes on switch', env.els.drawer.className === '');
-    check('the active marker moved', /active/.test(env.els.convlist.children[1].className)
-      && !/active/.test(env.els.convlist.children[0].className));
+    check('the active marker moved', /active/.test(convRow(env, 1).className)
+      && !/active/.test(convRow(env, 0).className));
 
     env.els.input.value = 'a typed message';
     env.els.send.dispatch('click');
@@ -2012,7 +2066,7 @@ async function main() {
       env.sandbox.history.entries.length === 1 && env.sandbox.history.entries[0].how === 'replace',
       JSON.stringify(env.sandbox.history.entries));
 
-    env.els.convlist.children[1].dispatch('click'); // switch to "Widget audit"
+    convRow(env, 1).dispatch('click'); // switch to "Widget audit"
     await settle();
     check('switching puts that conversation in the address bar',
       env.sandbox.location.hash === '#/c/c2', env.sandbox.location.hash);
@@ -2057,7 +2111,7 @@ async function main() {
   {
     const env = liveEnv();
     await settle();
-    env.els.convlist.children[1].dispatch('click');
+    convRow(env, 1).dispatch('click');
     await settle();
     check('we are in the second conversation', env.els.title.textContent === 'Widget audit');
 
@@ -2085,7 +2139,7 @@ async function main() {
     check('*** an unknown conversation does not leave a blank page ***',
       env.els.title.textContent === 'Main', env.els.title.textContent);
     check('it says so rather than switching you silently',
-      /not here any more/i.test(env.els.err.textContent), JSON.stringify(env.els.err.textContent));
+      /not in your list/i.test(env.els.err.textContent), JSON.stringify(env.els.err.textContent));
     check('and the bad address is repaired, so a reload does not repeat it',
       env.sandbox.location.hash === '#/c/main', env.sandbox.location.hash);
     check('...by replacing, so Back does not lead to the dead link',
@@ -2105,7 +2159,7 @@ async function main() {
     open.sandbox.dispatchWindow('hashchange');
     await settle();
     check('a dead link pasted into an already-open page is repaired too',
-      open.els.title.textContent === 'Main' && /not here any more/i.test(open.els.err.textContent),
+      open.els.title.textContent === 'Main' && /not in your list/i.test(open.els.err.textContent),
       `${open.els.title.textContent} / ${open.els.err.textContent}`);
   }
 
@@ -2158,7 +2212,7 @@ async function main() {
 
     env.sayOneThing();                       // spoken while "Main" is open
     await settle();
-    env.els.convlist.children[1].dispatch('click'); // ...user switches away mid-transcription
+    convRow(env, 1).dispatch('click'); // ...user switches away mid-transcription
     await settle();
     check('the switch happened', env.els.title.textContent === 'Widget audit', env.els.title.textContent);
     check('the live microphone was not stranded by the switch', env.track().stopped === false);
@@ -2192,7 +2246,7 @@ async function main() {
     env.els.menu.dispatch('click');
     await settle();
 
-    const rows = env.els.convlist.children;
+    const rows = env.els.convlist.children.map((w) => w.children[0]);
     check('all three conversations are listed', rows.length === 3, `${rows.length}`);
     const sparks = rows.map((r) => r.children.find((k) => /spark/.test(k.className)));
     check('a busy conversation gets a sparkline', !!sparks[0] && sparks[0].children.length === 12,
@@ -2241,7 +2295,7 @@ async function main() {
     check('a second hue is derived for the gradient', env.cssVar('--hue2') !== undefined);
     check('the hue is a legal degree', Number(mainHue) >= 0 && Number(mainHue) < 360, String(mainHue));
 
-    env.els.convlist.children[1].dispatch('click'); // switch conversations
+    convRow(env, 1).dispatch('click'); // switch conversations
     await settle();
     check('switching conversation changes the colour', env.cssVar('--hue') !== mainHue,
       `${mainHue} -> ${env.cssVar('--hue')}`);
@@ -2251,9 +2305,9 @@ async function main() {
     check('the same conversation always gets the same colour', again.cssVar('--hue') === mainHue,
       `${again.cssVar('--hue')} vs ${mainHue}`);
     check('each row in the menu is striped with its own colour',
-      again.els.convlist.children[0].style.borderLeftColor
-      !== again.els.convlist.children[1].style.borderLeftColor,
-      String(again.els.convlist.children[0].style.borderLeftColor));
+      convRow(again, 0).style.borderLeftColor
+      !== convRow(again, 1).style.borderLeftColor,
+      String(convRow(again, 0).style.borderLeftColor));
   }
 
   console.log('\ncolour — message state is readable without relying on hue');
@@ -2283,6 +2337,239 @@ async function main() {
         textOf(bubbles[i]).indexOf(chips[i]) > -1, textOf(bubbles[i]));
     }
     check('the three glyphs are all different', new Set(chips.map((c) => c[0])).size === 3);
+  }
+
+  // ===================================== folder scopes (FOLDER-SCOPES-SPEC item 4)
+  /*
+   * The page's path is a folder under home. `/` must behave exactly as before
+   * (every test above runs there); a deep path shows only that folder and what
+   * is below it, and never sends into, flashes, or remembers another folder's
+   * conversation.
+   */
+  const scoped = [
+    { id: 'main', title: 'Main', lastText: 'the first thread' },
+    { id: 'rq', title: 'Relay work', path: 'Projects/relay-queue' },
+    { id: 'rqsub', title: 'Relay tools', path: 'Projects/relay-queue/tools' },
+    { id: 'near', title: 'Lookalike', path: 'Projects/relay-queue-old' },
+    { id: 'sp', title: 'Sporefall', path: 'Projects/sporefall-station' },
+  ];
+  const listReads = (env) => env.posted.filter((p) => /^\/conversations(\?|$)/.test(String(p.url)) && !(p.body));
+
+  console.log('\nfolder scopes — the root is unchanged');
+  {
+    const env = liveEnv({ convs: scoped });
+    await settle();
+    check('the root asks for the whole list, with no path',
+      listReads(env).length > 0 && listReads(env).every((p) => p.url === '/conversations'),
+      listReads(env).map((p) => p.url).join(' '));
+    check('...and lists every folder\'s conversations', env.els.convlist.children.length === 5,
+      `${env.els.convlist.children.length} rows`);
+    check('...with no folder labels on the rows',
+      !findAll(env.els.convlist, (n) => /convpath/.test(n.className || '')).length);
+    check('...no breadcrumb in the header', env.els.title.parentNode.children[0] === env.els.title);
+    check('...and it opens on main', env.els.title.textContent === 'Main', env.els.title.textContent);
+    check('an older server without /folders leaves the folder section hidden', env.els.folders.hidden === true);
+    convRow(env, 1).dispatch('click');
+    await settle();
+    check('a switch at the root is remembered under the old key, unsuffixed',
+      env.sandbox.localStorage.getItem('relay.conv') === 'rq', env.sandbox.localStorage.getItem('relay.conv'));
+  }
+
+  console.log('\nfolder scopes — a folder page shows its folder and below');
+  {
+    const env = liveEnv({ convs: scoped, pathname: '/Projects/relay-queue' });
+    await settle();
+    check('it asks the server for this folder only',
+      listReads(env).some((p) => p.url === '/conversations?path=Projects%2Frelay-queue'),
+      listReads(env).map((p) => p.url).join(' '));
+    const titles = env.els.convlist.children.map((w) => textOf(w));
+    check('*** it lists this folder and its subfolders, nothing else ***',
+      titles.length === 2 && /Relay work/.test(titles[0]) && /Relay tools/.test(titles[1]), titles.join(' | '));
+    check('a whole-segment match only: relay-queue-old is not relay-queue',
+      !titles.some((t) => /Lookalike/.test(t)));
+    check('a subfolder row is labelled with its path relative to here', /tools\//.test(titles[1]), titles[1]);
+    check('...and a row at this folder is not', !/convpath/.test(JSON.stringify(env.els.convlist.children[0].children[0].children.map((k) => k.className))));
+    check('*** it opens on this folder\'s first tab, not main ***', env.els.title.textContent === 'Relay work',
+      env.els.title.textContent);
+    check('no thread outside this folder was ever read',
+      env.reads().every((p) => /conversation=(rq|rqsub)\b/.test(p.url)), env.reads().map((p) => p.url).join(' '));
+    check('a plain first visit is not scolded', !env.els.err.textContent, env.els.err.textContent);
+    check('the address bar names it', env.sandbox.location.hash === '#/c/rq', env.sandbox.location.hash);
+    check('it is remembered for this folder only',
+      env.sandbox.localStorage.getItem('relay.conv:Projects/relay-queue') === 'rq'
+      && env.sandbox.localStorage.getItem('relay.conv') === null,
+      JSON.stringify([env.sandbox.localStorage.getItem('relay.conv:Projects/relay-queue'), env.sandbox.localStorage.getItem('relay.conv')]));
+
+    const box = env.els.title.parentNode.children[0];
+    check('the header gets a breadcrumb above the title', box && box.id === 'scopebox' && box.children[1] === env.els.title);
+    const links = findAll(box, (n) => n.tagName === 'A');
+    check('*** each crumb links to its ancestor folder ***',
+      links.map((a) => a.href).join(' ') === '/ /Projects /Projects/relay-queue',
+      links.map((a) => a.href).join(' '));
+
+    env.els.input.value = 'filed here';
+    env.els.send.dispatch('click');
+    await settle();
+    check('a message goes to this folder\'s tab', env.sent()[0] && env.sent()[0].body.conversationId === 'rq',
+      JSON.stringify(env.sent()[0] && env.sent()[0].body));
+
+    env.els.newtitle.value = 'A new one';
+    env.els.newconv.dispatch('click');
+    await settle();
+    const made = env.posted.filter((p) => p.url === '/conversations' && p.body && p.body.title === 'A new one')[0];
+    check('*** a new tab is created in this folder ***', made && made.body.path === 'Projects/relay-queue',
+      JSON.stringify(made && made.body));
+  }
+
+  console.log('\nfolder scopes — the root still creates tabs without a path');
+  {
+    const env = liveEnv({ convs: scoped });
+    await settle();
+    env.els.newtitle.value = 'Root tab';
+    env.els.newconv.dispatch('click');
+    await settle();
+    const made = env.posted.filter((p) => p.url === '/conversations' && p.body && p.body.title === 'Root tab')[0];
+    check('the body is exactly { title }', made && JSON.stringify(made.body) === '{"title":"Root tab"}',
+      JSON.stringify(made && made.body));
+  }
+
+  console.log('\nfolder scopes — other folders stay out of it');
+  {
+    const env = liveEnv({ convs: scoped, pathname: '/Projects/relay-queue' });
+    await settle();
+    const rowsBefore = env.els.convlist.children.length;
+    env.convReply('sp', 'news from another folder', 'sp-1');
+    await settle();
+    check('*** activity in another folder does not light the hamburger ***', env.els.menudot.className !== 'show',
+      env.els.menudot.className);
+    env.convReply('main', 'news at the root', 'main-1');
+    await settle();
+    check('...nor does activity in main', env.els.menudot.className !== 'show', env.els.menudot.className);
+    check('...and none of it reaches the thread',
+      JSON.stringify(env.els.list.children).indexOf('news from another') === -1
+      && JSON.stringify(env.els.list.children).indexOf('news at the root') === -1);
+    const convReads = listReads(env).length;
+    env.store.es.onmessage({ data: JSON.stringify({ conversation: { id: 'sp2', title: 'Elsewhere', path: 'Projects/sporefall-station' } }) });
+    await settle();
+    check('a conversation frame from another folder adds no row and costs no read',
+      env.els.convlist.children.length === rowsBefore && listReads(env).length === convReads,
+      `${env.els.convlist.children.length} rows, ${listReads(env).length - convReads} reads`);
+
+    env.convReply('rqsub', 'news in a subfolder', 'sub-1');
+    await settle();
+    check('but activity in a subfolder does light it', env.els.menudot.className === 'show', env.els.menudot.className);
+  }
+
+  console.log('\nfolder scopes — memory and links from another folder');
+  {
+    const env = liveEnv({ convs: scoped, pathname: '/Projects/relay-queue', stored: { 'relay.conv:Projects/relay-queue': 'rqsub', 'relay.conv': 'sp' } });
+    await settle();
+    check('the folder\'s own memory is honoured, not the root\'s', env.els.title.textContent === 'Relay tools',
+      env.els.title.textContent);
+
+    const linked = liveEnv({ convs: scoped, pathname: '/Projects/relay-queue', hash: '#/c/sp' });
+    await settle();
+    check('*** a link to another folder\'s tab falls back to this folder ***',
+      linked.els.title.textContent === 'Relay work', linked.els.title.textContent);
+    check('...out loud', /not in Projects\/relay-queue/.test(linked.els.err.textContent), linked.els.err.textContent);
+    check('...and the other folder\'s thread was never read',
+      linked.reads().every((p) => !/conversation=sp\b/.test(p.url)), linked.reads().map((p) => p.url).join(' '));
+
+    // The same link pasted into a folder page that is already open.
+    const open = liveEnv({ convs: scoped, pathname: '/Projects/relay-queue' });
+    await settle();
+    open.sandbox.location.hash = '#/c/sp';
+    open.sandbox.dispatchWindow('hashchange');
+    open.els.input.value = 'meant for this folder';
+    open.els.send.dispatch('click');
+    await settle(); await settle();
+    check('*** a pasted link to another folder\'s tab does not switch into it ***',
+      open.els.title.textContent === 'Relay work', open.els.title.textContent);
+    check('...so nothing can be sent into it', open.sent().every((p) => p.body.conversationId !== 'sp'),
+      JSON.stringify(open.sent().map((p) => p.body.conversationId)));
+    check('...its thread is never read', open.reads().every((p) => !/conversation=sp\b/.test(p.url)),
+      open.reads().map((p) => p.url).join(' '));
+    check('...it says so', /not in Projects\/relay-queue/.test(open.els.err.textContent), open.els.err.textContent);
+    check('...and the address is put back', open.sandbox.location.hash === '#/c/rq', open.sandbox.location.hash);
+  }
+
+  console.log('\nfolder scopes — an empty folder');
+  {
+    const env = liveEnv({ convs: scoped, pathname: '/Projects/brand-new' });
+    await settle();
+    check('nothing is listed', env.els.convlist.children.length === 0, `${env.els.convlist.children.length}`);
+    check('*** no thread is read at all — not main, not anything ***', env.reads().length === 0,
+      env.reads().map((p) => p.url).join(' '));
+    check('it says how to start one', /Nothing is filed in Projects\/brand-new/.test(env.els.err.textContent),
+      env.els.err.textContent);
+    env.els.input.value = 'into the void';
+    env.els.send.dispatch('click');
+    await settle();
+    check('*** and it refuses to send anywhere ***', env.sent().length === 0, JSON.stringify(env.sent()));
+    check('...keeping the words', env.els.input.value === 'into the void');
+
+    env.els.newtitle.value = 'First here';
+    env.els.newconv.dispatch('click');
+    await settle(); await settle();
+    check('creating one moves in', env.els.title.textContent === 'First here', env.els.title.textContent);
+    check('...and the notice is gone', !/Nothing is filed/.test(env.els.err.textContent), env.els.err.textContent);
+    env.els.send.dispatch('click');
+    await settle();
+    check('...and the waiting words now go there', env.sent()[0] && env.sent()[0].body.conversationId === 'c-new',
+      JSON.stringify(env.sent()));
+  }
+
+  console.log('\nfolder scopes — a malformed address is the root');
+  {
+    const env = liveEnv({ convs: scoped, pathname: '/Projects/../etc' });
+    await settle();
+    check('it lists everything, as the root does', env.els.convlist.children.length === 5,
+      `${env.els.convlist.children.length}`);
+    check('and asks with no path', listReads(env).every((p) => p.url === '/conversations'));
+  }
+
+  console.log('\nfolders — drilldown in the drawer');
+  {
+    const folders = [
+      { name: 'relay-queue', path: 'Projects/relay-queue', conversations: 2, pending: 1, unread: 0 },
+      { name: 'sporefall-station', path: 'Projects/sporefall-station', conversations: 1, pending: 0, unread: 3 },
+    ];
+    const env = liveEnv({ convs: scoped, pathname: '/Projects', folders });
+    await settle();
+    env.els.menu.dispatch('click');
+    await settle();
+    check('the section appears once /folders answers', env.els.folders.hidden === false);
+    check('it asked for this folder\'s children',
+      env.posted.some((p) => p.url === '/folders?path=Projects'), env.posted.map((p) => p.url).filter((u) => /folders/.test(u)).join(' '));
+    const rows = env.els.foldlist.children;
+    check('one row per child folder', rows.length === 2, `${rows.length}`);
+    check('*** a row links to the folder\'s page ***', rows[0] && rows[0].href === '/Projects/relay-queue', rows[0] && rows[0].href);
+    check('it shows the tab count and what is waiting', /relay-queue\//.test(textOf(rows[0]))
+      && /2 tabs/.test(textOf(rows[0])) && /1 waiting/.test(textOf(rows[0])), textOf(rows[0]));
+    check('unread wears the same red dot as a conversation row',
+      rows[1] && rows[1].children.some((k) => k.className === 'convdot'));
+    const crumbs = findAll(env.els.foldcrumbs, (n) => n.tagName === 'A').map((a) => a.href).join(' ');
+    check('the drawer has the breadcrumb too', crumbs === '/ /Projects', crumbs);
+
+    env.els.foldpath.value = 'Projects/sporefall-station/../x';
+    env.els.foldgo.dispatch('submit', { preventDefault() {} });
+    check('*** a bad path is refused inline, without navigating ***',
+      /show/.test(env.els.folderr.className) && !/\/x$/.test(env.sandbox.location.href), env.sandbox.location.href);
+    env.els.foldpath.value = '~/Projects/brand new/';
+    env.els.foldgo.dispatch('submit', { preventDefault() {} });
+    check('*** a good one navigates there, even with nothing filed in it ***',
+      env.sandbox.location.href === '/Projects/brand%20new', env.sandbox.location.href);
+
+    env.els.foldtoggle.dispatch('click');
+    check('it folds', /folded/.test(env.els.folders.className) && env.els.foldtoggle.getAttribute('aria-expanded') === 'false');
+    check('...and remembers', env.sandbox.localStorage.getItem('relay.folders.folded') === '1');
+    const next = liveEnv({ convs: scoped, folders, stored: { 'relay.folders.folded': '1' } });
+    await settle();
+    check('a folded section stays folded on the next visit', /folded/.test(next.els.folders.className));
+    next.els.menu.dispatch('click');
+    await settle();
+    check('the root shows the section too', next.els.folders.hidden === false
+      && next.posted.some((p) => p.url === '/folders?path='));
   }
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');

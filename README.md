@@ -742,10 +742,19 @@ A conversation record:
   "title": "Widget audit",
   "agent": "coordinator-2",
   "createdAt": "2026-01-01T00:00:00.000Z",
+  "path": "Projects/widgets",
   "archived": false,
   "archivedAt": null
 }
 ```
+
+**`path` is the folder the conversation is filed under**, relative to the owner's home — `""` is
+the home root, and every record written before folder scopes reads as `""` (no log rewrite). The page
+at `/Projects/widgets` shows only conversations in that folder and below, and autoseat runs the
+conversation's coordinator with that folder as its cwd. The server itself never resolves it to a
+directory. It is normalised on the way in: one leading and one trailing slash are stripped (`null`,
+`""` and `/` all mean the root), and anything else that is not already canonical is a `400` — `.` or
+`..` segments, empty segments (`a//b`), backslashes, control characters. Whitespace is kept.
 
 **`agent` is the agent side's field.** It names whoever is meant to answer in this conversation.
 relay-queue never reads it, never acts on it and **never spawns anything** — it is a passive queue,
@@ -770,6 +779,7 @@ Returns `{count, defaultId, conversations:[…]}`. Filters, which stack:
 | `?unread=1`  | only conversations with unrelayed results |
 | `?archived=1` | include archived ones |
 | `?archived=only` | *only* archived ones |
+| `?path=Projects` | only conversations in that folder **or below it**, on whole segments (`Projects` does not match `ProjectsOld`); absent, empty or `/` = everything. `400` if invalid |
 
 **Where is there work waiting, and who is meant to do it?**
 
@@ -777,12 +787,26 @@ Returns `{count, defaultId, conversations:[…]}`. Filters, which stack:
 curl -s 'http://127.0.0.1:3901/conversations?pending=1'
 ```
 
-**Create a conversation** — `title` is required, `agent` optional. Returns `201` + the record.
+**Create a conversation** — `title` is required, `agent` and `path` optional. Returns `201` + the
+record.
 
 ```bash
 curl -s -X POST http://127.0.0.1:3901/conversations \
   -H 'content-type: application/json' \
-  -d '{"title":"Widget audit","agent":"coordinator-2"}'
+  -d '{"title":"Widget audit","agent":"coordinator-2","path":"Projects/widgets"}'
+```
+
+**List the child folders under a scope** — for drilling down. Returns the *immediate* child folders
+of `path` (absent / empty / `/` = the home root) that hold at least one conversation at or below
+them, sorted by name, each with how many conversations are in it and the summed `pending` and `unread`
+(`counts.unrelayed`) from the list above. Derived only from conversation paths — the server never
+reads a home folder, so an empty folder is not listed. The `archived` filter works exactly as on
+`GET /conversations` (archived ones left out by default). `400` on an invalid `path`.
+
+```bash
+curl -s 'http://127.0.0.1:3901/folders?path=Projects'
+# {"path":"Projects","count":1,"folders":[{"name":"relay-queue","path":"Projects/relay-queue",
+#   "conversations":3,"pending":1,"unread":2}]}
 ```
 
 **Get one** — same shape as a list entry, with counts. `404` if unknown.
@@ -791,8 +815,8 @@ curl -s -X POST http://127.0.0.1:3901/conversations \
 curl -s http://127.0.0.1:3901/conversations/REPLACE_ID
 ```
 
-**Rename, reassign or archive** — POST any of `title`, `agent` (or `assignee`), `archived`. Only the
-fields present are changed.
+**Rename, reassign, move or archive** — POST any of `title`, `agent` (or `assignee`), `path`,
+`archived`. Only the fields present are changed. `path` may be set on `main` too.
 
 ```bash
 curl -s -X POST http://127.0.0.1:3901/conversations/REPLACE_ID \
@@ -869,8 +893,11 @@ a guess. The active conversation is remembered across reloads.
 
 ```
 data: {"now":"…","conversationId":"main","entries":[…]}
-data: {"now":"…","conversation":{"id":"…","title":"…","agent":"…","archived":false}}
+data: {"now":"…","conversation":{"id":"…","title":"…","agent":"…","path":"…","archived":false}}
 ```
+
+A `conversation` frame carries the whole record, `path` included, so a page scoped to a folder can
+tell that a frame belongs to a conversation outside its scope and not light the menu dot for it.
 
 A page merges frames for the conversation it is showing and merely *flags* the rest. This is
 deliberately not filtered server-side: it is what lets the menu light up for a conversation you are
@@ -1309,6 +1336,7 @@ JSON
 | Method | Path                  | Purpose                                                        |
 | ------ | --------------------- | -------------------------------------------------------------- |
 | GET    | `/`                   | **new** — the mobile web UI (`text/html`; `503` if the page file is missing) |
+| GET    | `/<folder path>`      | **new** — the same page, scoped to that folder — only for a browser navigation (`Accept: text/html` or `Sec-Fetch-Mode: navigate`) to a path no route owns; anything else still gets the JSON `404`. A folder whose first segment is a route name in this table (`folders`, `tasks`, `images`, …) cannot be opened this way |
 | GET    | `/health`             | liveness + counts                                               |
 | POST   | `/tasks`              | create (`400` if `instruction`/`text` missing, over 8000 chars, or the conversation is unknown) |
 | GET    | `/tasks`              | list; `conversation` `status` `unread` `since` `limit` (first N) |
@@ -1322,10 +1350,11 @@ JSON
 | GET    | `/messages`           | **new** — read an internal channel; `channel` `since` `limit`     |
 | GET    | `/channels`           | **new** — which internal channels exist                          |
 | GET    | `/thread`             | chronological human+agent view; `conversation` `since` (on `rev`) `limit` (last N) |
-| GET    | `/conversations`      | **new** — list with counts and a snippet; `pending` `unread` `archived` |
-| POST   | `/conversations`      | **new** — create one (`title`, optional `agent`)                 |
+| GET    | `/conversations`      | **new** — list with counts and a snippet; `pending` `unread` `archived` `path` |
+| POST   | `/conversations`      | **new** — create one (`title`, optional `agent`, `path`)         |
 | GET    | `/conversations/:id`  | **new** — one conversation with its counts                       |
-| POST   | `/conversations/:id`  | **new** — rename / reassign / archive (`title`, `agent`, `archived`) |
+| GET    | `/folders`            | **new** — immediate child folders of `path` that hold conversations, with counts; `path` `archived` |
+| POST   | `/conversations/:id`  | **new** — rename / reassign / move / archive (`title`, `agent`, `path`, `archived`) |
 | POST   | `/agents`             | **new** — register a self-chosen name; returns a `key` and the inbox path (`409` if the name, folded, is taken) |
 | GET    | `/agents`             | **new** — the roster, the tree and the graveyard; `conversationId` |
 | GET    | `/agents/:name`       | **new** — one agent; any spelling that folds the same reaches it   |
