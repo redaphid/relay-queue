@@ -2,6 +2,14 @@
 
 Message queue between the human and his agents. `server.js` on `http://127.0.0.1:3901`.
 
+> **Active handoff:** the folder-scopes work in progress is described in
+> HANDOFF.md, imported below. When its objective is complete (feature merged
+> and the post-deploy migration done), delete HANDOFF.md and remove this note
+> and the `@HANDOFF.md` line.
+> The latest handoff is always written to the root HANDOFF.md; older ones go in handoffs/.
+
+@HANDOFF.md
+
 Coordinator protocol: read **`COORDINATOR.md`** (a stub pointing at the
 `relay-coordinator` skill in `.claude/skills/`). Read it before touching relay.
 
