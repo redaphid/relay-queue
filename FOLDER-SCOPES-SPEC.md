@@ -3,6 +3,11 @@
 Status: owner-approved design, 2026-09-19. Implementation NOT started - see
 `HANDOFF.md`.
 
+Follow-up: **`FOLDER-BROWSE-SPEC.md`** adds `GET /fs` and `POST /folder-index`
+on top of this - the host publishes a home directory index so the drawer can
+list, and the path box can autocomplete, folders that hold no tab yet.
+`GET /folders` below is unchanged and stays derived from conversation paths.
+
 ## Goal
 
 Relay URL paths map to folders relative to the owner's WSL home
