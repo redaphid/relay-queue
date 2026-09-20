@@ -253,6 +253,137 @@ function folderProblem(cwd) {
 }
 
 /*
+ * ---- the folder index: telling relay what folders exist ------------------
+ *
+ * A tab is filed at a folder relative to home, and getting that path wrong is
+ * silent - autoseat spawns nothing and posts one note. The page cannot offer a
+ * picker because the server has NO HOME MOUNT (the owner's decision, and not
+ * revisited): it runs in a container that sees only the checkout and data/.
+ *
+ * This process does have home access, and already talks to relay, so it walks
+ * home and POSTs a directory index to /folder-index; the server stores it and
+ * serves it back on /fs. See FOLDER-BROWSE-SPEC.md.
+ *
+ * THIS IS A BONUS AND NEVER A DEPENDENCY. Every call into it is wrapped so
+ * that a throw, a refusal or an unreachable relay is one log line and nothing
+ * else: seating must not be delayed, skipped or broken because a directory
+ * walk went wrong. RELAY_FOLDER_INDEX=0 turns the whole thing off.
+ *
+ * What it publishes is directory NAMES under home and nothing else - no file
+ * names, no contents, depth 4 - and the port it goes to has no app auth. The
+ * owner was told (FOLDER-BROWSE-SPEC.md, "Security note"): anyone who can
+ * reach 3901 can already file a tab at any path and have a guarded coordinator
+ * seated there, which is strictly more than reading these names.
+ */
+const FOLDER_INDEX_ON = process.env.RELAY_FOLDER_INDEX !== '0';
+const FOLDER_INDEX_MS = 180000;
+// Depth 4 below home reaches ~/Projects/app/src/lib and stops. Deeper is where
+// a home directory stops being navigable and starts being a file listing.
+const FOLDER_INDEX_DEPTH = 4;
+// A hard stop, so a home with a pathological tree cannot make this walk long or
+// the payload large. The server caps at the same number independently.
+const FOLDER_INDEX_MAX = 4000;
+/* Dot-folders are config, not places to work; the rest are build output and
+ * dependency trees, which are the bulk of the entries in any project folder
+ * and are never somewhere a tab gets filed. */
+const FOLDER_SKIP = new Set(['node_modules', '__pycache__', 'venv', 'dist', 'build']);
+
+/**
+ * Every directory under `home`, home-relative, breadth-first.
+ *
+ * SYMLINKS ARE NOT FOLLOWED, and the mechanism is `withFileTypes` rather than a
+ * stat: a symlink's dirent reports isSymbolicLink(), never isDirectory(), so a
+ * link to `/` or a loop back into home is simply not a directory here. An
+ * unreadable directory is skipped, not an error - a permission denied halfway
+ * through home must not cost the whole scan.
+ *
+ * @returns {{dirs: string[], truncated: boolean}} sorted, so an unchanged tree
+ *   produces an unchanged payload whatever order the filesystem hands back.
+ */
+function scanFolders(home, opts) {
+  const maxDepth = Number((opts && opts.depth) || FOLDER_INDEX_DEPTH);
+  const max = Number((opts && opts.max) || FOLDER_INDEX_MAX);
+  const dirs = [];
+  let truncated = false;
+  const queue = [{ abs: path.resolve(home), rel: '', depth: 0 }];
+  while (queue.length && !truncated) {
+    const cur = queue.shift();
+    if (cur.depth >= maxDepth) continue;
+    let entries;
+    try { entries = fs.readdirSync(cur.abs, { withFileTypes: true }); } catch { continue; }
+    for (const d of entries) {
+      if (!d.isDirectory()) continue;
+      if (d.name.startsWith('.') || FOLDER_SKIP.has(d.name)) continue;
+      if (dirs.length >= max) { truncated = true; break; }
+      const rel = cur.rel ? `${cur.rel}/${d.name}` : d.name;
+      dirs.push(rel);
+      queue.push({ abs: path.join(cur.abs, d.name), rel, depth: cur.depth + 1 });
+    }
+  }
+  dirs.sort();
+  return { dirs, truncated };
+}
+
+/**
+ * Scan and publish, unless nothing has changed since the last publish.
+ *
+ * The skip compares the FOLDER LIST, not the whole payload: `scannedAt` moves
+ * every tick by construction, so a byte comparison including it would never
+ * skip anything and the point of the comparison - not waking the server every
+ * three minutes to be told the same thing - would be lost.
+ *
+ * Throws on a failed POST. The caller is the only thing that catches, on
+ * purpose: this returns a result worth logging or it says what went wrong.
+ */
+async function publishFolderIndex(cfg, runtime) {
+  const scan = scanFolders(cfg.home);
+  const key = JSON.stringify([scan.truncated, scan.dirs]);
+  if (key === runtime.folderIndexKey) return { skipped: true, dirs: scan.dirs.length, truncated: scan.truncated };
+  const r = await postJson(cfg.queue, '/folder-index', {
+    root: '~',
+    scannedAt: new Date().toISOString(),
+    truncated: scan.truncated,
+    dirs: scan.dirs,
+  });
+  // Only after the server has it: a failed POST must be retried next tick.
+  runtime.folderIndexKey = key;
+  return { skipped: false, dirs: scan.dirs.length, truncated: scan.truncated, stored: r && r.stored, dropped: r && r.dropped };
+}
+
+/**
+ * Arm the publisher: once now, then every FOLDER_INDEX_MS.
+ *
+ * Nothing in here can reach seating. The timer is unref'd (it must never be
+ * the reason this process stays up), every tick is wrapped, and a repeated
+ * failure is logged once rather than every three minutes - a relay that is
+ * down is already loud elsewhere, and this is the least important thing in the
+ * process.
+ */
+function startFolderIndex(cfg, runtime) {
+  if (!FOLDER_INDEX_ON) {
+    runtime.log('folder index: off (RELAY_FOLDER_INDEX=0); the page keeps the typed-path box and no picker');
+    return null;
+  }
+  const once = async () => {
+    try {
+      const r = await publishFolderIndex(cfg, runtime);
+      runtime.folderIndexError = null;
+      if (!r.skipped) runtime.log(`folder index: published ${r.dirs} folder(s)${r.truncated ? ' (truncated)' : ''}`
+        + `${r.dropped ? `, ${r.dropped} dropped by the server` : ''}`);
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      if (runtime.folderIndexError !== msg) runtime.log(`folder index: not published (${msg}); retrying in ${FOLDER_INDEX_MS / 1000}s`);
+      runtime.folderIndexError = msg;
+    }
+  };
+  once();
+  const timer = setInterval(once, FOLDER_INDEX_MS);
+  if (timer.unref) timer.unref();
+  runtime.folderIndexTimer = timer;
+  return timer;
+}
+
+/*
  * EVERY TAB STARTS IN ITS OWN GIT WORKTREE (owner, 2026-09-19).
  *
  * If a tab's folder is inside a git repo, its seat does not stand in that
@@ -1778,6 +1909,7 @@ async function shutdown(runtime, sig, opts) {
   if (runtime.stopping) return;
   runtime.stopping = true;
   clearTimeout(runtime.pokeTimer);
+  clearInterval(runtime.folderIndexTimer);
   const { log } = runtime;
   const mine = [...runtime.coords.values()].filter((c) => c.attached);
   const idle = mine.filter((c) => !c.busy && !c.closing);
@@ -1921,6 +2053,10 @@ const USAGE = `autoseat - keep one long-lived coordinator per tab that has a hum
   --once               run a single pass and exit; a coordinator it started answers that one turn and exits
   --dry                decide, log, spawn nothing
   --explain            print every message considered and why it was or was not seated
+
+  RELAY_FOLDER_INDEX=0 stop publishing the home folder index the page's folder picker reads
+                       (POST /folder-index, served back on GET /fs). Directory names only, under
+                       home, depth 4. Off means the page keeps its typed-path box and no picker.
 `;
 
 async function main() {
@@ -1983,6 +2119,12 @@ async function main() {
   beat();
 
   await safeTick();
+  /*
+   * After the first seating pass, never before it: the walk is synchronous and
+   * a tab waiting for a coordinator outranks a picker being up to date. Not
+   * awaited, and it cannot throw - see startFolderIndex.
+   */
+  if (!cfg.once && !cfg.dry) startFolderIndex(cfg, runtime);
   if (cfg.once) {
     /* --once hands out one turn and stops deciding. Closing stdin makes any
      * coordinator it started answer that turn and exit - the old one-shot
@@ -2003,6 +2145,7 @@ module.exports = {
   selectSeats, coveredBy, agentName, brief, turnText, writeHeartbeat, parseArgs, HUMAN_ORIGINS,
   createRuntime, tick, serialTicker, adoptSurvivors, shutdown, pidAlive, loadState,
   seatArgs, verifySeatConfig, seatCwd, folderProblem, prepareSeatDir, slugify, REPO, SEAT_SETTINGS, SEAT_SKILL,
+  scanFolders, publishFolderIndex, startFolderIndex, FOLDER_INDEX_ON,
 };
 
 if (require.main === module) main();

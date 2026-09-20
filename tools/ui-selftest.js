@@ -187,8 +187,9 @@ function makeEnv(opts) {
     // The offline banner and the composer it sits above. Both are core chrome:
     // the page is entitled to assume they exist, so the stub must have them.
     'offbar', 'composer',
-    // Folder drilldown in the drawer (GET /folders).
-    'folders', 'foldtoggle', 'foldwhere', 'foldcrumbs', 'foldlist', 'foldgo', 'foldpath', 'folderr'];
+    // Folder drilldown in the drawer (GET /folders), and the real-folder
+    // picker layered on top of it (GET /fs): `foldnames` is the <datalist>.
+    'folders', 'foldtoggle', 'foldwhere', 'foldcrumbs', 'foldlist', 'foldgo', 'foldpath', 'folderr', 'foldnames'];
   const els = {};
   ids.forEach((id) => { els[id] = makeEl(id === 'input' || id === 'newtitle' ? 'textarea' : 'div'); });
   els.drawer.hidden = true;
@@ -219,6 +220,9 @@ function makeEnv(opts) {
       conv('c2', 'Widget audit', { lastText: 'how many widgets', counts: { pending: 2, claimed: 0, done: 0, unrelayed: 0 } })],
     // What GET /folders answers; null models an older server (404).
     folders: opts.folders === undefined ? null : opts.folders,
+    // What GET /fs answers; null models a server with no folder index at all,
+    // which must leave the drawer exactly as /folders drew it.
+    fs: opts.fs === undefined ? null : opts.fs,
     /*
      * A model of the server's checklist store, because checkbox state is server
      * state now. `texts` is what each entry actually said, so the model parses
@@ -415,6 +419,14 @@ function makeEnv(opts) {
       if (/^\/folders\?/.test(String(url))) {
         if (!store.folders) return jsonRes({ error: 'not found' }, 404);
         return jsonRes({ path: new URLSearchParams(String(url).split('?')[1]).get('path') || '', folders: store.folders });
+      }
+      if (/^\/fs\?/.test(String(url))) {
+        if (!store.fs) return jsonRes({ error: 'not found' }, 404);
+        return jsonRes(Object.assign({
+          path: new URLSearchParams(String(url).split('?')[1]).get('path') || '',
+          scannedAt: '2026-01-01T00:00:00.000Z', ageSec: 5, stale: false, truncated: false,
+          known: true, count: (store.fs.dirs || []).length, dirs: [], descendants: [],
+        }, store.fs));
       }
       if (url === '/conversations') {
         if (init && init.method === 'POST') {
@@ -2570,6 +2582,66 @@ async function main() {
     await settle();
     check('the root shows the section too', next.els.folders.hidden === false
       && next.posted.some((p) => p.url === '/folders?path='));
+  }
+
+  console.log('\nfolder picker — the real folders under this one (GET /fs)');
+  {
+    const folders = [
+      { name: 'relay-queue', path: 'Projects/relay-queue', conversations: 2, pending: 1, unread: 0 },
+    ];
+    const dirs = [
+      // The one that already holds tabs, exactly as the index reports it...
+      { name: 'relay-queue', path: 'Projects/relay-queue', hasChildren: true, conversations: 2, pending: 1, unread: 0 },
+      // ...and two that exist on the host with nothing filed in them yet.
+      { name: 'life-control', path: 'Projects/life-control', hasChildren: false, conversations: 0, pending: 0, unread: 0 },
+      { name: 'sporefall-station', path: 'Projects/sporefall-station', hasChildren: true, conversations: 0, pending: 0, unread: 0 },
+    ];
+    const descendants = ['Projects/life-control', 'Projects/relay-queue', 'Projects/relay-queue/data'];
+    const env = liveEnv({ convs: scoped, pathname: '/Projects', folders, fs: { dirs, descendants } });
+    await settle();
+    env.els.menu.dispatch('click');
+    await settle();
+    await settle(); // /fs is asked only once /folders has drawn the list
+    check('it asked the host index for this folder\'s real children',
+      env.posted.some((p) => p.url === '/fs?path=Projects'), env.posted.map((p) => p.url).join(' '));
+    const rows = env.els.foldlist.children;
+    const names = rows.map((r) => (r.className === 'fsep' ? '|' : textOf(r).trim().split('/')[0])).join(' ');
+    check('*** the folders with tabs come first, then a divider, then the empty ones ***',
+      names === 'relay-queue | life-control sporefall-station', names);
+    check('a folder that already has a row is not listed twice',
+      rows.filter((r) => /relay-queue/.test(textOf(r))).length === 1, names);
+    const empty = rows.filter((r) => /fnew/.test(r.className));
+    check('the empty ones are dimmed and carry no tab count',
+      empty.length === 2 && empty.every((r) => !/tab/.test(textOf(r))), empty.map((r) => textOf(r)).join(' | '));
+    check('...and still link to their own page',
+      empty[0] && empty[0].href === '/Projects/life-control', empty[0] && empty[0].href);
+    const options = env.els.foldnames.children.map((o) => o.value).join(' ');
+    check('*** the path box autocompletes to folders that actually exist ***',
+      options === descendants.join(' '), options);
+    check('a fresh index says nothing in the error line', !env.els.folderr.className, env.els.folderr.className);
+
+    console.log('\n...and it is a bonus: nothing about it may break the drawer');
+    const noIdx = liveEnv({ convs: scoped, pathname: '/Projects', folders });
+    await settle();
+    noIdx.els.menu.dispatch('click');
+    await settle();
+    await settle();
+    check('a server with no folder index leaves the list exactly as /folders drew it',
+      noIdx.els.folders.hidden === false && noIdx.els.foldlist.children.length === 1,
+      `${noIdx.els.foldlist.children.length}`);
+    check('...and adds no autocomplete', noIdx.els.foldnames.children.length === 0);
+    check('...and says nothing about it', !noIdx.els.folderr.className, noIdx.els.folderr.className);
+
+    const old = liveEnv({ convs: scoped, pathname: '/Projects', folders, fs: { dirs, descendants, ageSec: 1500, stale: true } });
+    await settle();
+    old.els.menu.dispatch('click');
+    await settle();
+    await settle();
+    check('*** a stale index admits its age, quietly ***',
+      /quiet/.test(old.els.folderr.className) && /25 min old/.test(old.els.folderr.textContent),
+      `${old.els.folderr.className} ${old.els.folderr.textContent}`);
+    check('...and the list is still drawn', old.els.foldlist.children.length === 4,
+      `${old.els.foldlist.children.length}`);
   }
 
   console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');

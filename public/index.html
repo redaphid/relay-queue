@@ -235,6 +235,9 @@
   .fname { flex: 1 1 auto; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fcount { flex: 0 0 auto; font-size: 12px; color: var(--muted); }
   .fwait { flex: 0 0 auto; font-size: 12px; color: var(--off); }
+  /* A real folder that holds no tab yet (GET /fs): same row, dimmed, no count. */
+  .frow.fnew .fname { color: var(--muted); }
+  .fsep { height: 1px; margin: 8px 8px 4px; background: var(--line); }
   .fgo { display: flex; gap: 6px; margin-top: 6px; }
   #foldpath {
     flex: 1 1 auto; min-width: 0; font-family: inherit; font-size: 16px;
@@ -248,6 +251,8 @@
   }
   #folderr { display: none; margin: 6px 2px 0; font-size: 13px; color: var(--err-fg); }
   #folderr.show { display: block; }
+  /* The same line, used for a fact rather than a refusal: an old folder index. */
+  #folderr.quiet { color: var(--muted); }
   .conv {
     display: block; width: 100%; min-height: 48px;
     padding: 10px 12px; margin: 0;
@@ -1521,8 +1526,11 @@
           <nav id="foldcrumbs" class="crumbs" aria-label="Current folder"></nav>
           <div id="foldlist"></div>
           <form id="foldgo" class="fgo" autocomplete="off">
-            <input id="foldpath" type="text" placeholder="Open folder&hellip; Projects/app"
+            <input id="foldpath" type="text" placeholder="Open folder&hellip; Projects/app" list="foldnames"
               autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-label="Open a folder by path">
+            <!-- Real folders under this scope, from GET /fs. Empty, and so
+                 invisible, on a server that has no folder index. -->
+            <datalist id="foldnames"></datalist>
             <button id="foldopen" type="submit">Go</button>
           </form>
           <p id="folderr"></p>
@@ -3585,8 +3593,12 @@
   var foldList = document.getElementById('foldlist');
   var foldGo = document.getElementById('foldgo');
   var foldPath = document.getElementById('foldpath');
+  var foldNames = document.getElementById('foldnames');
   var foldErr = document.getElementById('folderr');
   var foldTimer = null;
+  /* Which folders the /folders pass already put on screen, so the /fs pass can
+   * add only the ones that hold no tab yet rather than listing them twice. */
+  var foldShown = {};
   var FOLD_KEY = 'relay.folders.folded';
 
   function setFolded(on, remember) {
@@ -3639,17 +3651,107 @@
         // At the root the trail would be a lone "~"; the list says enough.
         if (foldCrumbs) foldCrumbs.hidden = !SCOPE;
         if (foldWhere) foldWhere.textContent = SCOPE ? '~/' + SCOPE : '';
+        foldShown = {};
         if (foldList) {
           foldList.textContent = '';
           for (var i = 0; i < j.folders.length; i++) {
             var f = j.folders[i];
-            if (f && typeof f.path === 'string' && normScope(f.path)) foldList.appendChild(folderRow(f));
+            if (f && typeof f.path === 'string' && normScope(f.path)) {
+              foldShown[f.path] = true;
+              foldList.appendChild(folderRow(f));
+            }
           }
         }
         foldersBox.hidden = false;
+        // The bonus, on top of a list that is already correct without it.
+        loadFs();
         return true;
       })
       .catch(function () { foldersBox.hidden = true; return false; });
+  }
+
+  /** A real folder with nothing filed in it yet: dimmed, and no count to give. */
+  function fsRow(d) {
+    var a = el('a', 'frow fnew');
+    a.href = scopeHref(d.path);
+    a.appendChild(el('span', 'fname', (d.name || String(d.path).split('/').pop()) + '/'));
+    if (d.hasChildren) a.appendChild(el('span', 'fcount', '…'));
+    a.setAttribute('aria-label', (d.name || d.path) + ', no conversations yet');
+    return a;
+  }
+
+  /*
+   * GET /fs?path=<scope> - the folders that REALLY exist under this one, from
+   * the index autoseat publishes (the server has no home mount and cannot look
+   * for itself). Two jobs: the subfolders that hold no tab yet, listed below a
+   * divider so "Open folder" is no longer typing blind, and every known folder
+   * under this scope fed to the path box's autocomplete.
+   *
+   * ENTIRELY A BONUS. No index, an older server, a network failure or a shape
+   * this page does not recognise all leave the drawer exactly as loadFolders()
+   * just drew it - the same rule that function already follows, and the reason
+   * nothing here is awaited or reported.
+   */
+  function loadFs() {
+    if (!foldersBox || foldersBox.hidden) return Promise.resolve(false);
+    var scope = SCOPE;
+    return fetch('/fs?path=' + encodeURIComponent(scope), { headers: { accept: 'application/json' } })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j || !Array.isArray(j.dirs)) throw new Error('no fs list');
+        // A reply for a scope we have since navigated away from is not ours.
+        if (scope !== SCOPE) return false;
+        if (foldList) {
+          var sep = null;
+          for (var i = 0; i < j.dirs.length; i++) {
+            var d = j.dirs[i];
+            if (!d || typeof d.path !== 'string' || !normScope(d.path)) continue;
+            if (foldShown[d.path]) continue;
+            if (!sep) { sep = el('div', 'fsep'); foldList.appendChild(sep); }
+            foldList.appendChild(fsRow(d));
+          }
+        }
+        fillFoldNames(j.descendants);
+        noteFsAge(j);
+        return true;
+      })
+      .catch(function () { return false; });
+  }
+
+  /** The `<datalist>` behind #foldpath: folders that actually exist, to type into. */
+  function fillFoldNames(list) {
+    if (!foldNames) return;
+    foldNames.textContent = '';
+    if (!list || !list.length) return;
+    for (var i = 0; i < list.length; i++) {
+      if (typeof list[i] !== 'string' || !list[i]) continue;
+      var o = el('option');
+      o.value = list[i];
+      foldNames.appendChild(o);
+    }
+  }
+
+  /*
+   * One quiet line when the index is old, because a picker that is silently
+   * out of date is worse than one that admits it: autoseat republishes every
+   * three minutes, so anything past ten is the host process being gone. Said
+   * in the error line's place, in the muted colour - it is a fact, not a
+   * refusal - and cleared the moment the index is fresh again.
+   */
+  function noteFsAge(j) {
+    if (!foldErr) return;
+    var old = j && j.stale && typeof j.ageSec === 'number' && j.ageSec > 0;
+    if (!old) {
+      if (/quiet/.test(foldErr.className)) { foldErr.className = ''; foldErr.textContent = ''; }
+      return;
+    }
+    if (foldErr.className && !/quiet/.test(foldErr.className)) return; // a real error is on screen
+    var mins = Math.round(j.ageSec / 60);
+    foldErr.textContent = 'folder list is ' + (mins < 1 ? 'under a minute' : mins + ' min') + ' old.';
+    foldErr.className = 'show quiet';
   }
 
   /** Coalesced, and only while the drawer is open: opening it always re-reads. */

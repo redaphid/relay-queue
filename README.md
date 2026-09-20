@@ -809,6 +809,37 @@ curl -s 'http://127.0.0.1:3901/folders?path=Projects'
 #   "conversations":3,"pending":1,"unread":2}]}
 ```
 
+**Browse the folders that actually exist** — `GET /fs` is the same drill-down over *real* directories,
+so a folder with no tab in it yet is listed too and a picker becomes possible. The server cannot look
+for itself (it runs in a container with no home mount, on purpose): `tools/autoseat.js` walks `$HOME`
+— directories only, depth 4, no symlinks followed, dot-folders and `node_modules`/`dist`/`build`/
+`venv`/`__pycache__` skipped, 4000 entries max — and republishes to `POST /folder-index` every 180s.
+`RELAY_FOLDER_INDEX=0` turns that off and the page keeps only its typed-path box.
+
+The index is a **cache, never the truth**: a scope it has not seen answers `200` with `known:false`
+and an empty list, *not* `404`; `stale` is true past 600s or when there is no index at all; a
+malformed `path` is still `400`. `conversations`/`pending`/`unread` are the same numbers `GET /folders`
+reports, and `descendants` (capped at 500) is autocomplete fodder for a path box.
+
+```bash
+curl -s 'http://127.0.0.1:3901/fs?path=Projects'
+# {"path":"Projects","scannedAt":"2026-09-20T03:00:00.000Z","ageSec":42,"stale":false,
+#  "truncated":false,"known":true,"count":2,
+#  "dirs":[{"name":"life-control","path":"Projects/life-control","hasChildren":true,
+#           "conversations":0,"pending":0,"unread":0}, ...],
+#  "descendants":["Projects/life-control","Projects/relay-queue","Projects/relay-queue/data"]}
+
+curl -s -X POST http://127.0.0.1:3901/folder-index \
+  -H 'content-type: application/json' \
+  -d '{"root":"~","scannedAt":"2026-09-20T03:00:00.000Z","truncated":false,
+       "dirs":["Projects","Projects/relay-queue"]}'
+# {"ok":true,...,"stored":2,"dropped":0}   ← an entry it refuses is DROPPED AND COUNTED, not fatal
+```
+
+This publishes home directory **names** (no file names, no contents) to a port with no app auth. See
+`.github-drafts/authenticate-the-queue.md`; anyone who can reach it can already file a tab at any path
+and have a guarded coordinator seated there, which is strictly more.
+
 **Get one** — same shape as a list entry, with counts. `404` if unknown.
 
 ```bash
@@ -1354,6 +1385,8 @@ JSON
 | POST   | `/conversations`      | **new** — create one (`title`, optional `agent`, `path`)         |
 | GET    | `/conversations/:id`  | **new** — one conversation with its counts                       |
 | GET    | `/folders`            | **new** — immediate child folders of `path` that hold conversations, with counts; `path` `archived` |
+| GET    | `/fs`                 | **new** — child folders of `path` that really exist on the host, from the published index, with the same counts; `path` `archived` |
+| POST   | `/folder-index`       | **new** — the host (autoseat) publishing which folders exist under home; bad entries are dropped and counted |
 | POST   | `/conversations/:id`  | **new** — rename / reassign / move / archive (`title`, `agent`, `path`, `archived`) |
 | POST   | `/agents`             | **new** — register a self-chosen name; returns a `key` and the inbox path (`409` if the name, folded, is taken) |
 | GET    | `/agents`             | **new** — the roster, the tree and the graveyard; `conversationId` |

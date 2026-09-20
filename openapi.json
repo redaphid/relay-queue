@@ -70,7 +70,7 @@
         "operationId": "getIndex",
         "tags": ["meta"],
         "summary": "The mobile web UI",
-        "description": "One self-contained HTML file, served with a tight CSP and the `x-relay-app: 1` header the service worker keys its cache on.\n\nDEEP LINKS. The same page is also the answer to a GET for any path no route owns, when the request is a browser navigation (`Accept` includes `text/html`, or `Sec-Fetch-Mode: navigate`): `/Projects/relay-queue` is the app scoped to that folder (see the conversation `path` field). Any other client still gets the JSON 404 for an unknown path. A folder whose first segment is a route name (`folders`, `conversations`, `tasks`, `images`, `agents`, `events`, `thread`, `v2`, ...) is answered by that route instead, so it cannot be opened as a scope.",
+        "description": "One self-contained HTML file, served with a tight CSP and the `x-relay-app: 1` header the service worker keys its cache on.\n\nDEEP LINKS. The same page is also the answer to a GET for any path no route owns, when the request is a browser navigation (`Accept` includes `text/html`, or `Sec-Fetch-Mode: navigate`): `/Projects/relay-queue` is the app scoped to that folder (see the conversation `path` field). Any other client still gets the JSON 404 for an unknown path. A folder whose first segment is a route name (`folders`, `fs`, `folder-index`, `conversations`, `tasks`, `images`, `agents`, `events`, `thread`, `v2`, ...) is answered by that route instead, so it cannot be opened as a scope.",
         "responses": {
           "200": { "description": "the page", "content": { "text/html": { "schema": { "type": "string" } } } },
           "503": {
@@ -936,6 +936,102 @@
             }
           },
           "400": { "description": "invalid `path`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/fs": {
+      "get": {
+        "operationId": "listHostFolders",
+        "tags": ["conversations"],
+        "summary": "Child folders that actually EXIST on the host, for a folder picker",
+        "description": "The immediate child DIRECTORIES of `path`, sorted by name (plain code-unit order), from the index the host publishes on `POST /folder-index` — so unlike `GET /folders` this lists folders that hold no conversation yet, which is what makes a folder picker possible.\n\nTHE INDEX IS A CACHE, NEVER THE TRUTH. This server runs in a container with no home mount, by the owner's decision, and cannot look for itself; `tools/autoseat.js` walks `$HOME` (directories only, depth 4, no symlinks followed, dot-folders and `node_modules`/`dist`/`build`/`venv`/`__pycache__` skipped) and republishes every 180s. So: a scope the index has never heard of answers **200 with `known: false`** and an empty list, NOT a 404; no index at all answers the same way with `scannedAt: null`; and `stale` is true past 600 seconds or when there is no index. A malformed `path` is still a 400, by the same normaliser as everywhere else.\n\n`conversations`, `pending` and `unread` are the same numbers `GET /folders` reports for that folder (a folder holding no tabs shows zeros), so a badge never differs between the two routes. `descendants` is the autocomplete hint for a path box: every indexed folder below the scope, capped at 500.",
+        "parameters": [
+          { "name": "path", "in": "query", "schema": { "type": "string", "maxLength": 1024 }, "description": "the scope, normalised like the conversation `path` field. Absent, empty or `/` = the home root. Invalid = 400.", "example": "Projects" },
+          { "name": "archived", "in": "query", "schema": { "type": "string", "enum": ["only", "true", "false", "0"] }, "description": "same as on GET /conversations; it only affects the counts" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the child directories the index knows about",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["path", "scannedAt", "ageSec", "stale", "truncated", "known", "count", "dirs", "descendants"],
+                  "properties": {
+                    "path": { "type": "string", "description": "the normalised scope; `\"\"` is the root" },
+                    "scannedAt": { "type": ["string", "null"], "format": "date-time", "description": "when the host walked home; `null` if it never has" },
+                    "ageSec": { "type": ["integer", "null"], "description": "how old that scan is, in seconds" },
+                    "stale": { "type": "boolean", "description": "`ageSec > 600`, or there is no index at all" },
+                    "truncated": { "type": "boolean", "description": "the scan hit its 4000-entry ceiling" },
+                    "known": { "type": "boolean", "description": "the index has seen this scope. `false` means \"not seen\", never \"does not exist\"" },
+                    "count": { "type": "integer" },
+                    "dirs": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["name", "path", "hasChildren", "conversations", "pending", "unread"],
+                        "properties": {
+                          "name": { "type": "string", "description": "one segment" },
+                          "path": { "type": "string", "description": "home-relative; pass it back as `?path=` to drill in" },
+                          "hasChildren": { "type": "boolean", "description": "the index holds at least one folder below it" },
+                          "conversations": { "type": "integer", "description": "as on GET /folders; 0 for a folder with no tabs" },
+                          "pending": { "type": "integer" },
+                          "unread": { "type": "integer" }
+                        }
+                      }
+                    },
+                    "descendants": { "type": "array", "items": { "type": "string" }, "description": "every indexed folder below the scope, capped at 500 — autocomplete fodder" }
+                  }
+                },
+                "examples": { "projects": { "value": { "path": "Projects", "scannedAt": "2026-09-20T03:00:00.000Z", "ageSec": 42, "stale": false, "truncated": false, "known": true, "count": 2, "dirs": [
+                  { "name": "life-control", "path": "Projects/life-control", "hasChildren": true, "conversations": 0, "pending": 0, "unread": 0 },
+                  { "name": "relay-queue", "path": "Projects/relay-queue", "hasChildren": true, "conversations": 3, "pending": 1, "unread": 2 }
+                ], "descendants": ["Projects/life-control", "Projects/relay-queue", "Projects/relay-queue/data"] } } }
+              }
+            }
+          },
+          "400": { "description": "invalid `path`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/folder-index": {
+      "post": {
+        "operationId": "publishFolderIndex",
+        "tags": ["conversations"],
+        "summary": "The host publishing which folders exist under home",
+        "description": "Written by `tools/autoseat.js`, the only process with home access, and read back on `GET /fs`. Stored atomically in `DATA_DIR/folder-index.json` and held in memory, so it survives a restart.\n\nEvery entry goes through the same normaliser as the conversation `path` field. AN ENTRY IT REFUSES IS DROPPED AND COUNTED, NOT FATAL — one odd directory name must not cost a whole scan — so the reply reports `stored` and `dropped` and you should read them. Duplicates and the empty path count as dropped. Over 4000 entries the rest are dropped and `truncated` is forced true.\n\nEmits NO SSE event: this is not conversation traffic, and a page that re-rendered its thread because a directory appeared would be wrong.\n\nEXPOSURE, stated plainly: this makes home directory NAMES (no file names, no contents, depth 4) readable on a port with no app auth. Anyone who can reach it can already file a tab at any path and have a guarded coordinator seated there, which is strictly more. Set `RELAY_FOLDER_INDEX=0` on autoseat to publish nothing.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["dirs"],
+            "properties": {
+              "root": { "type": "string", "description": "what the paths are relative to, for a human reading the file; `~` by convention" },
+              "scannedAt": { "type": "string", "format": "date-time", "description": "when the walk happened. An unparseable or missing value is taken as now, which would make a stale index look fresh" },
+              "truncated": { "type": "boolean", "description": "the walk stopped at its own ceiling" },
+              "dirs": { "type": "array", "items": { "type": "string" }, "maxItems": 4000, "description": "home-relative folder paths, e.g. `Projects/app`" }
+            },
+            "additionalProperties": true
+          }, "example": { "root": "~", "scannedAt": "2026-09-20T03:00:00.000Z", "truncated": false, "dirs": ["Projects", "Projects/relay-queue", "Projects/relay-queue/data"] } } }
+        },
+        "responses": {
+          "200": {
+            "description": "stored",
+            "content": { "application/json": { "schema": {
+              "type": "object",
+              "required": ["ok", "root", "scannedAt", "truncated", "stored", "dropped"],
+              "properties": {
+                "ok": { "type": "boolean" },
+                "root": { "type": "string" },
+                "scannedAt": { "type": "string", "format": "date-time" },
+                "truncated": { "type": "boolean" },
+                "stored": { "type": "integer", "description": "entries now in the index" },
+                "dropped": { "type": "integer", "description": "entries refused by the normaliser, duplicated, or past the ceiling" }
+              }
+            }, "example": { "ok": true, "root": "~", "scannedAt": "2026-09-20T03:00:00.000Z", "truncated": false, "stored": 812, "dropped": 3 } } }
+          },
+          "400": { "description": "the body is not an object, or `dirs` is not an array", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "the index could not be written to disk", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },

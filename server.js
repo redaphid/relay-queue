@@ -7062,25 +7062,15 @@ function archivedFilter(list, q) {
   return list;
 }
 
-/*
- * GET /folders?path=<scope> - the drill-down under a folder scope: its
- * IMMEDIATE child folders that hold at least one conversation at or below
- * them, sorted by name.
+/**
+ * The counting half of GET /folders, by child name.
  *
- * DERIVED ONLY FROM CONVERSATION PATHS. This server never reads a home folder
- * (it runs in a container with no home mount, on purpose), so a folder with no
- * conversations in it does not exist as far as this route is concerned, and
- * that is the honest answer: there is nothing there to drill into.
- *
- * `conversations` counts every conversation at or below the child; `pending`
- * and `unread` sum the same counters the list route shows per row, so a badge
- * on a folder means exactly "this many, if you went and looked". Conversations
- * filed at the scope itself belong to no child and are not counted here - they
- * are what GET /conversations?path=<scope> shows alongside this list.
+ * Shared with GET /fs so the two routes can never disagree about how many tabs
+ * a folder holds: one of them lists folders that HAVE tabs, the other lists
+ * folders that EXIST, and a badge that differed between the two lists would be
+ * read as two different facts rather than one.
  */
-function foldersRoute(res, q) {
-  const scope = q.get('path') === null ? '' : normaliseConvPath(q.get('path'), 'path');
-  if (scope instanceof Error) return fail(res, 400, scope.message);
+function childFolderCounts(q, scope) {
   const prefix = scope ? scope + '/' : '';
   const byName = new Map();
   for (const c of archivedFilter(conversationSummaries(), q)) {
@@ -7093,9 +7083,199 @@ function foldersRoute(res, q) {
     f.pending += c.counts.pending;
     f.unread += c.counts.unrelayed;
   }
-  // Plain code-unit order: stable across locales, and what `ls` does under LC_ALL=C.
-  const folders = [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return byName;
+}
+
+// Plain code-unit order: stable across locales, and what `ls` does under LC_ALL=C.
+const byNameAsc = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+
+/*
+ * GET /folders?path=<scope> - the drill-down under a folder scope: its
+ * IMMEDIATE child folders that hold at least one conversation at or below
+ * them, sorted by name.
+ *
+ * DERIVED ONLY FROM CONVERSATION PATHS. This server never reads a home folder
+ * (it runs in a container with no home mount, on purpose), so a folder with no
+ * conversations in it does not exist as far as this route is concerned, and
+ * that is the honest answer: there is nothing there to drill into. GET /fs
+ * below is the other half of that answer: the folders that DO exist, from an
+ * index the host publishes, which is the only way this server can know.
+ *
+ * `conversations` counts every conversation at or below the child; `pending`
+ * and `unread` sum the same counters the list route shows per row, so a badge
+ * on a folder means exactly "this many, if you went and looked". Conversations
+ * filed at the scope itself belong to no child and are not counted here - they
+ * are what GET /conversations?path=<scope> shows alongside this list.
+ */
+function foldersRoute(res, q) {
+  const scope = q.get('path') === null ? '' : normaliseConvPath(q.get('path'), 'path');
+  if (scope instanceof Error) return fail(res, 400, scope.message);
+  const folders = [...childFolderCounts(q, scope).values()].sort(byNameAsc);
   return send(res, 200, { path: scope, count: folders.length, folders });
+}
+
+/*
+ * ---- the folder index: what actually exists on the host -------------------
+ *
+ * GET /folders above is honest but blind - it only knows folders that already
+ * hold a tab, so filing a tab somewhere new means typing a path and hoping it
+ * exists in WSL, and getting it wrong is silent (autoseat spawns nothing).
+ *
+ * This server cannot look for itself: it runs in a container with NO HOME
+ * MOUNT, by the owner's decision, and that is not being revisited here.
+ * tools/autoseat.js is already the only host-side process, already has home
+ * access and already posts to this queue, so it walks home and PUBLISHES a
+ * directory index; this server stores it and serves it back.
+ *
+ * The index is a CACHE, NEVER THE TRUTH. It is minutes old by design (a folder
+ * picker, not a file manager), a scope it has never heard of is answered 200
+ * with `known: false` rather than 404, and every consumer is expected to work
+ * unchanged when there is no index at all.
+ *
+ * What it exposes is directory NAMES under home, depth 4, no file names and no
+ * contents. See FOLDER-BROWSE-SPEC.md, "Security note".
+ */
+const FOLDER_INDEX_FILE = path.join(DATA_DIR, 'folder-index.json');
+// The same ceiling autoseat scans to. Enforced here as well because this route
+// is open to anything that can reach the port, not only to autoseat.
+const FOLDER_INDEX_MAX = 4000;
+// Past this, /fs says so and the page says so. Autoseat republishes every 180s,
+// so 600s is three missed publishes: the host process is gone, not merely slow.
+const FOLDER_INDEX_STALE_SEC = 600;
+// The autocomplete hint on /fs. Every descendant of a root scope is the whole
+// index, which is several thousand <option>s on a phone for no added use.
+const FS_DESCENDANTS_MAX = 500;
+
+/** { root, scannedAt, truncated, dirs: [...], set: Set(dirs) } or null. */
+let folderIndex = null;
+
+function indexInMemory(idx) {
+  return { root: idx.root, scannedAt: idx.scannedAt, truncated: idx.truncated, dirs: idx.dirs, set: new Set(idx.dirs) };
+}
+
+/**
+ * Read the index back after a restart. Anything wrong with the file is treated
+ * as "no index": it is a cache, and a server that refused to boot over a
+ * malformed cache would be trading a folder picker for the whole queue.
+ */
+function loadFolderIndex() {
+  let j;
+  try { j = JSON.parse(fs.readFileSync(FOLDER_INDEX_FILE, 'utf8')); } catch { return null; }
+  if (!j || typeof j !== 'object' || !Array.isArray(j.dirs)) return null;
+  const dirs = j.dirs.filter((d) => typeof d === 'string' && d);
+  return indexInMemory({
+    root: typeof j.root === 'string' ? j.root : '~',
+    scannedAt: typeof j.scannedAt === 'string' ? j.scannedAt : nowIso(),
+    truncated: !!j.truncated,
+    dirs,
+  });
+}
+
+/** Atomic, for the same reason writeTermsOverlay is: half a JSON file is none. */
+function writeFolderIndex(idx) {
+  const body = JSON.stringify({ root: idx.root, scannedAt: idx.scannedAt, truncated: idx.truncated, dirs: idx.dirs }, null, 0) + '\n';
+  fs.mkdirSync(path.dirname(FOLDER_INDEX_FILE), { recursive: true });
+  const tmp = `${FOLDER_INDEX_FILE}.${process.pid}.part`;
+  fs.writeFileSync(tmp, body);
+  fs.renameSync(tmp, FOLDER_INDEX_FILE); // atomic within the directory
+}
+
+/*
+ * POST /folder-index - the host saying what folders exist.
+ *
+ * Every entry goes through normaliseConvPath, the same one the conversation
+ * `path` field and every `?path=` filter use, so nothing can enter the index
+ * that could not be a conversation's folder. A bad entry is DROPPED AND
+ * COUNTED, not fatal: one odd directory name must not cost the whole scan.
+ *
+ * Emits no SSE event. This is not conversation traffic, and a page that
+ * re-rendered its thread because a directory appeared would be wrong.
+ */
+function folderIndexRoute(res, body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return fail(res, 400, 'body must be a JSON object');
+  if (!Array.isArray(body.dirs)) return fail(res, 400, 'dirs must be an array of home-relative folder paths');
+  const dirs = [];
+  const seen = new Set();
+  let dropped = 0;
+  let truncated = !!body.truncated;
+  for (const raw of body.dirs) {
+    if (typeof raw !== 'string') { dropped++; continue; }
+    const p = normaliseConvPath(raw, 'dir');
+    // '' is the root, which is every scope's ancestor and no folder's name.
+    if (p instanceof Error || p === '') { dropped++; continue; }
+    if (seen.has(p)) { dropped++; continue; }
+    if (dirs.length >= FOLDER_INDEX_MAX) { dropped++; truncated = true; continue; }
+    seen.add(p);
+    dirs.push(p);
+  }
+  dirs.sort();
+  const scannedAt = typeof body.scannedAt === 'string' && !Number.isNaN(Date.parse(body.scannedAt))
+    ? new Date(body.scannedAt).toISOString()
+    : nowIso();
+  const idx = {
+    root: typeof body.root === 'string' ? body.root.slice(0, 256) : '~',
+    scannedAt,
+    truncated,
+    dirs,
+  };
+  try {
+    writeFolderIndex(idx);
+  } catch (e) {
+    return fail(res, 500, `could not store the folder index: ${e.message}`);
+  }
+  folderIndex = indexInMemory(idx);
+  return send(res, 200, { ok: true, root: idx.root, scannedAt, truncated, stored: dirs.length, dropped });
+}
+
+/*
+ * GET /fs?path=<scope> - the immediate child DIRECTORIES of a scope, from the
+ * published index, with the same counts GET /folders reports merged in.
+ *
+ * A scope the index has never heard of is `known: false` with an empty list and
+ * a 200, because "I have not seen that folder" is not "that folder does not
+ * exist" - the index is minutes old and bounded at depth 4. A malformed path is
+ * still a 400, by the same normaliser as everywhere else.
+ *
+ * `descendants` is the autocomplete hint for the path box: every indexed folder
+ * below the scope, capped, so typing completes to folders that actually exist.
+ */
+function fsRoute(res, q) {
+  const scope = q.get('path') === null ? '' : normaliseConvPath(q.get('path'), 'path');
+  if (scope instanceof Error) return fail(res, 400, scope.message);
+  const idx = folderIndex;
+  const scannedAt = idx ? idx.scannedAt : null;
+  const parsed = scannedAt ? Date.parse(scannedAt) : NaN;
+  const ageSec = Number.isNaN(parsed) ? null : Math.max(0, Math.round((Date.now() - parsed) / 1000));
+  // No index at all is stale by definition: nobody has ever looked.
+  const stale = !idx || ageSec === null || ageSec > FOLDER_INDEX_STALE_SEC;
+  const known = !!idx && (scope === '' || idx.set.has(scope));
+  const prefix = scope ? scope + '/' : '';
+  const byName = new Map();
+  const descendants = [];
+  if (idx && known) {
+    for (const d of idx.dirs) {
+      if (!d.startsWith(prefix) || d.length === prefix.length) continue;
+      if (descendants.length < FS_DESCENDANTS_MAX) descendants.push(d);
+      const rest = d.slice(prefix.length);
+      const cut = rest.indexOf('/');
+      const name = cut < 0 ? rest : rest.slice(0, cut);
+      let e = byName.get(name);
+      if (!e) byName.set(name, (e = { name, path: prefix + name, hasChildren: false, conversations: 0, pending: 0, unread: 0 }));
+      if (cut >= 0) e.hasChildren = true;
+    }
+    for (const [name, f] of childFolderCounts(q, scope)) {
+      const e = byName.get(name);
+      if (!e) continue; // holds tabs but is not (yet) in the index: /folders has it
+      e.conversations = f.conversations;
+      e.pending = f.pending;
+      e.unread = f.unread;
+    }
+  }
+  const dirs = [...byName.values()].sort(byNameAsc);
+  return send(res, 200, {
+    path: scope, scannedAt, ageSec, stale, truncated: !!(idx && idx.truncated),
+    known, count: dirs.length, dirs, descendants,
+  });
 }
 
 /** Is `convPath` the folder `scope`, or somewhere under it? Whole segments only. */
@@ -8371,6 +8551,19 @@ async function route(req, res) {
     return foldersRoute(res, q);
   }
 
+  // /fs — the child folders under a scope that actually EXIST on the host,
+  // from the index autoseat publishes. Counts merged from /folders.
+  if (seg.length === 1 && seg[0] === 'fs') {
+    if (!need('GET')) return;
+    return fsRoute(res, q);
+  }
+
+  // /folder-index — the host publishing that scan. Write-only, no SSE.
+  if (seg.length === 1 && seg[0] === 'folder-index') {
+    if (!need('POST')) return;
+    return folderIndexRoute(res, await readBody(req));
+  }
+
   // /status — is anything actually listening?
   if (seg.length === 1 && seg[0] === 'status') {
     if (!need('GET')) return;
@@ -8774,6 +8967,9 @@ ensureDefaultConv(); // before replay, so a rename of it replays onto something
 const replayed = replay();
 ensureDefaultConv(); // ...and after, in case the log somehow removed it
 if (PUSH_ON) vapidKeys = loadVapidKeys(); // after mkdir: the key file lives in DATA_DIR
+// The folder index survives a restart, so a picker opened right after one is
+// not blank while it waits up to 180s for autoseat's next publish.
+folderIndex = loadFolderIndex();
 /*
  * Every registered agent must have an inbox file waiting, even one that has
  * never been written to.
@@ -8803,6 +8999,9 @@ server.listen(PORT, HOST, () => {
   const ui = findUiFile();
   console.log(ui ? `ui:  ${ui.file}` : `ui:  MISSING — searched ${UI_FILES.join(', ')}`);
   console.log(`tasks: ${tasks.size} total — ${c.pending} pending, ${c.claimed} claimed, ${c.done} done, ${c.unrelayed} unrelayed`);
+  console.log(folderIndex
+    ? `folders: ${folderIndex.dirs.length} host folder(s) indexed at ${folderIndex.scannedAt}${folderIndex.truncated ? ' (truncated)' : ''}`
+    : 'folders: no host index yet (autoseat publishes one to POST /folder-index)');
   if (!PUSH_ON) {
     console.log('push: disabled (PUSH=0)');
   } else {
